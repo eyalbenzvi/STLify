@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { clampNumber, parseNumericInput } from "@/lib/geometry/validation";
 
 interface NumberFieldProps {
@@ -30,11 +30,15 @@ export function NumberField({
 }: NumberFieldProps) {
   const [raw, setRaw] = useState<string>(String(value));
   const [focused, setFocused] = useState(false);
+  const [lastValue, setLastValue] = useState(value);
 
   // Sync external value changes (template switch, reset) while not editing.
-  useEffect(() => {
+  // Render-time state adjustment — the React-recommended replacement for a
+  // setState-in-effect prop sync.
+  if (value !== lastValue) {
+    setLastValue(value);
     if (!focused) setRaw(String(value));
-  }, [value, focused]);
+  }
 
   const parsed = parseNumericInput(raw);
   const isInvalid = parsed === null || parsed < min || parsed > max;

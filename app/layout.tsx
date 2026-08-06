@@ -2,9 +2,9 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "PrintCraft STL Studio",
+  title: "Printable Product Studio",
   description:
-    "יצירת קבצי STL להדפסה תלת־ממדית: שלטים, מחזיקי מפתחות, לוחיות לוגו ותבליטים",
+    "סטודיו לעיצוב מוצרים להדפסה תלת־ממדית: טקסט, לוגו SVG, תבליטי תמונה, תבניות מוצר, בדיקות הדפסה וייצוא STL/3MF — הכול בדפדפן, ללא חשבון",
 };
 
 export default function RootLayout({

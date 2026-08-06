@@ -36,9 +36,11 @@ export function useModelBuilder(params: DesignParams): ModelBuilderState {
 
   useEffect(() => {
     const generation = ++generationRef.current;
-    setState((prev) => ({ ...prev, status: "building" }));
 
     const timer = setTimeout(() => {
+      setState((prev) =>
+        prev.status === "building" ? prev : { ...prev, status: "building" }
+      );
       void buildModel(params).then((result) => {
         // Discard stale results (params changed while building).
         if (generation !== generationRef.current) {
