@@ -43,9 +43,16 @@ export function useDocumentBuilder(document: DesignDocument): DocumentBuilderSta
   const generationRef = useRef(0);
   const livePartsRef = useRef<BuiltPart[]>([]);
 
+  // Flip to "building" the moment the document changes (state adjustment
+  // derived from a prop change, done during render — no effect cascade).
+  const [lastDocument, setLastDocument] = useState<DesignDocument | null>(null);
+  if (document !== lastDocument) {
+    setLastDocument(document);
+    setState((prev) => (prev.status === "building" ? prev : { ...prev, status: "building" }));
+  }
+
   useEffect(() => {
     const generation = ++generationRef.current;
-    setState((prev) => ({ ...prev, status: "building" }));
 
     const timer = setTimeout(() => {
       const validation = validateDocument(document);

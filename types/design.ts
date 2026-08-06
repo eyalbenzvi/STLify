@@ -9,7 +9,7 @@
  * layers by `meshId`.
  */
 
-import type { FontId, TextAlign, ValidationIssue } from "@/lib/geometry/types";
+import type { FontId, TextAlign } from "@/lib/geometry/types";
 
 /** Schema version written into portable design files. */
 export const DESIGN_SCHEMA_VERSION = 3;

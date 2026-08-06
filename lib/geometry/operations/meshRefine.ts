@@ -173,7 +173,7 @@ export function detectFeatureVertices(mesh: MeshData, angleDeg: number): Uint8Ar
     const vx = p[c] - p[a],
       vy = p[c + 1] - p[a + 1],
       vz = p[c + 2] - p[a + 2];
-    let nx = uy * vz - uz * vy,
+    const nx = uy * vz - uz * vy,
       ny = uz * vx - ux * vz,
       nz = ux * vy - uy * vx;
     const len = Math.hypot(nx, ny, nz) || 1;

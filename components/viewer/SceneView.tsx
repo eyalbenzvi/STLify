@@ -168,6 +168,8 @@ const PartMesh = memo(function PartMesh({
     } else if (geometry.getAttribute("color")) {
       geometry.deleteAttribute("color");
     }
+    // Imperative three.js buffer invalidation — external-system sync.
+    // eslint-disable-next-line react-hooks/immutability
     geometry.attributes.position.needsUpdate = true;
   }, [part.geometry, overlay, overlayColors]);
 
@@ -313,19 +315,31 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
 
   const { gl } = useThree();
   useEffect(() => {
+    // Imperative renderer flag — synchronizing an external system.
+    // eslint-disable-next-line react-hooks/immutability
     gl.localClippingEnabled = true;
   }, [gl]);
 
-  const objectsRef = useRef(new Map<string, THREE.Group>());
+  // Gizmo attachment targets live in state (not a ref) so the
+  // TransformControls re-attaches as soon as a part group mounts.
+  const [objects, setObjects] = useState<ReadonlyMap<string, THREE.Group>>(new Map());
   const registerObject = useCallback((layerId: string, object: THREE.Group | null) => {
-    if (object) objectsRef.current.set(layerId, object);
-    else objectsRef.current.delete(layerId);
+    setObjects((prev) => {
+      const next = new Map(prev);
+      if (object) next.set(layerId, object);
+      else next.delete(layerId);
+      return next;
+    });
   }, []);
 
   const [pendingPoint, setPendingPoint] = useState<THREE.Vector3 | null>(null);
-  useEffect(() => {
+  // Reset the half-finished measurement when leaving measure mode
+  // (state adjustment derived from a prop change, done during render).
+  const [prevTool, setPrevTool] = useState(tool);
+  if (tool !== prevTool) {
+    setPrevTool(tool);
     if (tool !== "measure") setPendingPoint(null);
-  }, [tool]);
+  }
 
   const clippingPlanes = useMemo(() => {
     if (!section.enabled) return [];
@@ -380,7 +394,7 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
   const gizmoLayer = gizmoLayerId
     ? document.layers.find((l) => l.id === gizmoLayerId)
     : null;
-  const gizmoObject = gizmoLayerId ? (objectsRef.current.get(gizmoLayerId) ?? null) : null;
+  const gizmoObject = gizmoLayerId ? (objects.get(gizmoLayerId) ?? null) : null;
   const gizmoMode =
     tool === "translate" || tool === "rotate" || tool === "scale" ? tool : null;
   const showGizmo = Boolean(
@@ -389,12 +403,12 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
 
   const commitGizmo = useCallback(() => {
     if (!gizmoLayerId) return;
-    const object = objectsRef.current.get(gizmoLayerId);
+    const object = objects.get(gizmoLayerId);
     if (!object) return;
     object.updateMatrix();
     const transform = snapTransformNoise(matrix4ToTransform(object.matrix));
     onCommitTransform(gizmoLayerId, transform);
-  }, [gizmoLayerId, onCommitTransform]);
+  }, [gizmoLayerId, objects, onCommitTransform]);
 
   return (
     <>

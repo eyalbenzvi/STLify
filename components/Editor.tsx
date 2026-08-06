@@ -752,20 +752,15 @@ function EditorInner() {
     }, 30);
   }, [build.parts, doc, printer, state.ui.overlay, showError]);
 
-  // Recompute overlay colors when the overlay type changes (cheap re-map).
-  useEffect(() => {
-    if (state.ui.overlay !== "none" && overlayColors.size === 0 && build.parts.length > 0) {
-      runAnalysis();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.ui.overlay]);
-
-  // Invalidate analysis results when geometry changes.
-  useEffect(() => {
+  // Invalidate analysis results when the geometry changes (state adjustment
+  // derived from the build id, done during render — no effect cascade).
+  const [lastBuildId, setLastBuildId] = useState(0);
+  if (build.buildId !== lastBuildId) {
+    setLastBuildId(build.buildId);
     setModelIssues([]);
     setOverlayColors(new Map());
     setEstimate(null);
-  }, [build.buildId]);
+  }
 
   const handleSuggestOrientation = useCallback(() => {
     const part = selectedParts[0] ?? build.parts[0];

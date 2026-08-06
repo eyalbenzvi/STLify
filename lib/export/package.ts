@@ -115,7 +115,7 @@ export async function buildMultiPartZip(
   const entries: ZipEntry[] = [];
   const usedNames = new Set<string>();
   for (const part of parts) {
-    let base = sanitizeFileName(part.fileBaseName);
+    const base = sanitizeFileName(part.fileBaseName);
     let candidate = base;
     let counter = 2;
     while (usedNames.has(candidate)) candidate = `${base}-${counter++}`;
