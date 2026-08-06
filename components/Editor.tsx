@@ -64,15 +64,15 @@ import {
   analyzeFloatingParts,
   analyzeOverhangs,
   analyzeThickness,
-  estimatePrint,
   overhangToVertexColors,
   suggestOrientations,
   thicknessToVertexColors,
   type OrientationCandidate,
 } from "@/lib/geometry/analysis";
-import type { PrintEstimate } from "@/lib/geometry/analysis/estimate";
+import { estimateDetailed, type DetailedEstimateResult } from "@/lib/geometry/analysis/estimateDetailed";
 import { parseStl, StlImportError, summarizeStlMesh } from "@/lib/import/stl";
 import { parseSvgToContours, SvgImportError } from "@/lib/import/svg";
+import { sanitizeSvg } from "@/lib/import/svgSanitize";
 import {
   decodeImageToGrid,
   gridToSilhouetteContours,
@@ -83,7 +83,9 @@ import {
 import { downloadBlob } from "@/lib/export/stl";
 import { meshDataToBinaryStl } from "@/lib/export/stlData";
 import { buildMultiPartZip } from "@/lib/export/package";
+import { buildThreeMf } from "@/lib/export/threeMF";
 import { DESIGN_FILE_EXTENSION, DesignFileError, importDesignFile, serializeDesignFile } from "@/lib/serialization/designFile";
+import { decodeShareHash, encodeShareHash, SHARE_HASH_PREFIX, shareLinkEligibility } from "@/lib/serialization/shareLink";
 import type { ModelIssue } from "@/types/design";
 import { Section } from "@/components/ui/Section";
 import { EditorProvider, useEditor } from "@/components/editor/store";
@@ -174,7 +176,7 @@ function EditorInner() {
   const [modeSwitchTarget, setModeSwitchTarget] = useState<"withBase" | "baseless" | null>(null);
   const [modelIssues, setModelIssues] = useState<ModelIssue[]>([]);
   const [overlayColors, setOverlayColors] = useState<Map<string, Float32Array>>(new Map());
-  const [estimate, setEstimate] = useState<PrintEstimate | null>(null);
+  const [estimate, setEstimate] = useState<DetailedEstimateResult | null>(null);
   const [analysisBusy, setAnalysisBusy] = useState(false);
 
   const stlInputRef = useRef<HTMLInputElement>(null);
@@ -741,8 +743,25 @@ function EditorInner() {
           MATERIAL_PROFILES.find((m) => m.id === usage?.suggestedMaterialId) ??
           MATERIAL_PROFILES[0];
         const layerHeight = custom?.layerHeightMm ?? profile.layerHeightMm;
+        let bounds = { x: 0, y: 0, z: maxHeight };
+        for (const part of build.parts) {
+          bounds = {
+            x: Math.max(bounds.x, part.stats.dimensionsMm.x),
+            y: Math.max(bounds.y, part.stats.dimensionsMm.y),
+            z: bounds.z,
+          };
+        }
         setEstimate(
-          estimatePrint(totalVolume, maxHeight, material, layerHeight, usage?.suggestedInfillPct ?? 20)
+          estimateDetailed({
+            modelVolumeMm3: totalVolume,
+            boundsMm: bounds,
+            technology: profile.technology,
+            layerHeightMm: layerHeight,
+            nozzleDiameterMm: custom?.nozzleDiameterMm ?? profile.nozzleDiameterMm,
+            infillPercent: usage?.suggestedInfillPct ?? 20,
+            densityGCm3: material.densityGCm3,
+            pricePerKgIls: material.pricePerKgIls,
+          })
         );
       } catch (err) {
         showError(err, "ניתוח המודל נכשל");
@@ -882,9 +901,15 @@ function EditorInner() {
       setSvgPending(null);
       if (!pending) return;
       void runOp("ייבוא SVG", async () => {
-        const result = parseSvgToContours(pending.text, {
+        // Security first: strip scripts/external refs, collect Hebrew warnings.
+        const sanitized = sanitizeSvg(pending.text);
+        if (!sanitized.ok) {
+          throw new SvgImportError(sanitized.error ?? "קובץ ה-SVG אינו תקין");
+        }
+        const result = parseSvgToContours(sanitized.svgText, {
           targetWidthMm: options.targetWidthMm,
         });
+        result.warningsHe.push(...sanitized.warnings);
         const layer: DesignLayer = {
           id: newId("layer"),
           type: "svg",
@@ -924,7 +949,18 @@ function EditorInner() {
       setImagePending(null);
       if (!pending) return;
       void runOp("ייבוא תמונה", async () => {
-        const decoded = await decodeImageToGrid(pending.file, options.resolution);
+        const decoded = await decodeImageToGrid(pending.file, options.resolution, {
+          removeBackgroundTolerance: options.removeBackground ? options.bgToleranceMm : null,
+          brightness: options.brightness,
+          contrast: options.contrast,
+        });
+        if (options.removeBackground && decoded.backgroundRemovedFraction < 0.01) {
+          setMessage({
+            titleHe: "הסרת רקע",
+            bodyHe: "כמעט שלא זוהה רקע להסרה — נסו להגדיל את סבילות הצבע",
+            kind: "info",
+          });
+        }
         const grid = smoothGrid(decoded.grid, options.smoothingLevel);
         const pixelSizeMm = options.targetWidthMm / grid.width;
         let layer: DesignLayer;
@@ -1047,6 +1083,27 @@ function EditorInner() {
           return;
         }
         if (build.parts.length === 0) throw new OpError("אין חלקים לייצוא");
+        if (kind === "threemf") {
+          const usage = USAGE_PROFILES.find((u) => u.id === doc.usageProfileId);
+          const material =
+            MATERIAL_PROFILES.find((m) => m.id === usage?.suggestedMaterialId) ??
+            MATERIAL_PROFILES[0];
+          const blob = buildThreeMf(
+            build.parts.map((part) => {
+              const slot = doc.materialSlots.find((s) => s.id === part.materialSlotId);
+              return {
+                name: part.nameHe,
+                colorHex: slot?.colorHex ?? "#8a8f98",
+                materialName: slot ? `${slot.nameHe} (${material.nameHe})` : material.nameHe,
+                vertices: part.worldMesh.positions,
+                triangles: part.worldMesh.indices,
+              };
+            }),
+            fileName
+          );
+          downloadBlob(blob, `${fileName}.3mf`);
+          return;
+        }
         if (kind === "stl") {
           // Merge all parts (world space) into one binary STL.
           let totalVerts = 0;
@@ -1189,6 +1246,64 @@ function EditorInner() {
     },
     [dispatch]
   );
+
+  // ---- share links -----------------------------------------------------------
+
+  const handleShareLink = useCallback(() => {
+    const eligibility = shareLinkEligibility(doc);
+    if (!eligibility.ok) {
+      setMessage({ titleHe: "שיתוף בקישור", bodyHe: eligibility.reasonHe, kind: "info" });
+      return;
+    }
+    void runOp("יצירת קישור שיתוף", async () => {
+      const hash = await encodeShareHash(doc);
+      if (!hash) {
+        setMessage({
+          titleHe: "שיתוף בקישור",
+          bodyHe: "העיצוב גדול מדי לקישור — יש לשתף כקובץ עיצוב",
+          kind: "info",
+        });
+        return;
+      }
+      const url = `${window.location.origin}${window.location.pathname}${hash}`;
+      await navigator.clipboard.writeText(url);
+      setMessage({
+        titleHe: "הקישור הועתק",
+        bodyHe:
+          "הקישור מכיל את העיצוב עצמו (אין שרת ואין שמירה בענן) — כל מי שמקבל אותו רואה את העיצוב. פתיחת הקישור טוענת את העיצוב לזיכרון הדפדפן בלבד.",
+        kind: "success",
+      });
+    });
+  }, [doc, runOp]);
+
+  // Load a shared design from the URL hash once, on startup.
+  const hashLoadedRef = useRef(false);
+  useEffect(() => {
+    if (hashLoadedRef.current) return;
+    hashLoadedRef.current = true;
+    const hash = window.location.hash;
+    if (!hash.startsWith(SHARE_HASH_PREFIX)) return;
+    void (async () => {
+      try {
+        const { document: shared, warningsHe } = await decodeShareHash(hash);
+        applyDocument(shared, "טעינת עיצוב מקישור");
+        window.history.replaceState(null, "", window.location.pathname);
+        if (warningsHe.length > 0) {
+          setMessage({
+            titleHe: "העיצוב מהקישור נטען עם הערות",
+            bodyHe: warningsHe.join("\n"),
+            kind: "info",
+          });
+        }
+      } catch {
+        setMessage({
+          titleHe: "טעינת קישור",
+          bodyHe: "הקישור אינו מכיל עיצוב תקין",
+          kind: "error",
+        });
+      }
+    })();
+  }, [applyDocument]);
 
   // ---- keyboard shortcuts -----------------------------------------------------
 
@@ -1336,6 +1451,14 @@ function EditorInner() {
           </button>
           <button type="button" className="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-sm text-slate-600 hover:bg-slate-50" onClick={() => designInputRef.current?.click()}>
             טעינת עיצוב
+          </button>
+          <button
+            type="button"
+            className="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-sm text-slate-600 hover:bg-slate-50"
+            title="קישור שמכיל את העיצוב עצמו — לעיצובים קטנים בלבד"
+            onClick={handleShareLink}
+          >
+            שיתוף בקישור
           </button>
           <button
             type="button"

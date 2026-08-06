@@ -66,8 +66,10 @@ export type LayerType =
 /**
  * How a shape layer participates in the printable result while in
  * "withBase" mode. In "baseless" mode every non-hole layer is standalone.
+ * "inlay" = flush insert: the base gets a clearance pocket and the layer
+ * becomes a separate printable part (multi-colour inlays).
  */
-export type CombineMode = "raised" | "engraved" | "standalone";
+export type CombineMode = "raised" | "engraved" | "inlay" | "standalone";
 
 /** Optional bevel for extruded (text/SVG/silhouette) layers. */
 export interface BevelSettings {
@@ -96,11 +98,16 @@ export interface LayerCommon {
 /** The single base plate (only meaningful in "withBase" mode). */
 export interface BaseLayer extends LayerCommon {
   type: "base";
-  shape: "rectangle" | "roundedRectangle";
+  shape: "rectangle" | "roundedRectangle" | "circle";
+  /** Plate size along X (for circles: the diameter). */
   widthMm: number;
   heightMm: number;
   thicknessMm: number;
   cornerRadiusMm: number;
+  /** Raised border ring on the top face (coasters, medals, plaques). */
+  rimEnabled: boolean;
+  rimWidthMm: number;
+  rimHeightMm: number;
 }
 
 export interface TextLayer extends LayerCommon {
@@ -111,6 +118,14 @@ export interface TextLayer extends LayerCommon {
   bold: boolean;
   align: TextAlign;
   lineSpacing: number;
+  /** Extra spacing between glyphs, in mm (0 = font default). */
+  letterSpacingMm: number;
+  /** Bidi handling: "auto" = simplified bidi reorder, "ltr" = keep order. */
+  direction: "auto" | "ltr";
+  /** Arc radius for curved (medal-style) text, mm. 0 = straight. */
+  curveRadiusMm: number;
+  /** Mirror horizontally — required for stamps. */
+  mirrored: boolean;
   /** Extrusion depth (raised height / engrave depth / standalone thickness). */
   extrudeMm: number;
   combine: CombineMode;

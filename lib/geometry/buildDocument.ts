@@ -28,7 +28,8 @@ import type {
   ModelIssue,
   ShapeLayer,
 } from "@/types/design";
-import { isShapeLayer } from "@/types/design";
+import { isContourLayer, isShapeLayer } from "@/types/design";
+import { getPrintabilityProfile } from "@/types/profiles";
 import { getGeometryKernel, type GeometryKernel, type Solid } from "./kernel";
 import {
   meshDataBounds,
@@ -38,7 +39,13 @@ import {
   type MeshData,
 } from "./meshData";
 import { matrix4ToManifoldMat4, transformToMatrix4 } from "./transform";
-import { buildHoleCutter, buildShapeLayerSolid, LayerBuildError } from "./solids";
+import {
+  buildHoleCutter,
+  buildInlayPocketCutter,
+  buildShapeLayerSolid,
+  LayerBuildError,
+  type EffectiveCombine,
+} from "./solids";
 
 export interface PartStats {
   triangleCount: number;
@@ -114,11 +121,19 @@ export function layerWorldMatrix(
 export function effectiveCombineMode(
   document: DesignDocument,
   layer: ShapeLayer
-): "standalone" | "raised" | "engraved" {
+): EffectiveCombine {
   if (layer.type === "base") return "standalone";
   if (document.baseMode === "baseless") return "standalone";
   if (!findBaseLayer(document)) return "standalone";
   return layer.combine;
+}
+
+/** Printing clearance used for inlay pockets, mm. */
+function inlayClearanceMm(document: DesignDocument): number {
+  return (
+    document.customPrintability?.clearanceMm ??
+    getPrintabilityProfile(document.printabilityProfileId).clearanceMm
+  );
 }
 
 function issueForLayerFailure(layer: DesignLayer, err: unknown): ModelIssue {
@@ -197,7 +212,7 @@ export async function buildDocument(
   interface BuiltShape {
     layer: ShapeLayer;
     solid: Solid;
-    effectiveCombine: "standalone" | "raised" | "engraved";
+    effectiveCombine: EffectiveCombine;
   }
   const built: BuiltShape[] = [];
 
@@ -249,6 +264,24 @@ export async function buildDocument(
         const anchor = new THREE.Matrix4()
           .makeTranslation(0, 0, base.layer.thicknessMm)
           .multiply(transformToMatrix4(b.layer.transform));
+        if (b.effectiveCombine === "inlay") {
+          // Flush insert: subtract a clearance pocket from the base; the
+          // inlay body itself becomes a separate part below.
+          if (isContourLayer(b.layer)) {
+            const pocket = await buildInlayPocketCutter(
+              kernel,
+              b.layer,
+              inlayClearanceMm(document)
+            );
+            if (pocket) {
+              combined = combined.subtract(
+                pocket.transform(matrix4ToManifoldMat4(anchor))
+              );
+              combinedLayerIds.push(b.layer.id);
+            }
+          }
+          continue;
+        }
         const positioned = b.solid.transform(matrix4ToManifoldMat4(anchor));
         combined =
           b.effectiveCombine === "raised"
@@ -263,13 +296,22 @@ export async function buildDocument(
         nameHe: base.layer.name,
       });
       for (const b of built) {
-        if (b === base || b.effectiveCombine !== "standalone") continue;
-        bodies.push({
-          primary: b.layer,
-          solid: b.solid,
-          layerIds: [b.layer.id],
-          nameHe: b.layer.name,
-        });
+        if (b === base) continue;
+        if (b.effectiveCombine === "standalone") {
+          bodies.push({
+            primary: b.layer,
+            solid: b.solid,
+            layerIds: [b.layer.id],
+            nameHe: b.layer.name,
+          });
+        } else if (b.effectiveCombine === "inlay") {
+          bodies.push({
+            primary: b.layer,
+            solid: b.solid,
+            layerIds: [b.layer.id],
+            nameHe: `${b.layer.name} (שיבוץ)`,
+          });
+        }
       }
     } else {
       for (const b of built) {

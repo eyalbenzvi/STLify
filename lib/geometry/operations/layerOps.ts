@@ -55,7 +55,8 @@ export async function materializeWorldSolid(
   const local = await buildShapeLayerSolid(
     kernel,
     layer,
-    combine === "engraved" ? "raised" : combine
+    // Ops always want the layer's positive body, not a cutter/flush pose.
+    combine === "engraved" || combine === "inlay" ? "raised" : combine
   );
   if (!local) return null;
   return local.transform(matrix4ToManifoldMat4(layerWorldMatrix(document, layer)));

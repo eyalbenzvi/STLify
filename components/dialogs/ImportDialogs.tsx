@@ -150,6 +150,10 @@ export interface ImageImportOptionsValue {
   minThicknessMm: number;
   resolution: number;
   smoothingLevel: number;
+  removeBackground: boolean;
+  bgToleranceMm: number;
+  brightness: number;
+  contrast: number;
 }
 
 export function ImageImportDialog({
@@ -173,6 +177,10 @@ export function ImageImportDialog({
     minThicknessMm: 1,
     resolution: 200,
     smoothingLevel: 1,
+    removeBackground: false,
+    bgToleranceMm: 24,
+    brightness: 0,
+    contrast: 0,
   });
   const patch = (p: Partial<ImageImportOptionsValue>) =>
     setOptions((o) => ({ ...o, ...p }));
@@ -224,6 +232,27 @@ export function ImageImportDialog({
       </label>
       <NumberField label="רזולוציה" value={options.resolution} min={32} max={512} step={16} unit="px" onChange={(resolution) => patch({ resolution })} />
       <NumberField label="רמת החלקה" value={options.smoothingLevel} min={0} max={5} step={1} unit="" onChange={(smoothingLevel) => patch({ smoothingLevel: Math.round(smoothingLevel) })} />
+      <label className="flex items-center justify-between text-sm">
+        <span className="text-slate-600">הסרת רקע אוטומטית (מקומית, ללא ענן)</span>
+        <input
+          type="checkbox"
+          checked={options.removeBackground}
+          onChange={(e) => patch({ removeBackground: e.target.checked })}
+        />
+      </label>
+      {options.removeBackground && (
+        <NumberField
+          label="סבילות צבע רקע"
+          value={options.bgToleranceMm}
+          min={1}
+          max={100}
+          step={1}
+          unit=""
+          onChange={(bgToleranceMm) => patch({ bgToleranceMm })}
+        />
+      )}
+      <NumberField label="בהירות" value={options.brightness} min={-1} max={1} step={0.05} unit="" onChange={(brightness) => patch({ brightness })} />
+      <NumberField label="ניגודיות" value={options.contrast} min={-1} max={1} step={0.05} unit="" onChange={(contrast) => patch({ contrast })} />
       <p className="text-xs text-slate-500">
         צללית: אזורים כהים הופכים לגוף שטוח (כמו SVG). תבליט: גוף סגור שגובהו
         משתנה לפי בהירות — אזורים כהים גבוהים יותר.
