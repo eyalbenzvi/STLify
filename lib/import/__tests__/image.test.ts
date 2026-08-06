@@ -8,7 +8,10 @@ import { getGeometryKernel } from "@/lib/geometry/kernel";
 import {
   gridToSilhouetteContours,
   heightFieldToClosedMesh,
+  IMAGE_INPUT_ACCEPT,
   smoothGrid,
+  stripImageExtension,
+  validateImageFile,
   type LuminanceGrid,
 } from "../image";
 
@@ -113,5 +116,52 @@ describe("smoothGrid", () => {
       return arr.reduce((s, v) => s + (v - mean) ** 2, 0) / arr.length;
     };
     expect(variance(smoothed.values)).toBeLessThan(variance(values));
+  });
+});
+
+describe("IMAGE_INPUT_ACCEPT", () => {
+  it("uses the generic image/* so mobile pickers expose all device sources", () => {
+    // A list of only specific MIME types makes Android Chrome route the
+    // request to a photo app, hiding Files/Downloads.
+    expect(IMAGE_INPUT_ACCEPT.split(",")).toContain("image/*");
+    expect(IMAGE_INPUT_ACCEPT).toContain(".jpg");
+    expect(IMAGE_INPUT_ACCEPT).toContain(".heic");
+  });
+});
+
+describe("validateImageFile", () => {
+  const file = (name: string, type: string, size = 1000) => ({ name, type, size });
+
+  it("accepts the common raster formats", () => {
+    expect(validateImageFile(file("a.png", "image/png"))).toBeNull();
+    expect(validateImageFile(file("a.jpg", "image/jpeg"))).toBeNull();
+    expect(validateImageFile(file("a.webp", "image/webp"))).toBeNull();
+    expect(validateImageFile(file("IMG_0001.HEIC", "image/heic"))).toBeNull();
+  });
+
+  it("accepts files a mobile picker hands over without a type or extension", () => {
+    expect(validateImageFile(file("image", ""))).toBeNull();
+    expect(validateImageFile(file("content://media/external/images/1", ""))).toBeNull();
+    expect(validateImageFile(file("photo.jpg", ""))).toBeNull();
+  });
+
+  it("rejects non-images and points SVG at its own importer", () => {
+    expect(validateImageFile(file("doc.pdf", "application/pdf"))).toMatch(/אינו תמונה/);
+    expect(validateImageFile(file("notes.txt", ""))).toMatch(/אינו תמונה/);
+    expect(validateImageFile(file("logo.svg", "image/svg+xml"))).toMatch(/SVG/);
+    expect(validateImageFile(file("logo.svg", ""))).toMatch(/SVG/);
+  });
+
+  it("rejects files over 20MB", () => {
+    expect(validateImageFile(file("big.png", "image/png", 21 * 1024 * 1024))).toMatch(/גדול מדי/);
+  });
+});
+
+describe("stripImageExtension", () => {
+  it("drops known image extensions only", () => {
+    expect(stripImageExtension("logo.PNG")).toBe("logo");
+    expect(stripImageExtension("IMG_1.jpeg")).toBe("IMG_1");
+    expect(stripImageExtension("IMG_1.HEIC")).toBe("IMG_1");
+    expect(stripImageExtension("v1.2.stl")).toBe("v1.2.stl");
   });
 });
