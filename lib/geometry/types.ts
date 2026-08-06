@@ -1,72 +1,14 @@
 /**
- * Core parameter types for the PrintCraft STL Studio geometry pipeline.
- * All linear dimensions are in millimetres (mm) — the internal and the
- * displayed unit of the application.
+ * Shared primitive types for the geometry pipeline. All linear dimensions
+ * are in millimetres (mm) — the internal and the displayed unit of the
+ * application. The layer/document model lives in types/design.ts.
  */
-
-export type TemplateId = "namePlate" | "keychain" | "logoPlaque" | "reliefTile";
-
-export type BaseShape = "rectangle" | "roundedRectangle";
 
 export type TextMode = "raised" | "engraved";
 
 export type TextAlign = "right" | "center" | "left";
 
-export type HolePosition = "right" | "left" | "top";
-
 export type FontId = "alef" | "davidLibre" | "suezOne" | "varelaRound";
-
-/** Base plate parameters. The plate lies in the XY plane and extrudes along +Z. */
-export interface BaseParams {
-  shape: BaseShape;
-  /** Plate size along X, in mm. */
-  widthMm: number;
-  /** Plate size along Y, in mm. */
-  heightMm: number;
-  /** Plate size along Z (thickness), in mm. */
-  thicknessMm: number;
-  /** Corner radius in mm; only used when shape === "roundedRectangle". */
-  cornerRadiusMm: number;
-}
-
-/** Text relief parameters. */
-export interface TextParams {
-  /** Text content. May contain "\n" for multiple lines. */
-  content: string;
-  fontId: FontId;
-  /** Font em size in mm (approximately the line height of the glyphs). */
-  sizeMm: number;
-  bold: boolean;
-  align: TextAlign;
-  mode: TextMode;
-  /** Raised height above the plate, or engraved depth into it, in mm. */
-  depthMm: number;
-  /** Horizontal offset of the text block from the plate centre, in mm. */
-  offsetXMm: number;
-  /** Vertical offset of the text block from the plate centre, in mm. */
-  offsetYMm: number;
-  /** Line spacing multiplier for multi-line text (1 = font default). */
-  lineSpacing: number;
-}
-
-/** Keychain hole parameters. The hole is a through-hole along Z. */
-export interface HoleParams {
-  enabled: boolean;
-  diameterMm: number;
-  /** Distance from the hole centre to the nearest plate edge, in mm. */
-  edgeMarginMm: number;
-  position: HolePosition;
-}
-
-/** Full, explicit description of a design. Everything the pipeline needs. */
-export interface DesignParams {
-  template: TemplateId;
-  base: BaseParams;
-  text: TextParams;
-  hole: HoleParams;
-  /** Preview material colour (hex string). Does not affect the exported STL. */
-  materialColor: string;
-}
 
 /** Printability thresholds used by validation. Configurable in one place. */
 export interface PrintabilityLimits {
@@ -115,14 +57,4 @@ export interface ValidationResult {
   /** True when there are no blocking errors (warnings are allowed). */
   ok: boolean;
   issues: ValidationIssue[];
-}
-
-/** Statistics about a generated mesh, shown in the validation panel. */
-export interface MeshStats {
-  triangleCount: number;
-  /** Bounding-box dimensions in mm. */
-  dimensionsMm: { x: number; y: number; z: number };
-  /** True when every edge is shared by exactly two triangles. */
-  watertight: boolean;
-  openEdgeCount: number;
 }
