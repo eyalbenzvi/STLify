@@ -74,6 +74,73 @@ export function meshDataBounds(mesh: MeshData): {
   return { min, max };
 }
 
+/**
+ * Apply a column-major 4x4 matrix to the positions (CPU-side). Indices are
+ * shared with the source mesh (positions are copied). If the matrix mirrors
+ * (negative determinant), triangle winding is flipped to keep faces outward.
+ */
+export function transformMeshData(mesh: MeshData, matrix: THREE.Matrix4): MeshData {
+  const e = matrix.elements;
+  const src = mesh.positions;
+  const out = new Float32Array(src.length);
+  for (let i = 0; i < src.length; i += 3) {
+    const x = src[i],
+      y = src[i + 1],
+      z = src[i + 2];
+    out[i] = e[0] * x + e[4] * y + e[8] * z + e[12];
+    out[i + 1] = e[1] * x + e[5] * y + e[9] * z + e[13];
+    out[i + 2] = e[2] * x + e[6] * y + e[10] * z + e[14];
+  }
+  let indices = mesh.indices;
+  if (matrix.determinant() < 0) {
+    indices = new Uint32Array(mesh.indices.length);
+    for (let i = 0; i < mesh.indices.length; i += 3) {
+      indices[i] = mesh.indices[i];
+      indices[i + 1] = mesh.indices[i + 2];
+      indices[i + 2] = mesh.indices[i + 1];
+    }
+  }
+  return { positions: out, indices };
+}
+
+/** Exact volume for closed meshes (signed tetrahedron sum, abs). */
+export function meshDataVolume(mesh: MeshData): number {
+  const p = mesh.positions;
+  const idx = mesh.indices;
+  let volume = 0;
+  for (let i = 0; i < idx.length; i += 3) {
+    const a = idx[i] * 3;
+    const b = idx[i + 1] * 3;
+    const c = idx[i + 2] * 3;
+    volume +=
+      (p[a] * (p[b + 1] * p[c + 2] - p[b + 2] * p[c + 1]) +
+        p[a + 1] * (p[b + 2] * p[c] - p[b] * p[c + 2]) +
+        p[a + 2] * (p[b] * p[c + 1] - p[b + 1] * p[c])) /
+      6;
+  }
+  return Math.abs(volume);
+}
+
+/** Total surface area of the mesh. */
+export function meshDataSurfaceArea(mesh: MeshData): number {
+  const p = mesh.positions;
+  const idx = mesh.indices;
+  let area = 0;
+  for (let i = 0; i < idx.length; i += 3) {
+    const a = idx[i] * 3;
+    const b = idx[i + 1] * 3;
+    const c = idx[i + 2] * 3;
+    const ux = p[b] - p[a],
+      uy = p[b + 1] - p[a + 1],
+      uz = p[b + 2] - p[a + 2];
+    const vx = p[c] - p[a],
+      vy = p[c + 1] - p[a + 1],
+      vz = p[c + 2] - p[a + 2];
+    area += Math.hypot(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx) / 2;
+  }
+  return area;
+}
+
 // ---------------------------------------------------------------------------
 // Base64 serialization (portable design files)
 // ---------------------------------------------------------------------------

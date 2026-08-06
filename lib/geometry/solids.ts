@@ -67,15 +67,17 @@ export function buildBevelledExtrusion(
 
   const steps = Math.min(Math.max(bevel.segments, 2), 8);
   const bodyH = heightMm - bevelH;
-  let solid = kernel.extrude(contours, bodyH + BOOLEAN_OVERLAP_MM);
+  let solid = kernel.extrude(contours, bodyH);
   const slabH = bevelH / steps;
+  // Each slab overlaps DOWNWARD into the previous one, so the stack tops
+  // out exactly at heightMm.
   for (let i = 1; i <= steps; i++) {
     const inset = (bevelH * i) / steps;
     const insetContours = kernel.offsetContours(contours, -inset, "round");
     if (insetContours.length === 0) break; // shape vanished — stop the chamfer
     const slab = kernel
       .extrude(insetContours, slabH + BOOLEAN_OVERLAP_MM)
-      .translate(0, 0, bodyH + (i - 1) * slabH);
+      .translate(0, 0, bodyH + (i - 1) * slabH - BOOLEAN_OVERLAP_MM);
     solid = solid.union(slab);
   }
   return solid;
