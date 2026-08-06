@@ -284,8 +284,11 @@ class ManifoldSolid implements Solid {
       [origin.x, origin.y, origin.z],
       [end.x, end.y, end.z]
     );
+    // Manifold reports distance as a 0..1 fraction of the segment; convert
+    // to millimetres so callers can reason in real units.
+    const segmentLength = Math.hypot(end.x - origin.x, end.y - origin.y, end.z - origin.z);
     return hits.map((hit) => ({
-      distance: hit.distance,
+      distance: hit.distance * segmentLength,
       position: { x: hit.position[0], y: hit.position[1], z: hit.position[2] },
       normal: { x: hit.normal[0], y: hit.normal[1], z: hit.normal[2] },
     }));
