@@ -172,6 +172,29 @@ function validateBase(layer: BaseLayer, limits: Limits, issues: ValidationIssue[
       });
     }
   }
+  if (layer.rimEnabled) {
+    const maxRim = Math.min(layer.widthMm, layer.heightMm) / 2 - 1;
+    if (layer.rimWidthMm <= 0 || layer.rimWidthMm > maxRim) {
+      issues.push({
+        code: "base/rim-width",
+        severity: "error",
+        message: "רוחב השפה המוגבהת גדול מדי ביחס לבסיס",
+      });
+    }
+    if (layer.rimHeightMm <= 0 || layer.rimHeightMm > 20) {
+      issues.push({
+        code: "base/rim-height",
+        severity: "error",
+        message: "גובה השפה המוגבהת חייב להיות בין 0.2 ל-20 מ״מ",
+      });
+    } else if (layer.rimWidthMm < limits.minWallMm) {
+      issues.push({
+        code: "base/rim-thin",
+        severity: "warning",
+        message: `השפה המוגבהת (${layer.rimWidthMm} מ״מ) דקה מהמינימום המומלץ (${limits.minWallMm} מ״מ)`,
+      });
+    }
+  }
 }
 
 function validateExtrusion(
@@ -207,19 +230,20 @@ function validateExtrusion(
       message: `עומק תבליט של ${depth} מ״מ בשכבה "${layer.name}" נמוך מהמינימום המומלץ (${limits.minReliefDepthMm} מ״מ)`,
     });
   }
-  if (!standalone && layer.combine === "engraved" && base) {
+  if (!standalone && (layer.combine === "engraved" || layer.combine === "inlay") && base) {
+    const kindHe = layer.combine === "engraved" ? "החריטה" : "כיס השיבוץ";
     const floor = base.thicknessMm - depth;
     if (floor <= 0) {
       issues.push({
         code: "layer/engrave-through",
         severity: "warning",
-        message: `עומק החריטה של "${layer.name}" גדול מעובי הבסיס — החריטה תחורר את הלוחית`,
+        message: `עומק ${kindHe} של "${layer.name}" גדול מעובי הבסיס — ${kindHe} יחורר את הלוחית`,
       });
     } else if (floor < limits.minEngraveFloorMm) {
       issues.push({
         code: "layer/engrave-floor",
         severity: "warning",
-        message: `נשארת רצפה של ${round2(floor)} מ״מ בלבד מתחת לחריטת "${layer.name}" (מומלץ לפחות ${limits.minEngraveFloorMm} מ״מ)`,
+        message: `נשארת רצפה של ${round2(floor)} מ״מ בלבד מתחת ל${kindHe} של "${layer.name}" (מומלץ לפחות ${limits.minEngraveFloorMm} מ״מ)`,
       });
     }
   }
@@ -281,6 +305,27 @@ function validateText(
       code: "text/line-spacing-range",
       severity: "error",
       message: "מרווח השורות מחוץ לטווח המותר",
+    });
+  }
+  if (!Number.isFinite(layer.letterSpacingMm) || layer.letterSpacingMm < -5 || layer.letterSpacingMm > 20) {
+    issues.push({
+      code: "text/letter-spacing-range",
+      severity: "error",
+      message: "ריווח האותיות חייב להיות בין ‎-5 ל-20 מ״מ",
+    });
+  }
+  if (layer.curveRadiusMm !== 0 && (layer.curveRadiusMm < 10 || layer.curveRadiusMm > 1000)) {
+    issues.push({
+      code: "text/curve-radius-range",
+      severity: "error",
+      message: "רדיוס הקשת חייב להיות בין 10 ל-1000 מ״מ (0 = טקסט ישר)",
+    });
+  }
+  if (layer.mirrored && layer.combine !== "engraved") {
+    issues.push({
+      code: "text/mirrored-note",
+      severity: "warning",
+      message: `הטקסט "${layer.name}" בכתב ראי — מתאים לחותמות; ודאו שזו הכוונה`,
     });
   }
   validateExtrusion(layer, document, base, limits, issues);

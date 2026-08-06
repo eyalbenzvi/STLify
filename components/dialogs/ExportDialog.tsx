@@ -13,7 +13,7 @@ import type { BuiltPart } from "@/hooks/useDocumentBuilder";
 import { getPrintabilityProfile } from "@/types/profiles";
 import { Modal, ModalButton } from "@/components/ui/Modal";
 
-export type ExportKind = "stl" | "zip" | "design";
+export type ExportKind = "stl" | "zip" | "threemf" | "design";
 
 export interface ExportDialogProps {
   open: boolean;
@@ -125,6 +125,15 @@ export function ExportDialog({
           <span>
             ZIP עם STL נפרד לכל חלק/צבע + README{" "}
             <span className="text-xs text-slate-400">({parts.length} חלקים)</span>
+          </span>
+        </label>
+        <label className="flex items-center gap-2">
+          <input type="radio" checked={kind === "threemf"} onChange={() => setKind("threemf")} />
+          <span>
+            קובץ 3MF{" "}
+            <span className="text-xs text-slate-400">
+              (שומר צבעים/חומרים לכל חלק — PrusaSlicer, Bambu, Cura)
+            </span>
           </span>
         </label>
         <label className="flex items-center gap-2">

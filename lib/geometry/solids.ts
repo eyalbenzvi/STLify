@@ -126,6 +126,10 @@ export async function layerContours(
       sizeMm: layer.sizeMm,
       align: layer.align,
       lineSpacing: layer.lineSpacing,
+      letterSpacingMm: layer.letterSpacingMm,
+      direction: layer.direction,
+      curveRadiusMm: layer.curveRadiusMm,
+      mirrored: layer.mirrored,
     });
   }
   return storedContoursResult(layer.contours);
@@ -137,10 +141,36 @@ export async function layerContours(
 
 /** Base plate in local coordinates (centred XY, z ∈ [0, thickness]). */
 export function buildBaseSolid(kernel: GeometryKernel, layer: BaseLayer): Solid {
-  return kernel.extrude([baseOutline(layer)], layer.thicknessMm);
+  const outline = baseOutline(layer);
+  let plate = kernel.extrude([outline], layer.thicknessMm);
+  if (layer.rimEnabled && layer.rimWidthMm > 0 && layer.rimHeightMm > 0) {
+    // Raised border: outline minus an inset outline, extruded on top.
+    const inset = kernel.offsetContours([outline], -layer.rimWidthMm, "round");
+    if (inset.length > 0) {
+      const ringContours: Contour[] = [
+        outline,
+        ...inset.map((c) => [...c].reverse()),
+      ];
+      const ring = kernel
+        .extrude(ringContours, layer.rimHeightMm + BOOLEAN_OVERLAP_MM)
+        .translate(0, 0, layer.thicknessMm - BOOLEAN_OVERLAP_MM);
+      plate = plate.union(ring);
+    }
+  }
+  return plate;
 }
 
 export function baseOutline(layer: BaseLayer): Contour {
+  if (layer.shape === "circle") {
+    const radius = layer.widthMm / 2;
+    const segments = 96;
+    const contour: Contour = [];
+    for (let i = 0; i < segments; i++) {
+      const angle = (i / segments) * Math.PI * 2;
+      contour.push([Math.cos(angle) * radius, Math.sin(angle) * radius]);
+    }
+    return contour;
+  }
   if (layer.shape === "roundedRectangle" && layer.cornerRadiusMm > 0) {
     return sampleContour(
       roundedRectPath(layer.widthMm, layer.heightMm, layer.cornerRadiusMm)
@@ -174,14 +204,18 @@ function roundedRectPath(width: number, height: number, radius: number): THREE.P
   return path;
 }
 
+export type EffectiveCombine = "standalone" | "raised" | "engraved" | "inlay";
+
 /**
  * Solid of a contour layer in local coordinates, positioned for its combine
  * mode (see module docs). Returns null when the layer has no visible shape.
+ * Inlay bodies span z ∈ [-depth, 0] so their top sits flush with the base
+ * top plane they are anchored to.
  */
 export async function buildContourLayerSolid(
   kernel: GeometryKernel,
   layer: TextLayer | SvgLayer | ImageReliefLayer,
-  effectiveCombine: "standalone" | "raised" | "engraved"
+  effectiveCombine: EffectiveCombine
 ): Promise<Solid | null> {
   const result = await layerContours(layer);
   if (result.isEmpty) return null;
@@ -202,9 +236,36 @@ export async function buildContourLayerSolid(
     );
     return solid.translate(0, 0, -BOOLEAN_OVERLAP_MM);
   }
+  if (effectiveCombine === "inlay") {
+    // Flush insert: top at the anchor plane (bevel n/a for flush inlays).
+    return kernel.extrude(result.contours, depth).translate(0, 0, -depth);
+  }
   // engraved: plain prism cutting down from the anchor plane (bevel n/a).
   const solid = kernel.extrude(result.contours, depth + BOOLEAN_OVERLAP_MM);
   return solid.translate(0, 0, -depth);
+}
+
+/**
+ * Pocket cutter for an inlay layer: the layer's outline inflated by the
+ * printing clearance, cutting down from the anchor plane. The pocket is
+ * slightly deeper than the body so the inlay always seats fully.
+ */
+export async function buildInlayPocketCutter(
+  kernel: GeometryKernel,
+  layer: TextLayer | SvgLayer | ImageReliefLayer,
+  clearanceMm: number
+): Promise<Solid | null> {
+  const result = await layerContours(layer);
+  if (result.isEmpty) return null;
+  const depth = layer.extrudeMm;
+  const inflated =
+    clearanceMm > 0
+      ? kernel.offsetContours(result.contours, clearanceMm, "round")
+      : result.contours;
+  if (inflated.length === 0) return null;
+  return kernel
+    .extrude(inflated, depth + BOOLEAN_OVERLAP_MM)
+    .translate(0, 0, -depth);
 }
 
 /** Relief solid stored in the mesh store (image relief in "relief" mode). */
@@ -250,7 +311,7 @@ export function buildHoleCutter(
 export async function buildShapeLayerSolid(
   kernel: GeometryKernel,
   layer: Exclude<DesignLayer, HoleLayer>,
-  effectiveCombine: "standalone" | "raised" | "engraved"
+  effectiveCombine: EffectiveCombine
 ): Promise<Solid | null> {
   switch (layer.type) {
     case "base":

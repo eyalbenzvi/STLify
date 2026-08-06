@@ -159,7 +159,7 @@ function sanitizeBevel(value: unknown): { enabled: boolean; sizeMm: number; segm
 }
 
 const LAYER_TYPES = new Set(["base", "text", "svg", "imageRelief", "importedMesh", "hole"]);
-const COMBINE_MODES = new Set(["raised", "engraved", "standalone"]);
+const COMBINE_MODES = new Set(["raised", "engraved", "inlay", "standalone"]);
 const FONT_IDS = new Set(["alef", "davidLibre", "suezOne", "varelaRound"]);
 
 function sanitizeLayer(
@@ -181,7 +181,7 @@ function sanitizeLayer(
     previewOpacity: Math.max(0.05, Math.min(finiteNumber(raw.previewOpacity, 1), 1)),
   };
   const combine = COMBINE_MODES.has(String(raw.combine))
-    ? (String(raw.combine) as "raised" | "engraved" | "standalone")
+    ? (String(raw.combine) as "raised" | "engraved" | "inlay" | "standalone")
     : "standalone";
 
   switch (raw.type) {
@@ -189,11 +189,17 @@ function sanitizeLayer(
       return {
         ...common,
         type: "base",
-        shape: raw.shape === "roundedRectangle" ? "roundedRectangle" : "rectangle",
+        shape:
+          raw.shape === "roundedRectangle" || raw.shape === "circle"
+            ? raw.shape
+            : "rectangle",
         widthMm: finiteNumber(raw.widthMm, 100),
         heightMm: finiteNumber(raw.heightMm, 50),
         thicknessMm: finiteNumber(raw.thicknessMm, 3),
         cornerRadiusMm: finiteNumber(raw.cornerRadiusMm, 0),
+        rimEnabled: raw.rimEnabled === true,
+        rimWidthMm: Math.max(0.5, Math.min(finiteNumber(raw.rimWidthMm, 2.5), 20)),
+        rimHeightMm: Math.max(0.2, Math.min(finiteNumber(raw.rimHeightMm, 1.2), 20)),
       };
     case "text":
       return {
@@ -210,6 +216,10 @@ function sanitizeLayer(
             ? raw.align
             : "center",
         lineSpacing: finiteNumber(raw.lineSpacing, 1),
+        letterSpacingMm: Math.max(-5, Math.min(finiteNumber(raw.letterSpacingMm, 0), 20)),
+        direction: raw.direction === "ltr" ? "ltr" : "auto",
+        curveRadiusMm: Math.max(0, Math.min(finiteNumber(raw.curveRadiusMm, 0), 1000)),
+        mirrored: raw.mirrored === true,
         extrudeMm: finiteNumber(raw.extrudeMm, 1.5),
         combine,
         bevel: sanitizeBevel(raw.bevel),

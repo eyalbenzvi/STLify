@@ -61,8 +61,28 @@ Open http://localhost:3000. A sample name-plate design is preloaded.
 - **Print preview**: approximate layer-line shading at a configurable layer
   height, labelled "תצוגה מקדימה בלבד — יש לאמת בסלייסר לפני הדפסה".
 - **Export**: single binary STL, ZIP with one STL per part + bilingual
-  README, portable design file. Export is blocked on critical geometry
-  failures and requires acknowledgement for warnings.
+  README, tested 3MF (per-part colours/materials), portable design file.
+  Export is blocked on critical geometry failures and requires
+  acknowledgement for warnings.
+
+### Ported from the V2 branch
+
+- **Text**: letter spacing, LTR direction override, arc (curved) text for
+  medals, mirrored text for stamps.
+- **Inlay combine mode**: flush inserts — the base gets a clearance pocket
+  and the inlay exports as a separate coloured part.
+- **Bases**: circle shape and a raised rim (coasters, medals, plaques).
+- **Templates**: round medal, name tag (rear magnet pocket), fridge magnet,
+  mirrored stamp, coaster, wall plaque with mounting holes, blank.
+- **SVG sanitization**: scripts, event handlers and external references are
+  always stripped before parsing; unsupported features produce Hebrew warnings.
+- **Image import**: fully client-side automatic background removal
+  (border-seeded flood fill) plus brightness/contrast adjustments.
+- **Estimation**: infill/shell-aware material+cost breakdown and a print-time
+  range with a confidence level (labelled as estimates).
+- **Share links**: small designs compress into the URL hash (`#d=…`) — the
+  link IS the data; no server involved. Mesh-bearing designs fall back to
+  file sharing with a clear Hebrew notice.
 
 ## Architecture
 

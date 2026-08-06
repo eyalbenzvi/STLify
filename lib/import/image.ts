@@ -377,12 +377,27 @@ export interface ImageDecodeResult {
   grid: LuminanceGrid;
   sourceWidthPx: number;
   sourceHeightPx: number;
+  /** Fraction of pixels removed as background (0 when removal is off). */
+  backgroundRemovedFraction: number;
+}
+
+export interface ImageDecodeOptions {
+  /**
+   * Automatic background removal (border-seeded flood fill, fully local).
+   * null/undefined = off; otherwise the colour tolerance (0..100).
+   */
+  removeBackgroundTolerance?: number | null;
+  /** Brightness shift, -1..1 (0 = unchanged). */
+  brightness?: number;
+  /** Contrast gain, -1..1 (0 = unchanged). */
+  contrast?: number;
 }
 
 /** Decode an image file to a downsampled luminance grid. */
 export async function decodeImageToGrid(
   file: Blob,
-  resolution: number
+  resolution: number,
+  options: ImageDecodeOptions = {}
 ): Promise<ImageDecodeResult> {
   if (file.size > MAX_IMAGE_BYTES) {
     throw new ImageImportError("קובץ התמונה גדול מדי (מקסימום 20MB)");
@@ -418,14 +433,43 @@ export async function decodeImageToGrid(
   const sourceHeightPx = bitmap.height;
   bitmap.close();
 
+  // Optional client-side background removal before the luminance pass.
+  let bgMask: Uint8Array | null = null;
+  let backgroundRemovedFraction = 0;
+  const tolerance = options.removeBackgroundTolerance;
+  if (tolerance !== null && tolerance !== undefined) {
+    const { removeBackgroundAuto } = await import("./removeBackground");
+    const result = removeBackgroundAuto(
+      { width: w, height: h, data },
+      { tolerance }
+    );
+    bgMask = result.mask;
+    backgroundRemovedFraction = result.backgroundFraction;
+  }
+
+  const brightness = Math.max(-1, Math.min(options.brightness ?? 0, 1));
+  const contrast = Math.max(-1, Math.min(options.contrast ?? 0, 1));
+  const gain = contrast >= 0 ? 1 + contrast * 2 : 1 + contrast * 0.9;
+
   const values = new Float32Array(w * h);
   for (let i = 0; i < w * h; i++) {
     const r = data[i * 4];
     const g = data[i * 4 + 1];
     const b = data[i * 4 + 2];
     const a = data[i * 4 + 3];
-    // Transparent pixels count as background (light).
-    values[i] = a < 8 ? 1 : (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+    // Transparent + removed-background pixels count as background (light).
+    if (a < 8 || (bgMask && bgMask[i] === 0)) {
+      values[i] = 1;
+      continue;
+    }
+    let v = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+    v = (v - 0.5) * gain + 0.5 + brightness;
+    values[i] = Math.max(0, Math.min(1, v));
   }
-  return { grid: { width: w, height: h, values }, sourceWidthPx, sourceHeightPx };
+  return {
+    grid: { width: w, height: h, values },
+    sourceWidthPx,
+    sourceHeightPx,
+    backgroundRemovedFraction,
+  };
 }

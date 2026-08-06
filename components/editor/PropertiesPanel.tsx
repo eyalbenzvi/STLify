@@ -80,8 +80,8 @@ function CombineSelect({
   onChange,
 }: {
   document: DesignDocument;
-  value: "raised" | "engraved" | "standalone";
-  onChange: (v: "raised" | "engraved" | "standalone") => void;
+  value: "raised" | "engraved" | "inlay" | "standalone";
+  onChange: (v: "raised" | "engraved" | "inlay" | "standalone") => void;
 }) {
   if (document.baseMode === "baseless") {
     return (
@@ -91,16 +91,25 @@ function CombineSelect({
     );
   }
   return (
-    <ToggleGroup
-      label="שילוב עם הבסיס"
-      value={value}
-      options={[
-        { value: "raised", label: "מובלט" },
-        { value: "engraved", label: "חרוט" },
-        { value: "standalone", label: "עצמאי" },
-      ]}
-      onChange={onChange}
-    />
+    <>
+      <ToggleGroup
+        label="שילוב עם הבסיס"
+        value={value}
+        options={[
+          { value: "raised", label: "מובלט" },
+          { value: "engraved", label: "חרוט" },
+          { value: "inlay", label: "משובץ" },
+          { value: "standalone", label: "עצמאי" },
+        ]}
+        onChange={onChange}
+      />
+      {value === "inlay" && (
+        <p className="text-xs text-slate-500">
+          שיבוץ: בבסיס נוצר כיס עם חופש הדפסה, והשכבה מיוצאת כחלק נפרד בצבע
+          משלה (הדפסה רב־צבעית).
+        </p>
+      )}
+    </>
   );
 }
 
@@ -195,6 +204,32 @@ function TextProps({
         onChange={(align) => onUpdate({ align }, "יישור טקסט")}
       />
       <NumberField label="מרווח שורות" value={layer.lineSpacing} min={r.lineSpacing.min} max={r.lineSpacing.max} step={0.1} unit="×" onChange={(v) => onUpdate({ lineSpacing: v }, "מרווח שורות")} />
+      <NumberField label="ריווח אותיות" value={layer.letterSpacingMm} min={-5} max={20} step={0.1} onChange={(v) => onUpdate({ letterSpacingMm: v }, "ריווח אותיות")} />
+      <NumberField
+        label="רדיוס קשת (0=ישר)"
+        value={layer.curveRadiusMm}
+        min={0}
+        max={1000}
+        step={5}
+        onChange={(v) => onUpdate({ curveRadiusMm: v === 0 ? 0 : Math.max(v, 10) }, "רדיוס קשת")}
+      />
+      <label className="flex items-center justify-between text-sm">
+        <span className="text-slate-600">כתב ראי (לחותמות)</span>
+        <input
+          type="checkbox"
+          checked={layer.mirrored}
+          onChange={(e) => onUpdate({ mirrored: e.target.checked }, "כתב ראי")}
+        />
+      </label>
+      <ToggleGroup
+        label="כיווניות"
+        value={layer.direction}
+        options={[
+          { value: "auto", label: "אוטומטי" },
+          { value: "ltr", label: "LTR" },
+        ]}
+        onChange={(direction) => onUpdate({ direction }, "כיווניות טקסט")}
+      />
       <NumberField
         label={layer.combine === "engraved" && document.baseMode === "withBase" ? "עומק חריטה" : "עובי/גובה"}
         value={layer.extrudeMm}
@@ -224,15 +259,47 @@ function BaseProps({
         value={layer.shape}
         options={[
           { value: "rectangle", label: "מלבן" },
-          { value: "roundedRectangle", label: "מלבן מעוגל" },
+          { value: "roundedRectangle", label: "מעוגל" },
+          { value: "circle", label: "עיגול" },
         ]}
-        onChange={(shape) => onUpdate({ shape }, "צורת בסיס")}
+        onChange={(shape) =>
+          onUpdate(
+            shape === "circle" ? { shape, heightMm: layer.widthMm } : { shape },
+            "צורת בסיס"
+          )
+        }
       />
-      <NumberField label="רוחב" value={layer.widthMm} min={r.baseWidthMm.min} max={r.baseWidthMm.max} onChange={(v) => onUpdate({ widthMm: v }, "רוחב בסיס")} />
-      <NumberField label="גובה" value={layer.heightMm} min={r.baseHeightMm.min} max={r.baseHeightMm.max} onChange={(v) => onUpdate({ heightMm: v }, "גובה בסיס")} />
+      {layer.shape === "circle" ? (
+        <NumberField
+          label="קוטר"
+          value={layer.widthMm}
+          min={r.baseWidthMm.min}
+          max={r.baseWidthMm.max}
+          onChange={(v) => onUpdate({ widthMm: v, heightMm: v }, "קוטר בסיס")}
+        />
+      ) : (
+        <>
+          <NumberField label="רוחב" value={layer.widthMm} min={r.baseWidthMm.min} max={r.baseWidthMm.max} onChange={(v) => onUpdate({ widthMm: v }, "רוחב בסיס")} />
+          <NumberField label="גובה" value={layer.heightMm} min={r.baseHeightMm.min} max={r.baseHeightMm.max} onChange={(v) => onUpdate({ heightMm: v }, "גובה בסיס")} />
+        </>
+      )}
       <NumberField label="עובי" value={layer.thicknessMm} min={r.baseThicknessMm.min} max={r.baseThicknessMm.max} step={0.5} onChange={(v) => onUpdate({ thicknessMm: v }, "עובי בסיס")} />
       {layer.shape === "roundedRectangle" && (
         <NumberField label="רדיוס פינה" value={layer.cornerRadiusMm} min={0} max={r.cornerRadiusMm.max} onChange={(v) => onUpdate({ cornerRadiusMm: v }, "רדיוס פינה")} />
+      )}
+      <label className="flex items-center justify-between text-sm">
+        <span className="text-slate-600">שפה מוגבהת (מסגרת)</span>
+        <input
+          type="checkbox"
+          checked={layer.rimEnabled}
+          onChange={(e) => onUpdate({ rimEnabled: e.target.checked }, "שפה מוגבהת")}
+        />
+      </label>
+      {layer.rimEnabled && (
+        <>
+          <NumberField label="רוחב השפה" value={layer.rimWidthMm} min={0.5} max={20} step={0.5} onChange={(v) => onUpdate({ rimWidthMm: v }, "רוחב שפה")} />
+          <NumberField label="גובה השפה" value={layer.rimHeightMm} min={0.2} max={20} step={0.2} onChange={(v) => onUpdate({ rimHeightMm: v }, "גובה שפה")} />
+        </>
       )}
     </>
   );

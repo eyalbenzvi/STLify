@@ -15,7 +15,7 @@ import {
   USAGE_PROFILES,
   getPrintabilityProfile,
 } from "@/types/profiles";
-import type { PrintEstimate } from "@/lib/geometry/analysis/estimate";
+import { formatMinutesHe, type DetailedEstimateResult } from "@/lib/geometry/analysis/estimateDetailed";
 import type { ValidationIssue } from "@/lib/geometry/types";
 import { NumberField } from "@/components/ui/NumberField";
 import type { OverlayMode } from "./store";
@@ -26,7 +26,7 @@ export interface AnalysisPanelProps {
   modelIssues: ModelIssue[];
   overlay: OverlayMode;
   analysisBusy: boolean;
-  estimate: PrintEstimate | null;
+  estimate: DetailedEstimateResult | null;
   onSetOverlay: (overlay: OverlayMode) => void;
   onRunAnalysis: () => void;
   onSuggestOrientation: () => void;
@@ -288,12 +288,31 @@ export function AnalysisPanel({
       {/* Estimates */}
       {estimate && (
         <div className="rounded-md border border-slate-200 p-2 text-xs text-slate-600">
-          <p className="mb-1 font-bold text-slate-500">הערכה גסה (לא פלט סלייסר)</p>
-          <p>
-            משקל: ~{estimate.weightGrams} גרם · זמן: ~
-            {Math.floor(estimate.timeMinutes / 60)}:
-            {String(estimate.timeMinutes % 60).padStart(2, "0")} שעות · עלות חומר: ~
-            {estimate.costIls} ₪
+          <p className="mb-1 font-bold text-slate-500">
+            הערכת חומר, זמן ועלות (הערכה בלבד — יש לאמת בסלייסר)
+          </p>
+          <dl className="grid grid-cols-2 gap-x-3 gap-y-0.5">
+            <dt className="text-slate-500">חומר (כולל פחת)</dt>
+            <dd className="text-end">
+              {estimate.materialVolumeCm3} סמ״ק · {estimate.materialWeightGrams} גרם
+            </dd>
+            <dt className="text-slate-500">זמן הדפסה (טווח)</dt>
+            <dd className="text-end">
+              {formatMinutesHe(estimate.time.totalMinutesMin)} – {formatMinutesHe(estimate.time.totalMinutesMax)}
+            </dd>
+            <dt className="text-slate-500">שכבות</dt>
+            <dd className="text-end">{estimate.time.layerCount.toLocaleString()}</dd>
+            <dt className="text-slate-500">עלות חומר</dt>
+            <dd className="text-end">{estimate.materialCostIls} ₪</dd>
+            <dt className="text-slate-500">חשמל + בלאי מכונה</dt>
+            <dd className="text-end">
+              {(estimate.electricityCostIls + estimate.machineCostIls).toFixed(2)} ₪
+            </dd>
+            <dt className="text-slate-500">סה״כ עלות משוערת</dt>
+            <dd className="text-end font-bold">{estimate.totalCostIls} ₪</dd>
+          </dl>
+          <p className="mt-1 text-[11px] text-slate-400">
+            רמת ביטחון: {estimate.time.confidence === "high" ? "גבוהה" : estimate.time.confidence === "medium" ? "בינונית" : "נמוכה"}
           </p>
         </div>
       )}
