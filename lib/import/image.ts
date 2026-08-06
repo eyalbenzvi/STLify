@@ -26,6 +26,54 @@ export interface LuminanceGrid {
 
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 
+/**
+ * `accept` for the image file input.
+ *
+ * A list of specific MIME types (image/png,image/jpeg,…) makes mobile
+ * pickers — Android Chrome in particular — hand the request straight to a
+ * photo app such as Google Photos, hiding Files/Downloads and any image the
+ * gallery does not index. The generic `image/*` plus explicit extensions
+ * keeps every on-device source reachable (gallery, camera, file manager,
+ * cloud providers), so the real format check moves to `validateImageFile`
+ * after selection.
+ */
+export const IMAGE_INPUT_ACCEPT =
+  "image/*,.png,.jpg,.jpeg,.webp,.gif,.bmp,.heic,.heif,.avif";
+
+/** Extensions the picker offers; used to name layers and to sanity-check. */
+const IMAGE_EXTENSION_RE = /\.(png|jpe?g|webp|gif|bmp|heic|heif|avif|tiff?)$/i;
+
+/** Drop a known image extension from a file name (for layer naming). */
+export function stripImageExtension(fileName: string): string {
+  return fileName.replace(IMAGE_EXTENSION_RE, "");
+}
+
+/**
+ * Post-selection check, replacing what a narrow `accept` used to enforce.
+ * Deliberately lenient: mobile pickers often hand over a file with an empty
+ * `type` and no extension, and those must still be allowed through — decode
+ * is the final arbiter. Returns a Hebrew error, or null when acceptable.
+ */
+export function validateImageFile(file: {
+  name: string;
+  type: string;
+  size: number;
+}): string | null {
+  if (file.type === "image/svg+xml" || /\.svg$/i.test(file.name)) {
+    return "זהו קובץ SVG — השתמשו בכפתור ״ייבוא SVG״";
+  }
+  if (file.type && !file.type.startsWith("image/")) {
+    return "הקובץ שנבחר אינו תמונה — בחרו קובץ PNG, JPG או WEBP";
+  }
+  if (!file.type && /\.[a-z0-9]+$/i.test(file.name) && !IMAGE_EXTENSION_RE.test(file.name)) {
+    return "הקובץ שנבחר אינו תמונה — בחרו קובץ PNG, JPG או WEBP";
+  }
+  if (file.size > MAX_IMAGE_BYTES) {
+    return "קובץ התמונה גדול מדי (מקסימום 20MB)";
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Grid utilities
 // ---------------------------------------------------------------------------
@@ -407,7 +455,9 @@ export async function decodeImageToGrid(
   try {
     bitmap = await createImageBitmap(file);
   } catch {
-    throw new ImageImportError("לא ניתן לפענח את קובץ התמונה — ודאו שהוא PNG או JPG תקין");
+    throw new ImageImportError(
+      "לא ניתן לפענח את קובץ התמונה — הדפדפן אינו תומך בפורמט הזה (למשל HEIC מהאייפון). נסו PNG, JPG או WEBP"
+    );
   }
   const scale = res / Math.max(bitmap.width, bitmap.height);
   const w = Math.max(2, Math.round(bitmap.width * scale));

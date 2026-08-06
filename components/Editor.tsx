@@ -77,8 +77,11 @@ import {
   decodeImageToGrid,
   gridToSilhouetteContours,
   heightFieldToClosedMesh,
+  IMAGE_INPUT_ACCEPT,
   ImageImportError,
   smoothGrid,
+  stripImageExtension,
+  validateImageFile,
 } from "@/lib/import/image";
 import { downloadBlob } from "@/lib/export/stl";
 import { meshDataToBinaryStl } from "@/lib/export/stlData";
@@ -943,6 +946,20 @@ function EditorInner() {
     [svgPending, doc, applyDocument, dispatch, runOp]
   );
 
+  /**
+   * The image input accepts `image/*` so mobile pickers expose every source
+   * on the device, which means an unsuitable file can reach us — check it
+   * here instead of relying on the picker's filter.
+   */
+  const handleImageFile = useCallback((file: File) => {
+    const error = validateImageFile({ name: file.name, type: file.type, size: file.size });
+    if (error) {
+      setMessage({ titleHe: "ייבוא תמונה", bodyHe: error, kind: "error" });
+      return;
+    }
+    setImagePending({ file, fileName: file.name });
+  }, []);
+
   const handleImageConfirm = useCallback(
     (options: ImageImportOptionsValue) => {
       const pending = imagePending;
@@ -978,7 +995,7 @@ function EditorInner() {
           layer = {
             id: newId("layer"),
             type: "imageRelief",
-            name: pending.fileName.replace(/\.(png|jpe?g|webp)$/i, ""),
+            name: stripImageExtension(pending.fileName),
             visible: true,
             locked: false,
             materialSlotId: doc.materialSlots[0]?.id ?? "slot1",
@@ -1018,7 +1035,7 @@ function EditorInner() {
           layer = {
             id: newId("layer"),
             type: "imageRelief",
-            name: pending.fileName.replace(/\.(png|jpe?g|webp)$/i, ""),
+            name: stripImageExtension(pending.fileName),
             visible: true,
             locked: false,
             materialSlotId: doc.materialSlots[0]?.id ?? "slot1",
@@ -1670,7 +1687,7 @@ function EditorInner() {
       {/* Hidden file inputs */}
       <input ref={stlInputRef} type="file" accept=".stl" className="hidden" aria-label="קובץ STL" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void handleStlFile(f); }} />
       <input ref={svgInputRef} type="file" accept=".svg" className="hidden" aria-label="קובץ SVG" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) { void f.text().then((text) => setSvgPending({ text, fileName: f.name })); } }} />
-      <input ref={imageInputRef} type="file" accept="image/png,image/jpeg,image/webp" className="hidden" aria-label="קובץ תמונה" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) setImagePending({ file: f, fileName: f.name }); }} />
+      <input ref={imageInputRef} type="file" accept={IMAGE_INPUT_ACCEPT} className="hidden" aria-label="קובץ תמונה" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) handleImageFile(f); }} />
       <input ref={designInputRef} type="file" accept=".json,.formadesign.json" className="hidden" aria-label="קובץ עיצוב" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void handleDesignFile(f); }} />
 
       {/* Dialogs */}
