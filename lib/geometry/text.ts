@@ -20,6 +20,17 @@ export interface TextLayoutOptions {
   align: TextAlign;
   /** Line spacing multiplier (1 = font default line height). */
   lineSpacing: number;
+  /** Extra spacing between glyphs, in mm (default 0). */
+  letterSpacingMm?: number;
+  /** Force text direction; "auto" (default) detects RTL runs. */
+  direction?: "auto" | "rtl" | "ltr";
+  /**
+   * Bend each line along a circle of this radius (mm); 0/undefined =
+   * straight. The line's centre stays at y=0, edges curve downward.
+   */
+  curveRadiusMm?: number;
+  /** Mirror the result horizontally (stamps). */
+  mirrored?: boolean;
 }
 
 export interface TextContoursResult {
@@ -45,20 +56,26 @@ export function textToContours(
   options: TextLayoutOptions
 ): TextContoursResult {
   const { sizeMm, align, lineSpacing } = options;
+  const letterSpacingMm = options.letterSpacingMm ?? 0;
+  const direction = options.direction ?? "auto";
+  const curveRadiusMm = options.curveRadiusMm ?? 0;
   const lines = content.split("\n").map((line) => line.trimEnd());
   const scale = sizeMm / font.unitsPerEm;
   const lineHeight = (font.ascender - font.descender) * scale * lineSpacing;
 
   const shapePath = new THREE.ShapePath();
 
+  const orderLine = (line: string): string =>
+    direction === "ltr" ? line : toVisualOrder(line);
+
   const lineWidths = lines.map((line) =>
-    line ? measureLine(font, toVisualOrder(line), sizeMm) : 0
+    line ? measureLine(font, orderLine(line), sizeMm, letterSpacingMm) : 0
   );
   const blockWidth = Math.max(...lineWidths, 0);
 
   lines.forEach((line, index) => {
     if (!line) return;
-    const visual = toVisualOrder(line);
+    const visual = orderLine(line);
     const width = lineWidths[index];
 
     // Alignment offsets within the block (align is visual, not logical).
@@ -70,14 +87,22 @@ export function textToContours(
     // addCommandsToPath to get the y-up modelling convention, so line 0 is
     // at y=0 and following lines go down in negative y.
     const baselineY = -index * lineHeight;
-    layoutLine(font, visual, x0, sizeMm, (commands) =>
-      addCommandsToPath(shapePath, commands, baselineY)
-    );
+    const lineCenter = x0 + width / 2;
+    layoutLine(font, visual, x0, sizeMm, letterSpacingMm, (commands, penX, advance) => {
+      if (curveRadiusMm > 0) {
+        const bent = bendCommands(commands, penX + advance / 2, lineCenter, curveRadiusMm);
+        addCommandsToPath(shapePath, bent, baselineY);
+      } else {
+        addCommandsToPath(shapePath, commands, baselineY);
+      }
+    });
   });
 
-  const contours = shapePath.subPaths
+  let contours = shapePath.subPaths
     .map((subPath) => sampleContour(subPath))
     .filter((contour) => contour.length >= 3);
+
+  if (options.mirrored) contours = mirrorContours(contours);
 
   if (contours.length === 0) return EMPTY_RESULT;
 
@@ -141,7 +166,8 @@ function layoutLine(
   visualText: string,
   x0: number,
   sizeMm: number,
-  emit: (commands: PathCommand[]) => void
+  letterSpacingMm: number,
+  emit: (commands: PathCommand[], penX: number, advance: number) => void
 ): void {
   const scale = sizeMm / font.unitsPerEm;
   let x = x0;
@@ -149,28 +175,89 @@ function layoutLine(
   for (const char of visualText) {
     const glyph = font.charToGlyph(char);
     if (prev) {
-      x += font.getKerningValue(prev, glyph) * scale;
+      x += font.getKerningValue(prev, glyph) * scale + letterSpacingMm;
     }
-    emit(glyph.getPath(x, 0, sizeMm).commands);
-    x += (glyph.advanceWidth ?? 0) * scale;
+    const advance = (glyph.advanceWidth ?? 0) * scale;
+    emit(glyph.getPath(x, 0, sizeMm).commands, x, advance);
+    x += advance;
     prev = glyph;
   }
 }
 
 /** Measure the advance width of a visual-order line, in mm. */
-function measureLine(font: Font, visualText: string, sizeMm: number): number {
+function measureLine(
+  font: Font,
+  visualText: string,
+  sizeMm: number,
+  letterSpacingMm = 0
+): number {
   const scale = sizeMm / font.unitsPerEm;
   let width = 0;
   let prev: ReturnType<Font["charToGlyph"]> | null = null;
   for (const char of visualText) {
     const glyph = font.charToGlyph(char);
     if (prev) {
-      width += font.getKerningValue(prev, glyph) * scale;
+      width += font.getKerningValue(prev, glyph) * scale + letterSpacingMm;
     }
     width += (glyph.advanceWidth ?? 0) * scale;
     prev = glyph;
   }
   return width;
+}
+
+/**
+ * Bend one glyph's path commands along a circle of the given radius. The
+ * glyph's centre (at pen position glyphCenterX) maps onto the circle so the
+ * line's middle stays at y=0 and the ends curve downward (medal-style arc).
+ * Coordinates here are still y-down (font space); y is negated later.
+ */
+function bendCommands(
+  commands: PathCommand[],
+  glyphCenterX: number,
+  lineCenterX: number,
+  radiusMm: number
+): PathCommand[] {
+  const phi = (glyphCenterX - lineCenterX) / radiusMm;
+  const cos = Math.cos(phi);
+  const sin = Math.sin(phi);
+  // Font space is y-down; the arc math is for y-up, so negate on the way
+  // in and out. Rotate the glyph by -phi around its baseline centre, then
+  // translate the baseline point onto the circle.
+  const tx = radiusMm * sin;
+  const ty = radiusMm * cos - radiusMm;
+  const map = (x: number, yDown: number): { x: number; y: number } => {
+    const lx = x - glyphCenterX;
+    const ly = -yDown;
+    const rx = lx * cos + ly * sin;
+    const ry = -lx * sin + ly * cos;
+    return { x: rx + tx, y: -(ry + ty) };
+  };
+  return commands.map((cmd) => {
+    const next = { ...cmd };
+    if (next.x !== undefined && next.y !== undefined) {
+      const p = map(next.x, next.y);
+      next.x = p.x;
+      next.y = p.y;
+    }
+    if (next.x1 !== undefined && next.y1 !== undefined) {
+      const p = map(next.x1, next.y1);
+      next.x1 = p.x;
+      next.y1 = p.y;
+    }
+    if (next.x2 !== undefined && next.y2 !== undefined) {
+      const p = map(next.x2, next.y2);
+      next.x2 = p.x;
+      next.y2 = p.y;
+    }
+    return next;
+  });
+}
+
+/** Mirror contours around x=0, preserving winding by reversing point order. */
+export function mirrorContours(contours: Contour[]): Contour[] {
+  return contours.map((contour) =>
+    contour.map(([x, y]): [number, number] => [-x, y]).reverse()
+  );
 }
 
 /** Append opentype path commands to a ShapePath, flipping Y to y-up. */

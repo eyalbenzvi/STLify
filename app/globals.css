@@ -8,3 +8,26 @@
 body {
   font-family: var(--font-hebrew);
 }
+
+/* Preview faces for the font browser — the same TTFs the geometry pipeline
+   uses, so the 2D preview matches the printed result. */
+@font-face {
+  font-family: "Alef Preview";
+  src: url("/fonts/Alef-Regular.ttf") format("truetype");
+  font-display: swap;
+}
+@font-face {
+  font-family: "David Libre Preview";
+  src: url("/fonts/DavidLibre-Regular.ttf") format("truetype");
+  font-display: swap;
+}
+@font-face {
+  font-family: "Suez One Preview";
+  src: url("/fonts/SuezOne-Regular.ttf") format("truetype");
+  font-display: swap;
+}
+@font-face {
+  font-family: "Varela Round Preview";
+  src: url("/fonts/VarelaRound-Regular.ttf") format("truetype");
+  font-display: swap;
+}
