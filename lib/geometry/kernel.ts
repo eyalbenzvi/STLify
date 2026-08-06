@@ -72,6 +72,10 @@ export interface Solid {
   simplify(toleranceMm: number): Solid;
   /** Convex hull. Consumes this solid. */
   hull(): Solid;
+  /** Morphological dilation by another solid. Consumes both. EXPENSIVE. */
+  minkowskiSum(other: Solid): Solid;
+  /** Morphological erosion by another solid. Consumes both. EXPENSIVE. */
+  minkowskiDifference(other: Solid): Solid;
   /** A second independent handle to the same solid. Does NOT consume. */
   duplicate(): Solid;
   /** True when the solid contains no geometry. */
@@ -217,6 +221,22 @@ class ManifoldSolid implements Solid {
 
   hull(): Solid {
     return this.wrap(this.manifold.hull());
+  }
+
+  minkowskiSum(other: Solid): Solid {
+    const b = (other as ManifoldSolid).manifold;
+    const next = this.manifold.minkowskiSum(b);
+    this.manifold.delete();
+    b.delete();
+    return new ManifoldSolid(next);
+  }
+
+  minkowskiDifference(other: Solid): Solid {
+    const b = (other as ManifoldSolid).manifold;
+    const next = this.manifold.minkowskiDifference(b);
+    this.manifold.delete();
+    b.delete();
+    return new ManifoldSolid(next);
   }
 
   duplicate(): Solid {
