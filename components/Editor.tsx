@@ -193,6 +193,7 @@ import {
 import { resolveParameters, type ParameterDefinition } from "@/lib/geometry/expression";
 import { garbageCollect, meshStoreStats, type MeshStoreStats } from "@/lib/geometry/meshStore";
 import { referencedMeshIds } from "@/lib/history/history";
+import { sweepUnreferencedMeshes } from "@/lib/history/retention";
 import {
   clearSnapshot,
   describeSnapshotAge,
@@ -1695,6 +1696,20 @@ function EditorInner() {
     void memoryVersion;
     return meshStoreStats();
   }, [doc, memoryVersion]);
+
+  // The history is bounded (HISTORY_CAPACITY): entries that fall off the old
+  // end may hold the last reference to a stored mesh, so every history change
+  // sweeps the store. A pending STL import (stored, previewed, not yet a
+  // layer) is passed as an extra root or an edit made while its dialog is
+  // open would free it out from under the confirm button.
+  useEffect(() => {
+    const pendingStl = pendingStlRef.current;
+    const result = sweepUnreferencedMeshes(
+      state.history,
+      pendingStl ? [pendingStl.meshId] : []
+    );
+    if (result.removed > 0) setMemoryVersion((v) => v + 1);
+  }, [state.history]);
 
   const handleCollectGarbage = useCallback(() => {
     // Sweep against the union of every state in the history: a mesh that only
