@@ -147,6 +147,7 @@ import {
   type StlImportPreview,
 } from "@/components/dialogs/ImportDialogs";
 import { ExportDialog, type ExportKind } from "@/components/dialogs/ExportDialog";
+import { LibraryDialog } from "@/components/dialogs/LibraryDialog";
 import { CreatePanel, type GeneratorKind } from "@/components/editor/CreatePanel";
 import {
   SubObjectPanel,
@@ -295,6 +296,7 @@ function EditorInner() {
   const [svgPending, setSvgPending] = useState<{ text: string; fileName: string } | null>(null);
   const [imagePending, setImagePending] = useState<{ file: File; fileName: string } | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
+  const [libraryOpen, setLibraryOpen] = useState(false);
   const [orientationCandidates, setOrientationCandidates] = useState<OrientationCandidate[] | null>(null);
   const [modeSwitchTarget, setModeSwitchTarget] = useState<"withBase" | "baseless" | null>(null);
   const [modelIssues, setModelIssues] = useState<ModelIssue[]>([]);
@@ -2465,6 +2467,14 @@ function EditorInner() {
           <button
             type="button"
             className="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-sm text-slate-600 hover:bg-slate-50"
+            title="ספריית עיצובים עם גרסאות — במכשיר זה בלבד, ללא חשבון וללא סנכרון"
+            onClick={() => setLibraryOpen(true)}
+          >
+            ספרייה
+          </button>
+          <button
+            type="button"
+            className="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-sm text-slate-600 hover:bg-slate-50"
             title="קישור שמכיל את העיצוב עצמו — לעיצובים קטנים בלבד"
             onClick={handleShareLink}
           >
@@ -2897,6 +2907,21 @@ function EditorInner() {
         buildOk={build.status === "ok"}
         onExport={handleExport}
         onClose={() => setExportOpen(false)}
+      />
+      <LibraryDialog
+        open={libraryOpen}
+        document={doc}
+        onClose={() => setLibraryOpen(false)}
+        onLoad={(loaded, labelHe, warningsHe) => {
+          applyDocument(loaded, labelHe);
+          dispatch({ type: "ui/select", selection: [] });
+          if (warningsHe.length > 0) {
+            setMessage({ titleHe: labelHe, bodyHe: warningsHe.join("\n"), kind: "info" });
+          }
+        }}
+        onError={(messageHe) =>
+          setMessage({ titleHe: "ספריית עיצובים", bodyHe: messageHe, kind: "error" })
+        }
       />
       <OrientationDialog
         candidates={orientationCandidates}
