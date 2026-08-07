@@ -39,6 +39,22 @@ export interface SolidRayHit {
   normal: { x: number; y: number; z: number };
 }
 
+/** An axis-aligned region of space, in mm. */
+export interface BoxBounds {
+  min: { x: number; y: number; z: number };
+  max: { x: number; y: number; z: number };
+}
+
+/** Options for the twist/taper-capable extrusion. */
+export interface ExtrudeOptions {
+  /** Intermediate slices along Z. Twisting needs > 1 to look smooth. */
+  divisions?: number;
+  /** Total rotation of the top cross-section relative to the bottom. */
+  twistDegrees?: number;
+  /** Uniform (number) or per-axis [x, y] scale applied to the top. */
+  scaleTop?: number | [number, number];
+}
+
 /** An opaque solid handle produced by the kernel. */
 export interface Solid {
   /** Translate in mm. Consumes this solid and returns a new one. */
@@ -72,6 +88,26 @@ export interface Solid {
   simplify(toleranceMm: number): Solid;
   /** Convex hull. Consumes this solid. */
   hull(): Solid;
+  /**
+   * Split by another solid: returns [intersection, difference]. Consumes
+   * this solid and the cutter.
+   */
+  splitBySolid(cutter: Solid): [Solid, Solid];
+  /** Outline of the shadow cast onto the XY plane. Does NOT consume. */
+  projectToXY(): Contour[];
+  /**
+   * Move every vertex through `fn` without changing topology. The caller is
+   * responsible for choosing a deformation that does not self-intersect.
+   * Consumes this solid.
+   */
+  warp(fn: (p: { x: number; y: number; z: number }) => { x: number; y: number; z: number }): Solid;
+  /** Subdivide until no edge is longer than `lengthMm`. Consumes. */
+  refineToLength(lengthMm: number): Solid;
+  /**
+   * Fill in tangents so edges below `minSharpAngleDeg` become smooth, then
+   * refine to realise the curvature. Consumes this solid.
+   */
+  smoothOut(minSharpAngleDeg: number, minSmoothness: number, refineLengthMm: number): Solid;
   /** Morphological dilation by another solid. Consumes both. EXPENSIVE. */
   minkowskiSum(other: Solid): Solid;
   /** Morphological erosion by another solid. Consumes both. EXPENSIVE. */
@@ -110,11 +146,33 @@ export interface GeometryKernel {
    * z in [0, heightMm].
    */
   extrude(contours: Contour[], heightMm: number): Solid;
+  /** Extrusion with optional twist and top taper (screw threads, vases). */
+  extrudeAdvanced(contours: Contour[], heightMm: number, options: ExtrudeOptions): Solid;
+  /**
+   * Revolve contours around the Y axis of the contour plane, mapping the
+   * contour's +X to the radius and +Y to the world +Z. Contours must not
+   * cross x = 0.
+   */
+  revolve(contours: Contour[], degrees?: number, segments?: number): Solid;
   /** A cylinder of the given radius spanning z in [0, heightMm]. */
   cylinder(radiusMm: number, heightMm: number, segments?: number): Solid;
+  /** A cone/frustum spanning z in [0, heightMm]. */
+  cone(bottomRadiusMm: number, topRadiusMm: number, heightMm: number, segments?: number): Solid;
+  /** A torus in the XY plane, centred on the origin. */
+  torus(majorRadiusMm: number, minorRadiusMm: number, segments?: number): Solid;
   /** An axis-aligned box. When center=true it is centred on the origin. */
   box(xMm: number, yMm: number, zMm: number, center?: boolean): Solid;
   sphere(radiusMm: number, segments?: number): Solid;
+  /**
+   * Marching-tetrahedra surface of a signed-distance function (positive =
+   * inside). `edgeLengthMm` drives both cost and fidelity.
+   */
+  levelSet(
+    sdf: (p: { x: number; y: number; z: number }) => number,
+    bounds: BoxBounds,
+    edgeLengthMm: number,
+    level?: number
+  ): Solid;
   /**
    * Offset (inflate > 0 / deflate < 0) closed contours using Clipper2.
    * Returns the resolved polygons; an empty array means the shape vanished.
@@ -221,6 +279,56 @@ class ManifoldSolid implements Solid {
 
   hull(): Solid {
     return this.wrap(this.manifold.hull());
+  }
+
+  splitBySolid(cutter: Solid): [Solid, Solid] {
+    const c = (cutter as ManifoldSolid).manifold;
+    const [inside, outside] = this.manifold.split(c);
+    this.manifold.delete();
+    c.delete();
+    return [new ManifoldSolid(inside), new ManifoldSolid(outside)];
+  }
+
+  projectToXY(): Contour[] {
+    const section = this.manifold.project();
+    const polygons = section.toPolygons().map((poly) =>
+      poly.map((p): Vec2Tuple => [p[0], p[1]])
+    );
+    section.delete();
+    return polygons;
+  }
+
+  warp(
+    fn: (p: { x: number; y: number; z: number }) => { x: number; y: number; z: number }
+  ): Solid {
+    return this.wrap(
+      this.manifold.warpBatch((verts, count) => {
+        for (let i = 0; i < count; i++) {
+          const o = i * 3;
+          const next = fn({ x: verts[o], y: verts[o + 1], z: verts[o + 2] });
+          verts[o] = next.x;
+          verts[o + 1] = next.y;
+          verts[o + 2] = next.z;
+        }
+      })
+    );
+  }
+
+  refineToLength(lengthMm: number): Solid {
+    if (!(lengthMm > 0)) return this;
+    return this.wrap(this.manifold.refineToLength(lengthMm));
+  }
+
+  smoothOut(minSharpAngleDeg: number, minSmoothness: number, refineLengthMm: number): Solid {
+    const smoothed = this.manifold.smoothOut(minSharpAngleDeg, minSmoothness);
+    this.manifold.delete();
+    // smoothOut only fills tangents; refining realises the curved surface.
+    if (refineLengthMm > 0) {
+      const refined = smoothed.refineToLength(refineLengthMm);
+      smoothed.delete();
+      return new ManifoldSolid(refined);
+    }
+    return new ManifoldSolid(smoothed);
   }
 
   minkowskiSum(other: Solid): Solid {
@@ -336,11 +444,59 @@ class ManifoldKernel implements GeometryKernel {
     return new ManifoldSolid(solid);
   }
 
+  extrudeAdvanced(contours: Contour[], heightMm: number, options: ExtrudeOptions): Solid {
+    const { CrossSection, Manifold } = this.wasm;
+    const section = new CrossSection(contours, "NonZero");
+    // Always pass scaleTop as an explicit [x, y] pair: the scalar overload of
+    // Manifold.extrude collapses the Y factor to 0 (a uniform 0.5 taper comes
+    // out as a taper to a degenerate line), so a number must be broadcast here.
+    const raw = options.scaleTop ?? 1;
+    const scaleTop: [number, number] = typeof raw === "number" ? [raw, raw] : raw;
+    const solid = Manifold.extrude(
+      section,
+      heightMm,
+      options.divisions ?? 0,
+      options.twistDegrees ?? 0,
+      scaleTop
+    );
+    section.delete();
+    return new ManifoldSolid(solid);
+  }
+
+  revolve(contours: Contour[], degrees = 360, segments = 64): Solid {
+    const { CrossSection, Manifold } = this.wasm;
+    const section = new CrossSection(contours, "NonZero");
+    const solid = Manifold.revolve(section, segments, degrees);
+    section.delete();
+    return new ManifoldSolid(solid);
+  }
+
   cylinder(radiusMm: number, heightMm: number, segments = 64): Solid {
     const { Manifold } = this.wasm;
     return new ManifoldSolid(
       Manifold.cylinder(heightMm, radiusMm, radiusMm, segments)
     );
+  }
+
+  cone(bottomRadiusMm: number, topRadiusMm: number, heightMm: number, segments = 64): Solid {
+    const { Manifold } = this.wasm;
+    return new ManifoldSolid(
+      Manifold.cylinder(heightMm, bottomRadiusMm, topRadiusMm, segments)
+    );
+  }
+
+  torus(majorRadiusMm: number, minorRadiusMm: number, segments = 48): Solid {
+    // A circle at x = majorRadius revolved around the Y axis (= world Z).
+    const circle: Contour = [];
+    const ringSegments = Math.max(8, Math.round(segments / 2));
+    for (let i = 0; i < ringSegments; i++) {
+      const a = (i / ringSegments) * Math.PI * 2;
+      circle.push([
+        majorRadiusMm + minorRadiusMm * Math.cos(a),
+        minorRadiusMm * Math.sin(a),
+      ]);
+    }
+    return this.revolve([circle], 360, segments);
   }
 
   box(xMm: number, yMm: number, zMm: number, center = false): Solid {
@@ -351,6 +507,22 @@ class ManifoldKernel implements GeometryKernel {
   sphere(radiusMm: number, segments = 48): Solid {
     const { Manifold } = this.wasm;
     return new ManifoldSolid(Manifold.sphere(radiusMm, segments));
+  }
+
+  levelSet(
+    sdf: (p: { x: number; y: number; z: number }) => number,
+    bounds: BoxBounds,
+    edgeLengthMm: number,
+    level = 0
+  ): Solid {
+    const { Manifold } = this.wasm;
+    const solid = Manifold.levelSet(
+      (point) => sdf({ x: point[0], y: point[1], z: point[2] }),
+      { min: [bounds.min.x, bounds.min.y, bounds.min.z], max: [bounds.max.x, bounds.max.y, bounds.max.z] },
+      edgeLengthMm,
+      level
+    );
+    return new ManifoldSolid(solid);
   }
 
   offsetContours(contours: Contour[], deltaMm: number, join: ContourJoin = "round"): Contour[] {
