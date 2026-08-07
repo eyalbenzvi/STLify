@@ -93,9 +93,15 @@ import type { LatticeSettings } from "@/lib/geometry/operations/lattice";
 import { buildPattern, PatternError, type PatternSettings } from "@/lib/geometry/operations/pattern";
 import {
   arrangeOnPlate,
+  convexHullXY,
   detectInterference,
   type InterferenceReport,
 } from "@/lib/geometry/analysis/collision";
+import {
+  matrix4ToTransform,
+  snapTransformNoise,
+  transformToMatrix4,
+} from "@/lib/geometry/transform";
 import {
   buildEnclosure,
   buildGear,
@@ -1236,13 +1242,32 @@ function EditorInner() {
   }, [build.parts, runOp]);
 
   const handleArrangePlate = useCallback(() => {
-    const items = build.parts.map((part) => ({
-      layerId: part.primaryLayerId,
-      widthMm: part.stats.dimensionsMm.x,
-      depthMm: part.stats.dimensionsMm.y,
-      currentX: (part.stats.bounds.min.x + part.stats.bounds.max.x) / 2,
-      currentY: (part.stats.bounds.min.y + part.stats.bounds.max.y) / 2,
-    }));
+    const layerById = new Map(doc.layers.map((l) => [l.id, l]));
+    const items = build.parts.map((part) => {
+      const layer = layerById.get(part.primaryLayerId);
+      const currentX = (part.stats.bounds.min.x + part.stats.bounds.max.x) / 2;
+      const currentY = (part.stats.bounds.min.y + part.stats.bounds.max.y) / 2;
+      // The REAL footprint: convex hull of the world mesh's XY projection
+      // (relative to the part centre) — a diagonal part stops costing its
+      // huge axis-aligned box.
+      const points: [number, number][] = [];
+      const pos = part.worldMesh.positions;
+      for (let i = 0; i < pos.length; i += 3) {
+        points.push([pos[i] - currentX, pos[i + 1] - currentY]);
+      }
+      return {
+        layerId: part.primaryLayerId,
+        widthMm: part.stats.dimensionsMm.x,
+        depthMm: part.stats.dimensionsMm.y,
+        currentX,
+        currentY,
+        hull: convexHullXY(points),
+        // Rotation composes into the layer transform, which is only sound
+        // for a free-standing layer — parents and pivots change what a Z
+        // rotation about the part centre means.
+        allowRotation: !!layer && !layer.locked && !layer.parentId && !layer.pivot,
+      };
+    });
     if (items.length === 0) return;
     const result = arrangeOnPlate(items, {
       plateWidthMm: printer.buildVolumeMm.x,
@@ -1255,6 +1280,25 @@ function EditorInner() {
       if (!placement) return layer;
       const item = items.find((i) => i.layerId === layer.id);
       if (!item) return layer;
+      if (placement.rotationDeg !== 0) {
+        // Rotate about the part's current centre, then move the centre to
+        // its shelf position — composed on the layer's own matrix.
+        const rad = (placement.rotationDeg * Math.PI) / 180;
+        const pivotRotation = new THREE.Matrix4()
+          .makeTranslation(item.currentX, item.currentY, 0)
+          .multiply(new THREE.Matrix4().makeRotationZ(rad))
+          .multiply(new THREE.Matrix4().makeTranslation(-item.currentX, -item.currentY, 0));
+        const move = new THREE.Matrix4().makeTranslation(
+          placement.x - item.currentX,
+          placement.y - item.currentY,
+          0
+        );
+        const next = move.multiply(pivotRotation).multiply(transformToMatrix4(layer.transform));
+        return {
+          ...layer,
+          transform: snapTransformNoise(matrix4ToTransform(next)),
+        } as DesignLayer;
+      }
       // Placements are absolute plate positions; shift the layer transform by
       // the delta so any local offset baked into the mesh is preserved.
       return {
