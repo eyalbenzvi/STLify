@@ -30,6 +30,7 @@ import type { PrinterProfile } from "@/types/profiles";
 import type { BuiltPart } from "@/hooks/useDocumentBuilder";
 import { matrix4ToTransform, snapTransformNoise } from "@/lib/geometry/transform";
 import { activePaints } from "@/lib/geometry/painting";
+import { createBvhRaycast } from "@/lib/geometry/viewportRaycast";
 import type {
   EditorTool,
   OverlayMode,
@@ -205,10 +206,16 @@ const PartMesh = memo(function PartMesh({
     return part.geometry.boundingBox ?? new THREE.Box3();
   }, [part.geometry]);
 
+  // Picking goes through the project BVH instead of three's linear scan —
+  // same closest-hit semantics, O(log n) per pointer move. Cached per
+  // localMesh identity, so a rebuild swaps in a fresh index automatically.
+  const raycast = useMemo(() => createBvhRaycast(part.localMesh), [part.localMesh]);
+
   return (
     <group ref={groupRef}>
       <mesh
         geometry={part.geometry}
+        raycast={raycast}
         onClick={(event) => onClick(event, part)}
         onPointerOver={(e) => {
           if (pickMode) {
