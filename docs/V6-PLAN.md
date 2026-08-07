@@ -71,4 +71,69 @@ verifies a call happened does not count. `npm test`, `npm run lint`,
 
 ## Outcome
 
-(Recorded as work progresses; completed at the end.)
+All twenty items are implemented and each landed as its own commit with
+tests that measure results. Verification at the end of Wave 5: 482 unit
+tests across 39 files, 26 Playwright journeys, `eslint` clean (0 errors,
+0 warnings), `tsc --noEmit` clean, `next build` clean, plus the separate
+`npm run bench` performance budgets. The places where the result differs
+from the plan, recorded rather than quietly dropped:
+
+- **The review document itself was missing.** The plan named
+  `docs/EXPERT-REVIEW-V5.md` as an input; it does not exist in the
+  repository. The findings embedded in the work order (file references
+  included) were used as the authoritative source.
+- **Item 3 was half-done already.** A history cap existed (100) and so did
+  the memory readout; what was genuinely missing was the sweep — nothing
+  freed the meshes trimmed entries had referenced. The cap moved to a
+  documented 50 and `lib/history/retention.ts` now sweeps on every history
+  change, with pending-import meshes protected as extra GC roots.
+- **Item 7's "export bake" needed no new job.** World meshes are baked
+  inside `buildDocument`, which item 5 already moved to the worker. The
+  one export-time kernel task still in-process is the PAINT SPLIT
+  (`splitPartsByPaint`): export is a one-shot user action and its meshes
+  double as live viewport buffers that must not be transferred. Recorded
+  as a residual, not hidden.
+- **Worker-path identity is proven in the browser, not in vitest.** vitest
+  cannot spawn module workers, so the "identical result on both paths"
+  tests execute the exact registry handler in-process; the worker path
+  itself is pinned end-to-end by Playwright, including a
+  `data-build-ran-on="worker"` assertion that fails the suite on a silent
+  fallback to the main thread.
+- **Item 11's "closer than the old model" needed a reference.** No slicer
+  runs in the test environment, so the reference is a perimeter-aware
+  ANALYTIC computation (exact per-layer perimeter/area of a plate,
+  hand-derived) sharing the model's speed constants but none of its
+  measurement code. The slice measurements themselves are verified against
+  closed-form values (cube, plate, hollow cylinder: perimeter 2π(R+r),
+  area π(R²−r²)). On the thin-plate case the old model missed the
+  reference by ~20%; the new one lands within minutes of it.
+- **Item 15 implements 15° candidates, but rectangles use only 0°/90°** —
+  by construction: a rotated rectangle's bounding box only grows at
+  intermediate angles, and the deterministic (fits, depth, width, angle)
+  ordering never picks a worse box. Real convex hulls do use the finer
+  steps (the diagonal-rod test chooses 135°).
+- **Item 18's F frames by pan + distance fit** along the current viewing
+  direction (radius-based), not a full aspect-aware zoom-to-fit. En route
+  it exposed and fixed a real bug: multi-select Delete looped the
+  single-delete handler over the same stale document, so only the last
+  deletion survived.
+- **Item 20 SHIPPED — the feasibility risk resolved in favour.** Because
+  the workaround composes only Manifold booleans (round a whole-body
+  duplicate, intersect with a zone box, union with the original outside
+  the zone), the result is watertight by construction. The feared seam
+  exists but as a small COSMETIC step where a rounded edge crosses the
+  zone boundary — named in the tooltip, the panel text and the operation's
+  warnings — and a validity gate (kernel status + volume-delta bound)
+  refuses anything worse rather than saving it.
+- **Item 16 has no unit tests, by environment.** vitest's node environment
+  has no IndexedDB; the DoD journey (save → reload the page → load →
+  revert to version 1 → delete everything) runs in a real browser instead,
+  asserting geometry consequences at every step.
+- **The README privacy paragraph was reworded, because item 16 made the
+  old wording false.** "No persistence" stopped being literally true the
+  moment the local design library existed. The paragraph now promises what
+  is actually kept: no AI, no server, no accounts, no sync — every byte on
+  this device, switchable off and wipeable. Substance preserved, wording
+  honest.
+- **One new dev dependency**: `tsx`, to run the batch CLI as TypeScript.
+  It is a build-time tool only; nothing ships to the browser.
