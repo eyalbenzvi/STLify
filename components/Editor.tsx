@@ -166,6 +166,8 @@ import {
   analyzeBridging,
   DEFAULT_SUPPORT_SETTINGS,
 } from "@/lib/geometry/analysis/supports";
+import { analyzeWarping } from "@/lib/geometry/analysis/warping";
+import { buildBrim, buildRaft } from "@/lib/geometry/operations/brimRaft";
 import {
   buildAdjacency,
   growSelection,
@@ -239,6 +241,22 @@ export function Editor() {
       <EditorInner />
     </EditorProvider>
   );
+}
+
+/** Hebrew handling note for print-aid parts in the ZIP README. */
+function printAidNote(doc: DesignDocument, part: PrintablePart): string | undefined {
+  const layer = doc.layers.find((l) => l.id === part.primaryLayerId);
+  if (layer?.type !== "importedMesh") return undefined;
+  switch (layer.provenance.kind) {
+    case "supportResult":
+      return "חלק תמיכה — הדפיסו בהגדרות תמיכה (ללא מילוי מלא) והסירו לאחר ההדפסה";
+    case "brimResult":
+      return "Brim — טבעת הצמדה למשטח; קלפו אותה מהחלק לאחר ההדפסה";
+    case "raftResult":
+      return "Raft — משטח בסיס; הפרידו את החלק ממנו לאחר ההדפסה";
+    default:
+      return undefined;
+  }
 }
 
 /** Read a File as ArrayBuffer. */
@@ -1420,6 +1438,85 @@ function EditorInner() {
     });
   }, [selectedParts, build.parts, runOp]);
 
+  const handleAnalyzeWarping = useCallback(() => {
+    const targets = selectedParts.length > 0 ? selectedParts : build.parts;
+    if (targets.length === 0) return;
+    void runOp("ניתוח כיווץ", async () => {
+      const levelHe = { low: "נמוך", medium: "בינוני", high: "גבוה" } as const;
+      const sections = targets.map((part) => {
+        const a = analyzeWarping(part.worldMesh);
+        return `${part.nameHe}: סיכון ${levelHe[a.riskLevel]} (${a.riskScore}/100)\n${a.explanationHe.map((line) => `• ${line}`).join("\n")}`;
+      });
+      const worstHigh = targets.some(
+        (part) => analyzeWarping(part.worldMesh).riskLevel === "high"
+      );
+      setMessage({
+        titleHe: "ניתוח כיווץ (Warping) — היוריסטיקה מוסברת",
+        bodyHe: sections.join("\n\n"),
+        kind: worstHigh ? "error" : "info",
+      });
+    });
+  }, [selectedParts, build.parts, runOp]);
+
+  const handleGenerateBrim = useCallback(() => {
+    const targets = selectedParts.length > 0 ? selectedParts : build.parts;
+    if (targets.length === 0) return;
+    void runOp("הוספת Brim", async () => {
+      const kernel = await getGeometryKernel();
+      const layers: DesignLayer[] = [];
+      const lines: string[] = [];
+      for (const part of targets) {
+        const outcome = await buildBrim(kernel, part.worldMesh);
+        lines.push(`${part.nameHe}: ${outcome.summaryHe}`);
+        layers.push(
+          generatorToLayer(
+            outcome.solid,
+            `${part.nameHe} — Brim`,
+            doc.materialSlots[0]?.id ?? "slot1",
+            outcome.summaryHe,
+            "brimResult"
+          )
+        );
+      }
+      applyDocument({ ...doc, layers: [...doc.layers, ...layers] }, "הוספת Brim");
+      dispatch({ type: "ui/select", selection: layers.map((l) => l.id) });
+      setMessage({ titleHe: "Brim נוסף", bodyHe: lines.join("\n"), kind: "success" });
+    });
+  }, [selectedParts, build.parts, doc, runOp, applyDocument, dispatch]);
+
+  const handleGenerateRaft = useCallback(() => {
+    const targets = selectedParts.length > 0 ? selectedParts : build.parts;
+    if (targets.length === 0) return;
+    void runOp("הוספת Raft", async () => {
+      const kernel = await getGeometryKernel();
+      const raftLayers: DesignLayer[] = [];
+      const lines: string[] = [];
+      // Two changes in ONE history step: the raft layers appear and each
+      // part is lifted onto its raft — undo reverts both together.
+      let layers = doc.layers;
+      for (const part of targets) {
+        const outcome = await buildRaft(kernel, part.worldMesh);
+        lines.push(`${part.nameHe}: ${outcome.summaryHe}`);
+        const raftLayer = generatorToLayer(
+          outcome.solid,
+          `${part.nameHe} — Raft`,
+          doc.materialSlots[0]?.id ?? "slot1",
+          outcome.summaryHe,
+          "raftResult"
+        );
+        raftLayers.push(raftLayer);
+        layers = layers.map((l) =>
+          l.id === part.primaryLayerId && !l.locked
+            ? { ...l, transform: { ...l.transform, z: l.transform.z + outcome.liftMm } }
+            : l
+        );
+      }
+      applyDocument({ ...doc, layers: [...layers, ...raftLayers] }, "הוספת Raft");
+      dispatch({ type: "ui/select", selection: raftLayers.map((l) => l.id) });
+      setMessage({ titleHe: "Raft נוסף", bodyHe: lines.join("\n"), kind: "success" });
+    });
+  }, [selectedParts, build.parts, doc, runOp, applyDocument, dispatch]);
+
   const handleReparent = useCallback(
     (childId: string, parentId: string | null) => {
       if (childId === parentId) return;
@@ -1985,10 +2082,7 @@ function EditorInner() {
             materialSlot:
               doc.materialSlots.find((s) => s.id === part.materialSlotId) ?? null,
             triangleCount: part.stats.triangleCount,
-            printAidHe:
-              roleOf(part) === "support"
-                ? "חלק תמיכה — הדפיסו בהגדרות תמיכה (ללא מילוי מלא) והסירו לאחר ההדפסה"
-                : undefined,
+            printAidHe: printAidNote(doc, part),
           })),
           {
             designName: fileName,
@@ -2445,6 +2539,9 @@ function EditorInner() {
               onArrangePlate={handleArrangePlate}
               onGenerateSupports={handleGenerateSupports}
               onCheckBridging={handleCheckBridging}
+              onAnalyzeWarping={handleAnalyzeWarping}
+              onGenerateBrim={handleGenerateBrim}
+              onGenerateRaft={handleGenerateRaft}
               onRevolve={() => setRevolveOpen(true)}
               onEmboss={() => setEmbossOpen(true)}
               canRevolve={

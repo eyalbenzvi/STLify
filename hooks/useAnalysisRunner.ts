@@ -35,6 +35,7 @@ import {
   thicknessToVertexColors,
   type OrientationCandidate,
 } from "@/lib/geometry/analysis";
+import { analyzeWarping } from "@/lib/geometry/analysis/warping";
 import { estimateDetailed, type DetailedEstimateResult } from "@/lib/geometry/analysis/estimateDetailed";
 import {
   estimateFromSlices,
@@ -105,6 +106,7 @@ export function useAnalysisRunner(context: AnalysisContext) {
           const contact = analyzeContact(mesh);
           const floating = analyzeFloatingParts(mesh);
           const volume = analyzeBuildVolume(part.stats.bounds, printer);
+          const warping = analyzeWarping(mesh);
 
           // Ray-sampled wall thickness is the expensive analysis — it runs
           // as a job (in the worker when one exists). transferables=[]: the
@@ -134,6 +136,7 @@ export function useAnalysisRunner(context: AnalysisContext) {
             ...contact.issues,
             ...floating.issues,
             ...volume.issues,
+            ...warping.issues,
             ...thicknessIssues,
           ]) {
             issues.push({ ...issue, titleHe: `${prefix}${issue.titleHe}` });
