@@ -31,6 +31,7 @@ import type {
 import { isContourLayer, isShapeLayer } from "@/types/design";
 import { getPrintabilityProfile } from "@/types/profiles";
 import { getGeometryKernel, type GeometryKernel, type Solid } from "./kernel";
+import { withSolidScopeSync } from "./solidScope";
 import {
   meshDataBounds,
   meshDataSurfaceArea,
@@ -585,46 +586,43 @@ function applyElephantFoot(
   const toWorld = worldMatrix;
   const toLocal = worldMatrix.clone().invert();
 
-  // Work on a duplicate so a mid-way kernel failure cannot leave the caller
-  // holding a consumed handle — `refine`/`warp`/`split` all consume.
-  const working = solid.duplicate();
-  let bottom: Solid | null = null;
-  let top: Solid | null = null;
+  // The scope owns every intermediate; a mid-way kernel failure frees them
+  // all and leaves the caller holding the original untouched `solid`.
+  // (dispose() is idempotent, so handles consumed by split/union are
+  // skipped safely by the final sweep.)
   try {
-    // A world-space slab from below the part up to the compensation height,
-    // expressed in the part's own frame so it can cut the local solid.
-    const size = new THREE.Vector3();
-    worldBounds.getSize(size);
-    const pad = Math.max(size.x, size.y, 10) + 10;
-    const floor = worldBounds.min.z - 1;
-    const span = pad * 2;
-    const slab = kernel
-      .box(span, span, height - floor, false)
-      .translate(centreX - pad, centreY - pad, floor)
-      .transform(matrix4ToManifoldMat4(toLocal));
-    [bottom, top] = working.splitBySolid(slab);
-    if (bottom.isEmpty()) {
-      bottom.dispose();
-      top.dispose();
-      return { solid, failed: false };
-    }
-    const warped = insetSlabWalls(kernel, bottom, calibration, toWorld, toLocal);
-    bottom = null;
-    if (!warped) {
-      top.dispose();
-      return { solid, failed: true };
-    }
-    const merged = top.isEmpty() ? (top.dispose(), warped) : warped.union(top);
-    top = null;
-    if (merged.status() !== "NoError" || merged.isEmpty()) {
-      merged.dispose();
-      return { solid, failed: true };
-    }
-    solid.dispose();
-    return { solid: merged, failed: false };
+    return withSolidScopeSync((scope) => {
+      const working = scope.track(solid.duplicate());
+      // A world-space slab from below the part up to the compensation
+      // height, expressed in the part's own frame so it can cut the local
+      // solid.
+      const size = new THREE.Vector3();
+      worldBounds.getSize(size);
+      const pad = Math.max(size.x, size.y, 10) + 10;
+      const floor = worldBounds.min.z - 1;
+      const span = pad * 2;
+      const slab = scope.track(
+        kernel
+          .box(span, span, height - floor, false)
+          .translate(centreX - pad, centreY - pad, floor)
+          .transform(matrix4ToManifoldMat4(toLocal))
+      );
+      const [bottom, top] = working.splitBySolid(slab);
+      scope.track(bottom);
+      scope.track(top);
+      if (bottom.isEmpty()) return { solid, failed: false };
+      const warped = scope.trackMaybe(
+        insetSlabWalls(kernel, bottom, calibration, toWorld, toLocal)
+      );
+      if (!warped) return { solid, failed: true };
+      const merged = top.isEmpty() ? warped : scope.track(warped.union(top));
+      if (merged.status() !== "NoError" || merged.isEmpty()) {
+        return { solid, failed: true };
+      }
+      solid.dispose();
+      return { solid: scope.keep(merged), failed: false };
+    });
   } catch {
-    bottom?.dispose();
-    top?.dispose();
     return { solid, failed: true };
   }
 }

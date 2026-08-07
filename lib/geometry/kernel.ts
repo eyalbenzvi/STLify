@@ -16,6 +16,14 @@
  * unless documented otherwise; call dispose() on any solid you abandon
  * without consuming. Use duplicate() to keep a handle across a consuming
  * call.
+ *
+ * V6 made the contract enforceable instead of purely disciplinary:
+ * dispose() is IDEMPOTENT (a consumed handle is marked dead, so a later
+ * dispose is a no-op rather than a double-free), `liveSolidCount()` reports
+ * live handles so leak tests can assert zero, and `solidScope.ts` provides
+ * a block scope that frees everything it tracked on success and throw
+ * alike. New multi-step pipelines should use the scope rather than manual
+ * try/dispose chains.
  */
 
 import * as THREE from "three";
@@ -190,12 +198,43 @@ export interface GeometryKernel {
   fromMeshData(mesh: MeshData): { solid: Solid; status: string };
 }
 
+/**
+ * Live-handle accounting. WASM solids are manually managed; this counter is
+ * the ground truth a leak test can assert against ("a 20-boolean pipeline
+ * ends with as many live solids as it started with"). It also enables
+ * IDEMPOTENT dispose: consuming an input marks it dead, so a later dispose()
+ * on an already-consumed handle is a safe no-op instead of a double-free —
+ * which is what makes the solidScope wrapper safe to use.
+ */
+let liveSolids = 0;
+
+/** Number of kernel solids currently alive (leak tests, diagnostics). */
+export function liveSolidCount(): number {
+  return liveSolids;
+}
+
 class ManifoldSolid implements Solid {
+  private dead = false;
+
   /** Internal: only the kernel module touches the raw Manifold handle. */
-  constructor(readonly manifold: Manifold) {}
+  constructor(readonly manifold: Manifold) {
+    liveSolids++;
+  }
+
+  /**
+   * Free the WASM object exactly once; later calls are no-ops. Module-
+   * internal (the class itself is not exported), also used by the kernel's
+   * unionAll.
+   */
+  release(): void {
+    if (this.dead) return;
+    this.dead = true;
+    liveSolids--;
+    this.manifold.delete();
+  }
 
   private wrap(next: Manifold): Solid {
-    this.manifold.delete();
+    this.release();
     return new ManifoldSolid(next);
   }
 
@@ -225,32 +264,32 @@ class ManifoldSolid implements Solid {
   }
 
   union(other: Solid): Solid {
-    const b = (other as ManifoldSolid).manifold;
-    const next = this.manifold.add(b);
-    this.manifold.delete();
-    b.delete();
+    const b = other as ManifoldSolid;
+    const next = this.manifold.add(b.manifold);
+    this.release();
+    b.release();
     return new ManifoldSolid(next);
   }
 
   subtract(other: Solid): Solid {
-    const b = (other as ManifoldSolid).manifold;
-    const next = this.manifold.subtract(b);
-    this.manifold.delete();
-    b.delete();
+    const b = other as ManifoldSolid;
+    const next = this.manifold.subtract(b.manifold);
+    this.release();
+    b.release();
     return new ManifoldSolid(next);
   }
 
   intersect(other: Solid): Solid {
-    const b = (other as ManifoldSolid).manifold;
-    const next = this.manifold.intersect(b);
-    this.manifold.delete();
-    b.delete();
+    const b = other as ManifoldSolid;
+    const next = this.manifold.intersect(b.manifold);
+    this.release();
+    b.release();
     return new ManifoldSolid(next);
   }
 
   splitByPlane(nx: number, ny: number, nz: number, offsetMm: number): [Solid, Solid] {
     const [above, below] = this.manifold.splitByPlane([nx, ny, nz], offsetMm);
-    this.manifold.delete();
+    this.release();
     return [new ManifoldSolid(above), new ManifoldSolid(below)];
   }
 
@@ -269,7 +308,7 @@ class ManifoldSolid implements Solid {
 
   decompose(): Solid[] {
     const parts = this.manifold.decompose();
-    this.manifold.delete();
+    this.release();
     return parts.map((part) => new ManifoldSolid(part));
   }
 
@@ -282,10 +321,10 @@ class ManifoldSolid implements Solid {
   }
 
   splitBySolid(cutter: Solid): [Solid, Solid] {
-    const c = (cutter as ManifoldSolid).manifold;
-    const [inside, outside] = this.manifold.split(c);
-    this.manifold.delete();
-    c.delete();
+    const c = cutter as ManifoldSolid;
+    const [inside, outside] = this.manifold.split(c.manifold);
+    this.release();
+    c.release();
     return [new ManifoldSolid(inside), new ManifoldSolid(outside)];
   }
 
@@ -321,7 +360,7 @@ class ManifoldSolid implements Solid {
 
   smoothOut(minSharpAngleDeg: number, minSmoothness: number, refineLengthMm: number): Solid {
     const smoothed = this.manifold.smoothOut(minSharpAngleDeg, minSmoothness);
-    this.manifold.delete();
+    this.release();
     // smoothOut only fills tangents; refining realises the curved surface.
     if (refineLengthMm > 0) {
       const refined = smoothed.refineToLength(refineLengthMm);
@@ -332,18 +371,18 @@ class ManifoldSolid implements Solid {
   }
 
   minkowskiSum(other: Solid): Solid {
-    const b = (other as ManifoldSolid).manifold;
-    const next = this.manifold.minkowskiSum(b);
-    this.manifold.delete();
-    b.delete();
+    const b = other as ManifoldSolid;
+    const next = this.manifold.minkowskiSum(b.manifold);
+    this.release();
+    b.release();
     return new ManifoldSolid(next);
   }
 
   minkowskiDifference(other: Solid): Solid {
-    const b = (other as ManifoldSolid).manifold;
-    const next = this.manifold.minkowskiDifference(b);
-    this.manifold.delete();
-    b.delete();
+    const b = other as ManifoldSolid;
+    const next = this.manifold.minkowskiDifference(b.manifold);
+    this.release();
+    b.release();
     return new ManifoldSolid(next);
   }
 
@@ -429,7 +468,7 @@ class ManifoldSolid implements Solid {
   }
 
   dispose(): void {
-    this.manifold.delete();
+    this.release();
   }
 }
 
@@ -551,9 +590,9 @@ class ManifoldKernel implements GeometryKernel {
   unionAll(solids: Solid[]): Solid {
     if (solids.length === 0) throw new Error("unionAll requires at least one solid");
     const { Manifold } = this.wasm;
-    const manifolds = solids.map((s) => (s as ManifoldSolid).manifold);
-    const result = Manifold.union(manifolds);
-    for (const m of manifolds) m.delete();
+    const handles = solids.map((s) => s as ManifoldSolid);
+    const result = Manifold.union(handles.map((h) => h.manifold));
+    for (const h of handles) h.release();
     return new ManifoldSolid(result);
   }
 
