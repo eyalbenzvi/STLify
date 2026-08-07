@@ -1,9 +1,10 @@
-# PrintCraft STL Studio — V3
+# PrintCraft STL Studio — V4
 
 A browser-only studio for designing genuinely 3D-printable models — text,
 SVG artwork, image silhouettes/reliefs and imported STL files — with a
-Hebrew, right-to-left UI. V3 adds a full layer-based 3D editor and print
-preparation tools on top of the deterministic geometry pipeline.
+Hebrew, right-to-left UI. V3 added a layer-based 3D editor and print
+preparation tools; V4 adds real modelling — creating geometry from nothing,
+reshaping it, and repairing broken meshes.
 
 Everything runs locally in the browser. There is **no AI, no server-side
 generation, no accounts and no persistence**: the active design exists only
@@ -23,6 +24,39 @@ npm run typecheck  # tsc --noEmit
 ```
 
 Open http://localhost:3000. A sample name-plate design is preloaded.
+
+## V4 features
+
+- **Create from nothing**: parametric primitives (box, cylinder, sphere,
+  cone, torus, wedge, tube) and a 2D sketch layer (polyline, rectangle,
+  circle, ellipse, regular polygon, quadratic Bezier) that extrudes down the
+  same path as imported SVG. Before V4 there was no way to make a cube.
+- **Real mesh repair**: hole filling by ear clipping, non-manifold and
+  winding repair, bowtie-vertex splitting, degenerate/duplicate cleanup,
+  self-intersection detection, loose-fragment and trapped-shell removal, and
+  a voxel rebuild that turns almost any broken file into a printable solid.
+  A staged pipeline escalates from lossless fixes to destructive ones and
+  reports exactly which stages ran.
+- **Mesh inspector**: every defect listed in Hebrew with a corrective action
+  and, where known, a camera-navigable location.
+- **Fillet / chamfer**: morphological rounding of convex or concave edges
+  (sphere = radius, octahedron = 45-degree cut).
+- **Open shell**: hollow with an opening in a chosen face — a real box, tray
+  or cup rather than a sealed cavity needing a drain hole.
+- **Deformers**: bend, twist, taper and localised stretch, each refining the
+  mesh to its own curvature so a bent cube is a smooth arc, plus a trilinear
+  FFD cage.
+- **Lattice infill**: gyroid, Schwarz-P and honeycomb interiors via level
+  sets. Unlike slicer infill this is real exported geometry.
+- **Array patterns**: linear, grid, circular and mirror. Copies share the
+  source mesh payload, so a large array costs one mesh.
+- **Parametric generators**: ISO threads, involute spur gears, two-part
+  enclosures with a fitted lid, living hinges, snap-fit clips and a printer
+  tolerance-test coupon.
+- **Interference detection**: every pair of parts checked for genuine
+  interpenetration, with overlap volume and location.
+- **Auto-arrange**: shelf-packs part footprints onto the build plate;
+  anything that will not fit is reported rather than silently stacked.
 
 ## V3 features
 
@@ -98,6 +132,10 @@ Open http://localhost:3000. A sample name-plate design is preloaded.
 | Export | `lib/export/{stl,stlData,zip,package}.ts` | Binary STL, dependency-free ZIP (STORE), multi-part package |
 | Serialization | `lib/serialization/designFile.ts` | Portable `.formadesign.json` v3 with strict validation |
 | History | `lib/history/history.ts` | In-memory undo/redo (session only) |
+| Repair | `lib/geometry/repair/*` | Topology analysis, hole filling, self-intersection, voxel remesh, component cleanup, staged repair pipeline |
+| Spatial index | `lib/geometry/bvh.ts` | Triangle BVH: closest point, ray crossings, overlap pairs |
+| Sketch | `lib/geometry/sketch.ts` | 2D sketch entities compiled to contours |
+| Generators | `lib/geometry/generators/*` | Threads, gears, enclosures, hinges, clips, tolerance coupons |
 | UI | `components/**`, `hooks/useDocumentBuilder.ts` | RTL Hebrew editor, R3F viewer, dialogs |
 
 ### Why Manifold (manifold-3d)
@@ -121,6 +159,22 @@ interfaces so it can be swapped without touching the pipeline.
 - Nothing non-manifold is ever exported: parts carry the kernel status and
   the export dialog blocks critical failures.
 
+### V4 implementation notes
+
+- **Fillet is global, not per-edge.** Manifold has no edge-select fillet
+  operator, so rounding uses morphological opening/closing and affects every
+  convex (or concave) edge at once. The dialog says so.
+- **Voxel rebuild loses detail** finer than the chosen voxel size, and the
+  repair report states the resolution used.
+- **Self-intersection is invisible to the kernel.** `Manifold.ofMesh`
+  validates topology only and accepts interpenetrating shells as `NoError`,
+  double-counting the overlap volume. The repair pipeline therefore does not
+  treat kernel acceptance as sufficient and escalates to the voxel rebuild
+  when overlaps are present.
+- **Deformers can fold a body through itself.** Parameters are bounded and
+  the result goes through the manifold gate, which produces an explicit
+  Hebrew error rather than a silently broken model.
+
 ## Known limitations
 
 - Niqqud / combining marks and full bidi nesting are not supported in text
@@ -136,3 +190,21 @@ interfaces so it can be swapped without touching the pipeline.
   output, and the UI says so everywhere it appears.
 - No 3MF export (no tested implementation existed); dovetail connectors
   assemble by sliding sideways (the UI explains this).
+
+### Not yet implemented (planned)
+
+These were scoped for V4 but are not in this release:
+
+- Sub-object (face / edge / vertex) selection, and the direct-editing tools
+  that depend on it: push/pull, per-edge fillet, local smoothing, split by
+  paint.
+- Projecting or wrapping text and SVG onto curved surfaces.
+- A non-destructive modifier stack and named parameters with expressions —
+  operations still bake to meshes.
+- Layer grouping / parent-child hierarchy and pivot editing.
+- Isotropic remeshing (the kernel exposes refinement and smoothing, but
+  there is no edge-split/collapse/flip remesher).
+- Moving geometry off the main thread into a Web Worker, mesh-store
+  reference counting, and local crash recovery.
+- Viewport snapping to vertices/edges/faces, angle and radius measurements,
+  and an undo-history panel.

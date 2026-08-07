@@ -63,6 +63,13 @@ export interface SceneViewProps {
   onCommitTransform: (layerId: string, transform: Transform3D) => void;
   onSurfacePick: (pick: SurfacePick) => void;
   onAddMeasurement: (a: THREE.Vector3, b: THREE.Vector3) => void;
+  /**
+   * World point to centre the camera on. Set by the mesh inspector and the
+   * interference report so a listed problem can be looked at rather than
+   * merely described. A new object identity re-triggers the move, so the
+   * same location can be revisited.
+   */
+  focusTarget?: { x: number; y: number; z: number } | null;
 }
 
 /** Material color for a part, honouring its material slot. */
@@ -311,6 +318,7 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
     onSurfacePick,
     onAddMeasurement,
     onRemoveMeasurement,
+    focusTarget,
   } = props;
 
   const { gl } = useThree();
@@ -473,8 +481,31 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
       </GizmoHelper>
 
       <OrbitControls makeDefault enableDamping />
+      <CameraFocus target={focusTarget ?? null} />
     </>
   );
+}
+
+/**
+ * Pans the orbit target onto a world point, keeping the current viewing
+ * direction and distance so the user does not lose their bearings.
+ */
+function CameraFocus({ target }: { target: { x: number; y: number; z: number } | null }) {
+  const camera = useThree((s) => s.camera);
+  const controls = useThree((s) => s.controls) as
+    | { target: THREE.Vector3; update: () => void }
+    | null;
+
+  useEffect(() => {
+    if (!target || !controls) return;
+    const next = new THREE.Vector3(target.x, target.y, target.z);
+    const offset = camera.position.clone().sub(controls.target);
+    controls.target.copy(next);
+    camera.position.copy(next).add(offset);
+    controls.update();
+  }, [target, controls, camera]);
+
+  return null;
 }
 
 export function SceneView(

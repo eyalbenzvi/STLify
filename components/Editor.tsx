@@ -30,7 +30,7 @@ import type {
   SmoothSettings,
   Transform3D,
 } from "@/types/design";
-import { isShapeLayer, newId } from "@/types/design";
+import { defaultPrimitive, isShapeLayer, newId, type PrimitiveKind } from "@/types/design";
 import { getPrintabilityProfile, getPrinterProfile, MATERIAL_PROFILES, USAGE_PROFILES } from "@/types/profiles";
 import { useDocumentBuilder, type BuiltPart } from "@/hooks/useDocumentBuilder";
 import { createTemplateDocument, makeBaseLayer, makeHoleLayer, makeTextLayer, PRODUCT_TEMPLATES } from "@/lib/geometry/documentTemplates";
@@ -58,6 +58,38 @@ import {
   snapToObjectEdge,
 } from "@/lib/geometry/operations/placement";
 import { attemptMeshRepair } from "@/lib/geometry/repair/repair";
+import {
+  diagnoseMesh,
+  repairMesh,
+  type MeshDiagnosis,
+  type MeshRepairReport,
+  type RepairOptions,
+} from "@/lib/geometry/repair/diagnose";
+import {
+  applyDeform,
+  applyFillet,
+  applyLattice,
+  applyShell,
+  generatorToLayer,
+  type DeformRequest,
+} from "@/lib/geometry/operations/advancedOps";
+import type { FilletSettings, ShellSettings } from "@/lib/geometry/operations/fillet";
+import type { LatticeSettings } from "@/lib/geometry/operations/lattice";
+import { buildPattern, PatternError, type PatternSettings } from "@/lib/geometry/operations/pattern";
+import {
+  arrangeOnPlate,
+  detectInterference,
+  type InterferenceReport,
+} from "@/lib/geometry/analysis/collision";
+import {
+  buildEnclosure,
+  buildGear,
+  buildLivingHinge,
+  buildSnapFit,
+  buildThread,
+  buildToleranceTest,
+  GeneratorError,
+} from "@/lib/geometry/generators";
 import {
   analyzeBuildVolume,
   analyzeContact,
@@ -118,6 +150,18 @@ import {
   type SvgImportOptionsValue,
 } from "@/components/dialogs/ImportDialogs";
 import { ExportDialog, type ExportKind } from "@/components/dialogs/ExportDialog";
+import { CreatePanel, type GeneratorKind } from "@/components/editor/CreatePanel";
+import {
+  DeformDialog,
+  FilletDialog,
+  GeneratorDialog,
+  InterferenceDialog,
+  LatticeDialog,
+  MeshInspectorDialog,
+  PatternDialog,
+  ShellDialog,
+  type GeneratorParams,
+} from "@/components/dialogs/AdvancedDialogs";
 import { BaseModeSwitchDialog, OrientationDialog } from "@/components/dialogs/MiscDialogs";
 import type { SurfacePick } from "@/components/viewer/SceneView";
 
@@ -181,6 +225,17 @@ function EditorInner() {
   const [overlayColors, setOverlayColors] = useState<Map<string, Float32Array>>(new Map());
   const [estimate, setEstimate] = useState<DetailedEstimateResult | null>(null);
   const [analysisBusy, setAnalysisBusy] = useState(false);
+  const [filletOpen, setFilletOpen] = useState(false);
+  const [shellOpen, setShellOpen] = useState(false);
+  const [deformOpen, setDeformOpen] = useState(false);
+  const [latticeOpen, setLatticeOpen] = useState(false);
+  const [patternOpen, setPatternOpen] = useState(false);
+  const [generatorKind, setGeneratorKind] = useState<GeneratorKind | null>(null);
+  const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [diagnosis, setDiagnosis] = useState<MeshDiagnosis | null>(null);
+  const [repairReport, setRepairReport] = useState<MeshRepairReport | null>(null);
+  const [interference, setInterference] = useState<InterferenceReport | null>(null);
+  const [focusTarget, setFocusTarget] = useState<{ x: number; y: number; z: number } | null>(null);
 
   const stlInputRef = useRef<HTMLInputElement>(null);
   const svgInputRef = useRef<HTMLInputElement>(null);
@@ -210,7 +265,9 @@ function EditorInner() {
       err instanceof StlImportError ||
       err instanceof SvgImportError ||
       err instanceof ImageImportError ||
-      err instanceof DesignFileError
+      err instanceof DesignFileError ||
+      err instanceof GeneratorError ||
+      err instanceof PatternError
     ) {
       setMessage({ titleHe, bodyHe: err.messageHe, kind: "error" });
     } else {
@@ -678,6 +735,365 @@ function EditorInner() {
       setMessage({ titleHe: "תיקון רשת", bodyHe: result.messageHe, kind: "success" });
     });
   }, [selectedMeshLayers, runOp, updateLayer]);
+
+  // ---- V4: creation ---------------------------------------------------------
+
+  const addLayer = useCallback(
+    (layer: DesignLayer, labelHe: string) => {
+      applyDocument({ ...doc, layers: [...doc.layers, layer] }, labelHe);
+      dispatch({ type: "ui/select", selection: [layer.id] });
+    },
+    [doc, applyDocument, dispatch]
+  );
+
+  const handleAddPrimitive = useCallback(
+    (kind: PrimitiveKind) => {
+      const namesHe: Record<PrimitiveKind, string> = {
+        box: "תיבה",
+        cylinder: "גליל",
+        sphere: "כדור",
+        cone: "חרוט",
+        torus: "טבעת",
+        wedge: "טריז",
+        tube: "צינור",
+      };
+      addLayer(
+        {
+          id: newId("layer"),
+          type: "primitive",
+          name: namesHe[kind],
+          visible: true,
+          locked: false,
+          materialSlotId: doc.materialSlots[0]?.id ?? "slot1",
+          transform: { x: 0, y: 0, z: 0, rotationX: 0, rotationY: 0, rotationZ: 0, scaleX: 1, scaleY: 1, scaleZ: 1 },
+          previewOpacity: 1,
+          ...defaultPrimitive(kind),
+        },
+        `הוספת ${namesHe[kind]}`
+      );
+    },
+    [addLayer, doc.materialSlots]
+  );
+
+  const handleAddSketch = useCallback(() => {
+    addLayer(
+      {
+        id: newId("layer"),
+        type: "sketch",
+        name: "סקיצה",
+        visible: true,
+        locked: false,
+        materialSlotId: doc.materialSlots[0]?.id ?? "slot1",
+        transform: { x: 0, y: 0, z: 0, rotationX: 0, rotationY: 0, rotationZ: 0, scaleX: 1, scaleY: 1, scaleZ: 1 },
+        previewOpacity: 1,
+        // Seeded with one rectangle so the layer produces geometry
+        // immediately; the properties panel edits the entity list.
+        entities: [
+          { kind: "rectangle", x: 0, y: 0, widthMm: 30, heightMm: 20, cornerRadiusMm: 2, rotationDeg: 0 },
+        ],
+        extrudeMm: 3,
+        combine: "standalone",
+        bevel: { enabled: false, sizeMm: 0.6, segments: 4 },
+      },
+      "הוספת סקיצה"
+    );
+  }, [addLayer, doc.materialSlots]);
+
+  const handleGeneratorConfirm = useCallback(
+    (kind: GeneratorKind, params: GeneratorParams) => {
+      setGeneratorKind(null);
+      const num = (key: string, fallback: number): number =>
+        typeof params[key] === "number" ? (params[key] as number) : fallback;
+      const bool = (key: string, fallback: boolean): boolean =>
+        typeof params[key] === "boolean" ? (params[key] as boolean) : fallback;
+      const slot = doc.materialSlots[0]?.id ?? "slot1";
+
+      void runOp("יצירת חלק פרמטרי", async () => {
+        const kernel = await getGeometryKernel();
+        const layers: DesignLayer[] = [];
+        switch (kind) {
+          case "thread": {
+            const internal = bool("internal", false);
+            const solid = buildThread(kernel, {
+              diameterMm: num("diameterMm", 8),
+              pitchMm: num("pitchMm", 1.25),
+              lengthMm: num("lengthMm", 20),
+              internal,
+              clearanceMm: num("clearanceMm", 0.4),
+              segments: 48,
+            });
+            layers.push(
+              generatorToLayer(
+                solid,
+                internal ? "כלי חיתוך להברגה פנימית" : "הברגה",
+                slot,
+                `הברגה M${num("diameterMm", 8)}×${num("pitchMm", 1.25)}`
+              )
+            );
+            break;
+          }
+          case "gear": {
+            const solid = buildGear(kernel, {
+              teeth: num("teeth", 20),
+              moduleMm: num("moduleMm", 2),
+              thicknessMm: num("thicknessMm", 6),
+              pressureAngleDeg: 20,
+              boreDiameterMm: num("boreDiameterMm", 6),
+              backlashMm: num("backlashMm", 0.1),
+            });
+            layers.push(
+              generatorToLayer(
+                solid,
+                `גלגל שיניים ${num("teeth", 20)}Z`,
+                slot,
+                `מודול ${num("moduleMm", 2)}, ${num("teeth", 20)} שיניים`
+              )
+            );
+            break;
+          }
+          case "enclosure": {
+            const { box, lid } = buildEnclosure(kernel, {
+              innerWidthMm: num("innerWidthMm", 60),
+              innerDepthMm: num("innerDepthMm", 40),
+              innerHeightMm: num("innerHeightMm", 25),
+              wallMm: num("wallMm", 2),
+              floorMm: num("floorMm", 2),
+              cornerRadiusMm: num("cornerRadiusMm", 3),
+              lipHeightMm: num("lipHeightMm", 4),
+              clearanceMm: num("clearanceMm", 0.2),
+            });
+            layers.push(generatorToLayer(box, "מארז — קופסה", slot, "גוף המארז"));
+            const lidLayer = generatorToLayer(lid, "מארז — מכסה", slot, "מכסה המארז");
+            // Park the lid beside the box so both are visible and printable.
+            lidLayer.transform.x += num("innerWidthMm", 60) + num("wallMm", 2) * 2 + 10;
+            layers.push(lidLayer);
+            break;
+          }
+          case "livingHinge": {
+            const solid = buildLivingHinge(kernel, {
+              widthMm: num("widthMm", 40),
+              lengthMm: num("lengthMm", 30),
+              thicknessMm: num("thicknessMm", 2),
+              hingeThicknessMm: num("hingeThicknessMm", 0.5),
+              grooveCount: num("grooveCount", 3),
+              grooveWidthMm: num("grooveWidthMm", 1),
+            });
+            layers.push(generatorToLayer(solid, "ציר חי", slot, "פאנל מתקפל"));
+            break;
+          }
+          case "snapFit": {
+            const solid = buildSnapFit(kernel, {
+              lengthMm: num("lengthMm", 15),
+              widthMm: num("widthMm", 6),
+              thicknessMm: num("thicknessMm", 1.5),
+              hookDepthMm: num("hookDepthMm", 1),
+              insertionAngleDeg: num("insertionAngleDeg", 30),
+              retentionAngleDeg: num("retentionAngleDeg", 75),
+            });
+            layers.push(generatorToLayer(solid, "תפס", slot, "וו הצמדה גמיש"));
+            break;
+          }
+          case "toleranceTest": {
+            const { plate, pin, clearancesMm } = buildToleranceTest(kernel, {
+              pinDiameterMm: num("pinDiameterMm", 5),
+              clearancesMm: [0.1, 0.2, 0.3, 0.4, 0.5],
+              thicknessMm: num("thicknessMm", 4),
+              spacingMm: num("spacingMm", 12),
+            });
+            layers.push(
+              generatorToLayer(
+                plate,
+                "מבחן סבולות — לוחית",
+                slot,
+                `מרווחים: ${clearancesMm.join(" / ")} מ״מ`
+              )
+            );
+            const pinLayer = generatorToLayer(pin, "מבחן סבולות — פין", slot, "פין בדיקה");
+            pinLayer.transform.y += num("spacingMm", 12);
+            layers.push(pinLayer);
+            break;
+          }
+        }
+        applyDocument({ ...doc, layers: [...doc.layers, ...layers] }, "יצירת חלק פרמטרי");
+        dispatch({ type: "ui/select", selection: layers.map((l) => l.id) });
+      });
+    },
+    [doc, runOp, applyDocument, dispatch]
+  );
+
+  // ---- V4: body operations ---------------------------------------------------
+
+  const handleFilletConfirm = useCallback(
+    (settings: FilletSettings) => {
+      setFilletOpen(false);
+      const layer = singleSelectedShape;
+      if (!layer) return;
+      void runOp("עיגול קצוות", async () => {
+        const outcome = await applyFillet(doc, layer, settings);
+        applyOpResult("עיגול קצוות", [outcome.layer], [layer.id], "hide", outcome.warningsHe);
+      });
+    },
+    [singleSelectedShape, doc, runOp, applyOpResult]
+  );
+
+  const handleShellConfirm = useCallback(
+    (settings: ShellSettings) => {
+      setShellOpen(false);
+      const layer = singleSelectedShape;
+      if (!layer) return;
+      void runOp("קליפה עם פתח", async () => {
+        const outcome = await applyShell(doc, layer, settings);
+        const saved = outcome.volumeBeforeMm3 > 0
+          ? 1 - outcome.volumeAfterMm3 / outcome.volumeBeforeMm3
+          : 0;
+        applyOpResult("קליפה עם פתח", [outcome.layer], [layer.id], "hide", [
+          `חיסכון בחומר: ${(saved * 100).toFixed(0)}%`,
+          ...outcome.warningsHe,
+        ]);
+      });
+    },
+    [singleSelectedShape, doc, runOp, applyOpResult]
+  );
+
+  const handleDeformConfirm = useCallback(
+    (request: DeformRequest) => {
+      setDeformOpen(false);
+      const layer = singleSelectedShape;
+      if (!layer) return;
+      void runOp("עיוות גוף", async () => {
+        const outcome = await applyDeform(doc, layer, request);
+        applyOpResult("עיוות גוף", [outcome.layer], [layer.id], "hide", outcome.warningsHe);
+      });
+    },
+    [singleSelectedShape, doc, runOp, applyOpResult]
+  );
+
+  const handleLatticeConfirm = useCallback(
+    (settings: LatticeSettings) => {
+      setLatticeOpen(false);
+      const layer = singleSelectedShape;
+      if (!layer) return;
+      void runOp("מילוי סריג", async () => {
+        const outcome = await applyLattice(doc, layer, settings);
+        applyOpResult("מילוי סריג", [outcome.layer], [layer.id], "hide", [
+          `חיסכון בחומר: ${(outcome.savedFraction * 100).toFixed(0)}%`,
+          ...outcome.warningsHe,
+        ]);
+      });
+    },
+    [singleSelectedShape, doc, runOp, applyOpResult]
+  );
+
+  const handlePatternConfirm = useCallback(
+    (settings: PatternSettings) => {
+      setPatternOpen(false);
+      const source = selectedLayers[0];
+      if (!source) return;
+      try {
+        const { layers, labelHe } = buildPattern(source, settings);
+        applyDocument({ ...doc, layers: [...doc.layers, ...layers] }, labelHe);
+        dispatch({ type: "ui/select", selection: layers.map((l) => l.id) });
+      } catch (err) {
+        if (err instanceof PatternError) {
+          setMessage({ titleHe: "מערך עותקים", bodyHe: err.messageHe, kind: "error" });
+        } else {
+          showError(err, "מערך עותקים");
+        }
+      }
+    },
+    [selectedLayers, doc, applyDocument, dispatch, showError]
+  );
+
+  // ---- V4: inspection --------------------------------------------------------
+
+  const handleOpenInspector = useCallback(() => {
+    const layer = selectedMeshLayers[0];
+    if (!layer) return;
+    setRepairReport(null);
+    setDiagnosis(null);
+    setInspectorOpen(true);
+    void runOp("בדיקת רשת", async () => {
+      const mesh = getMesh(layer.meshId);
+      if (!mesh) throw new OpError("נתוני הרשת חסרים");
+      setDiagnosis(await diagnoseMesh(mesh));
+    });
+  }, [selectedMeshLayers, runOp]);
+
+  const handleAdvancedRepair = useCallback(
+    (options: RepairOptions) => {
+      const layer = selectedMeshLayers[0];
+      if (!layer) return;
+      void runOp("תיקון רשת", async () => {
+        const mesh = getMesh(layer.meshId);
+        if (!mesh) throw new OpError("נתוני הרשת חסרים");
+        const report = await repairMesh(mesh, options);
+        setRepairReport(report);
+        if (report.succeeded && report.mesh) {
+          const repairedId = storeMesh(report.mesh);
+          updateLayer(
+            layer.id,
+            { meshId: repairedId, originalMeshId: layer.originalMeshId ?? layer.meshId },
+            "תיקון רשת"
+          );
+          setDiagnosis(await diagnoseMesh(report.mesh));
+        }
+      });
+    },
+    [selectedMeshLayers, runOp, updateLayer]
+  );
+
+  /**
+   * Point the camera at a reported problem. A fresh object identity is
+   * always stored so clicking the same issue twice re-centres the view.
+   */
+  const handleNavigateTo = useCallback((location: { x: number; y: number; z: number }) => {
+    setFocusTarget({ ...location });
+  }, []);
+
+  const handleCheckInterference = useCallback(() => {
+    void runOp("בדיקת חדירה", async () => {
+      setInterference(await detectInterference(build.parts));
+    });
+  }, [build.parts, runOp]);
+
+  const handleArrangePlate = useCallback(() => {
+    const items = build.parts.map((part) => ({
+      layerId: part.primaryLayerId,
+      widthMm: part.stats.dimensionsMm.x,
+      depthMm: part.stats.dimensionsMm.y,
+      currentX: (part.stats.bounds.min.x + part.stats.bounds.max.x) / 2,
+      currentY: (part.stats.bounds.min.y + part.stats.bounds.max.y) / 2,
+    }));
+    if (items.length === 0) return;
+    const result = arrangeOnPlate(items, {
+      plateWidthMm: printer.buildVolumeMm.x,
+      plateDepthMm: printer.buildVolumeMm.y,
+      spacingMm: 5,
+    });
+    const byLayer = new Map(result.placements.map((p) => [p.layerId, p]));
+    const layers = doc.layers.map((layer) => {
+      const placement = byLayer.get(layer.id);
+      if (!placement) return layer;
+      const item = items.find((i) => i.layerId === layer.id);
+      if (!item) return layer;
+      // Placements are absolute plate positions; shift the layer transform by
+      // the delta so any local offset baked into the mesh is preserved.
+      return {
+        ...layer,
+        transform: {
+          ...layer.transform,
+          x: layer.transform.x + (placement.x - item.currentX),
+          y: layer.transform.y + (placement.y - item.currentY),
+        },
+      } as DesignLayer;
+    });
+    applyDocument({ ...doc, layers }, "סידור אוטומטי על המשטח");
+    setMessage({
+      titleHe: "סידור אוטומטי",
+      bodyHe: result.summaryHe,
+      kind: result.unplaced.length > 0 ? "info" : "success",
+    });
+  }, [build.parts, doc, printer, applyDocument]);
 
   // ---- analysis ------------------------------------------------------------
 
@@ -1496,6 +1912,15 @@ function EditorInner() {
       <main className="flex min-h-0 flex-1 flex-col-reverse lg:flex-row">
         {/* Panels (start side = right in RTL) */}
         <aside className="max-h-[55dvh] w-full overflow-y-auto border-t border-slate-200 bg-white lg:max-h-none lg:w-[420px] lg:border-e lg:border-t-0">
+          <Section title="יצירה">
+            <CreatePanel
+              busy={busy}
+              onAddPrimitive={handleAddPrimitive}
+              onAddSketch={handleAddSketch}
+              onOpenGenerator={setGeneratorKind}
+            />
+          </Section>
+
           <Section title="שכבות">
             <div className="mb-1 flex gap-1">
               <button type="button" className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50" onClick={addTextLayer}>
@@ -1589,6 +2014,15 @@ function EditorInner() {
               onSmooth={() => setSmoothOpen(true)}
               onSimplify={() => setSimplifyOpen(true)}
               onRepair={handleRepair}
+              onFillet={() => setFilletOpen(true)}
+              onShell={() => setShellOpen(true)}
+              onDeform={() => setDeformOpen(true)}
+              onLattice={() => setLatticeOpen(true)}
+              onPattern={() => setPatternOpen(true)}
+              onInspectMesh={handleOpenInspector}
+              onCheckInterference={handleCheckInterference}
+              onArrangePlate={handleArrangePlate}
+              partCount={build.parts.length}
             />
           </Section>
 
@@ -1659,6 +2093,7 @@ function EditorInner() {
             onCommitTransform={commitTransform}
             onSurfacePick={handleSurfacePick}
             onAddMeasurement={handleAddMeasurement}
+            focusTarget={focusTarget}
             onRemoveMeasurement={(id) => dispatch({ type: "ui/removeMeasurement", id })}
           />
           {totalDims && (
@@ -1783,6 +2218,51 @@ function EditorInner() {
         hasBaseLayer={doc.layers.some((l) => l.type === "base")}
         onConfirm={confirmModeSwitch}
         onClose={() => setModeSwitchTarget(null)}
+      />
+      <FilletDialog
+        open={filletOpen}
+        onConfirm={handleFilletConfirm}
+        onClose={() => setFilletOpen(false)}
+      />
+      <ShellDialog
+        open={shellOpen}
+        onConfirm={handleShellConfirm}
+        onClose={() => setShellOpen(false)}
+      />
+      <DeformDialog
+        open={deformOpen}
+        onConfirm={handleDeformConfirm}
+        onClose={() => setDeformOpen(false)}
+      />
+      <LatticeDialog
+        open={latticeOpen}
+        onConfirm={handleLatticeConfirm}
+        onClose={() => setLatticeOpen(false)}
+      />
+      <PatternDialog
+        open={patternOpen}
+        onConfirm={handlePatternConfirm}
+        onClose={() => setPatternOpen(false)}
+      />
+      <GeneratorDialog
+        kind={generatorKind}
+        onConfirm={handleGeneratorConfirm}
+        onClose={() => setGeneratorKind(null)}
+      />
+      <MeshInspectorDialog
+        open={inspectorOpen}
+        diagnosis={diagnosis}
+        report={repairReport}
+        busy={busy}
+        onNavigate={handleNavigateTo}
+        onRepair={handleAdvancedRepair}
+        onClose={() => setInspectorOpen(false)}
+      />
+      <InterferenceDialog
+        open={interference !== null}
+        report={interference}
+        onNavigate={handleNavigateTo}
+        onClose={() => setInterference(null)}
       />
     </div>
   );
