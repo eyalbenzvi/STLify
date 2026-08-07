@@ -1,9 +1,8 @@
 /**
- * Binary STL export straight from MeshData, without going through three.js.
- * Same wire format as lib/export/stl.ts (84-byte header, computed facet
- * normals, little-endian), so both writers produce interchangeable files.
- * Useful in workers and tests where constructing a THREE.BufferGeometry
- * would be pointless overhead.
+ * Binary STL export straight from MeshData, without going through three.js:
+ * an 84-byte header, computed facet normals and little-endian floats. Works
+ * in workers and tests, where constructing a THREE.BufferGeometry would be
+ * pointless overhead.
  */
 
 import type { MeshData } from "@/lib/geometry/meshData";

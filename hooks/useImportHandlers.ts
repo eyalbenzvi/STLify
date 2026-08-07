@@ -16,7 +16,7 @@
 import { useCallback, type Dispatch, type RefObject } from "react";
 import * as THREE from "three";
 import type { DesignDocument, DesignLayer, ImportedMeshLayer } from "@/types/design";
-import { newId } from "@/types/design";
+import { newId, primaryMaterialSlotId } from "@/types/design";
 import type { EditorAction } from "@/components/editor/store";
 import { getGeometryKernel } from "@/lib/geometry/kernel";
 import { meshDataBounds, transformMeshData } from "@/lib/geometry/meshData";
@@ -131,7 +131,7 @@ export function useImportHandlers(context: ImportHandlersContext) {
       name: pending.fileName.replace(/\.stl$/i, ""),
       visible: true,
       locked: false,
-      materialSlotId: doc.materialSlots[0]?.id ?? "slot1",
+      materialSlotId: primaryMaterialSlotId(doc),
       transform: {
         x: 0, y: 0, z: 0,
         rotationX: 0, rotationY: 0, rotationZ: 0,
@@ -168,7 +168,7 @@ export function useImportHandlers(context: ImportHandlersContext) {
           name: pending.fileName.replace(/\.svg$/i, ""),
           visible: true,
           locked: false,
-          materialSlotId: doc.materialSlots[0]?.id ?? "slot1",
+          materialSlotId: primaryMaterialSlotId(doc),
           transform: {
             x: 0, y: 0, z: 0,
             rotationX: 0, rotationY: 0, rotationZ: 0,
@@ -247,7 +247,7 @@ export function useImportHandlers(context: ImportHandlersContext) {
             name: stripImageExtension(pending.fileName),
             visible: true,
             locked: false,
-            materialSlotId: doc.materialSlots[0]?.id ?? "slot1",
+            materialSlotId: primaryMaterialSlotId(doc),
             transform: { x: 0, y: 0, z: 0, rotationX: 0, rotationY: 0, rotationZ: 0, scaleX: 1, scaleY: 1, scaleZ: 1 },
             previewOpacity: 1,
             sourceName: pending.fileName,
@@ -287,7 +287,7 @@ export function useImportHandlers(context: ImportHandlersContext) {
             name: stripImageExtension(pending.fileName),
             visible: true,
             locked: false,
-            materialSlotId: doc.materialSlots[0]?.id ?? "slot1",
+            materialSlotId: primaryMaterialSlotId(doc),
             transform: { x: 0, y: 0, z: 0, rotationX: 0, rotationY: 0, rotationZ: 0, scaleX: 1, scaleY: 1, scaleZ: 1 },
             previewOpacity: 1,
             sourceName: pending.fileName,

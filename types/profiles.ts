@@ -290,7 +290,3 @@ export function getPrinterProfile(
 export function getPrintabilityProfile(id: string): PrintabilityProfile {
   return PRINTABILITY_PROFILES.find((p) => p.id === id) ?? PRINTABILITY_PROFILES[0];
 }
-
-export function getMaterialProfile(id: string): MaterialProfile {
-  return MATERIAL_PROFILES.find((m) => m.id === id) ?? MATERIAL_PROFILES[0];
-}

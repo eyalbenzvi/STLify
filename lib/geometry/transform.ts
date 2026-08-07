@@ -23,12 +23,10 @@ export function transformToMatrix4(t: Transform3D): THREE.Matrix4 {
   return matrix;
 }
 
-/** Manifold Mat4: full 4x4 in column-major order — same layout as three.js. */
-export function transformToManifoldMat4(t: Transform3D): number[] {
-  return [...transformToMatrix4(t).elements];
-}
-
-/** Convert an arbitrary three.js matrix to a Manifold Mat4 array. */
+/**
+ * Convert an arbitrary three.js matrix to a Manifold Mat4 array: the full
+ * 4x4 in column-major order, which is three.js's own layout.
+ */
 export function matrix4ToManifoldMat4(matrix: THREE.Matrix4): number[] {
   return [...matrix.elements];
 }
@@ -76,9 +74,4 @@ export function normalizeDeg(deg: number): number {
   if (a > 180) a -= 360;
   if (a <= -180) a += 360;
   return a === 0 ? 0 : a;
-}
-
-/** True when the transform has a negative determinant (mirrored). */
-export function isMirrored(t: Transform3D): boolean {
-  return t.scaleX * t.scaleY * t.scaleZ < 0;
 }

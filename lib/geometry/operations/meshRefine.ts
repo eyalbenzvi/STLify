@@ -16,7 +16,7 @@ import type {
   SmoothSettings,
 } from "@/types/design";
 import { getGeometryKernel } from "../kernel";
-import type { MeshData } from "../meshData";
+import { triangleCross, type MeshData } from "../meshData";
 import { withSolidScope } from "../solidScope";
 import { materializeWorldSolid, OpError, solidToResultLayer, type OpHooks } from "./layerOps";
 
@@ -171,19 +171,15 @@ export function detectFeatureVertices(mesh: MeshData, angleDeg: number): Uint8Ar
   const triCount = mesh.indices.length / 3;
   const normals = new Float32Array(triCount * 3);
   const p = mesh.positions;
+  const cross: [number, number, number] = [0, 0, 0];
   for (let t = 0; t < triCount; t++) {
-    const a = mesh.indices[t * 3] * 3;
-    const b = mesh.indices[t * 3 + 1] * 3;
-    const c = mesh.indices[t * 3 + 2] * 3;
-    const ux = p[b] - p[a],
-      uy = p[b + 1] - p[a + 1],
-      uz = p[b + 2] - p[a + 2];
-    const vx = p[c] - p[a],
-      vy = p[c + 1] - p[a + 1],
-      vz = p[c + 2] - p[a + 2];
-    const nx = uy * vz - uz * vy,
-      ny = uz * vx - ux * vz,
-      nz = ux * vy - uy * vx;
+    const [nx, ny, nz] = triangleCross(
+      p,
+      mesh.indices[t * 3],
+      mesh.indices[t * 3 + 1],
+      mesh.indices[t * 3 + 2],
+      cross
+    );
     const len = Math.hypot(nx, ny, nz) || 1;
     normals[t * 3] = nx / len;
     normals[t * 3 + 1] = ny / len;

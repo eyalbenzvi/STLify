@@ -16,19 +16,10 @@
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import process from "node:process";
+import { installNodeFontFetch } from "@/lib/geometry/nodeFontFetch";
 
-// The font loader fetches "/fonts/*"; in Node those come from ./public.
-const originalFetch = globalThis.fetch;
-globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-  const url = String(input);
-  if (url.startsWith("/fonts/")) {
-    const buffer = readFileSync(join(process.cwd(), "public", url));
-    return new Response(new Uint8Array(buffer), { status: 200 });
-  }
-  return originalFetch(input, init);
-}) as typeof fetch;
+installNodeFontFetch();
 
 function argValue(flag: string): string | null {
   const index = process.argv.indexOf(flag);

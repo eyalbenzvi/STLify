@@ -276,19 +276,28 @@ export interface BridgingReport {
 }
 
 /**
+ * Span below which a bridge prints cleanly and is not worth reporting. Also
+ * the point past which the strand starts to sag visibly.
+ */
+export const BRIDGE_SAG_THRESHOLD_MM = 5;
+
+/** Span past which a bridge usually fails outright and needs support. */
+export const BRIDGE_FAILURE_THRESHOLD_MM = 20;
+
+/**
  * Find horizontal runs of material with nothing beneath them.
  *
  * A printer can bridge a gap by stretching filament between two anchors, but
- * only so far: past roughly 5 mm the strand sags visibly, and past 20 mm it
- * usually fails outright. The overhang analysis misses this entirely, because
- * the underside of a bridge is a perfectly horizontal face — the worst
- * possible overhang angle, yet completely printable if it is short.
+ * only so far — see the two thresholds above. The overhang analysis misses
+ * this entirely, because the underside of a bridge is a perfectly horizontal
+ * face: the worst possible overhang angle, yet completely printable if it is
+ * short.
  */
 export function analyzeBridging(
   mesh: MeshData,
   options: { minSpanMm?: number; sampleStepMm?: number } = {}
 ): BridgingReport {
-  const minSpan = options.minSpanMm ?? 5;
+  const minSpan = options.minSpanMm ?? BRIDGE_SAG_THRESHOLD_MM;
   const bvh = new MeshBvh(mesh);
   const adjacency = buildAdjacency(mesh);
   const idx = mesh.indices;
@@ -341,7 +350,7 @@ export function analyzeBridging(
   let summaryHe: string;
   if (spans.length === 0) {
     summaryHe = "לא נמצאו גישורים ארוכים";
-  } else if (longest > 20) {
+  } else if (longest > BRIDGE_FAILURE_THRESHOLD_MM) {
     summaryHe = `נמצאו ${spans.length} גישורים; הארוך ביותר ${longest.toFixed(1)} מ״מ — סביר שייכשל ללא תמיכה`;
   } else {
     summaryHe = `נמצאו ${spans.length} גישורים; הארוך ביותר ${longest.toFixed(1)} מ״מ — צפוי שקע קל בתחתית`;

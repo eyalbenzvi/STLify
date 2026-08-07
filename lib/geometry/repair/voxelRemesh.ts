@@ -17,7 +17,7 @@
 
 import { MeshBvh } from "../bvh";
 import { getGeometryKernel } from "../kernel";
-import type { MeshData } from "../meshData";
+import { meshDataVolume, type MeshData } from "../meshData";
 import { orientConsistently } from "./topology";
 
 export interface VoxelRemeshOptions {
@@ -138,24 +138,7 @@ export async function voxelRemesh(
     mesh: result,
     voxelSizeMm: voxel,
     triangleCount,
-    volumeBeforeMm3: Math.abs(meshVolume(mesh)),
+    volumeBeforeMm3: meshDataVolume(mesh),
     volumeAfterMm3: volumeAfter,
   };
-}
-
-function meshVolume(mesh: MeshData): number {
-  const p = mesh.positions;
-  const idx = mesh.indices;
-  let volume = 0;
-  for (let i = 0; i < idx.length; i += 3) {
-    const a = idx[i] * 3;
-    const b = idx[i + 1] * 3;
-    const c = idx[i + 2] * 3;
-    volume +=
-      (p[a] * (p[b + 1] * p[c + 2] - p[b + 2] * p[c + 1]) +
-        p[a + 1] * (p[b + 2] * p[c] - p[b] * p[c + 2]) +
-        p[a + 2] * (p[b] * p[c + 1] - p[b + 1] * p[c])) /
-      6;
-  }
-  return volume;
 }

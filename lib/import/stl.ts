@@ -15,7 +15,7 @@
  *   message so the UI can display it directly.
  */
 
-import { type MeshData, meshDataBounds } from "@/lib/geometry/meshData";
+import { type MeshData, meshDataBounds, meshDataVolume } from "@/lib/geometry/meshData";
 
 /** Import failure with a Hebrew user-facing message. */
 export class StlImportError extends Error {
@@ -248,25 +248,11 @@ export function summarizeStlMesh(mesh: MeshData): StlImportSummary {
     z: bounds.max.z - bounds.min.z,
   };
 
-  // Signed volume: sum of tetrahedra from the origin. abs() makes the
-  // result independent of overall orientation.
-  const p = mesh.positions;
-  const idx = mesh.indices;
-  let signedVolume = 0;
-  for (let i = 0; i < idx.length; i += 3) {
-    const a = idx[i] * 3;
-    const b = idx[i + 1] * 3;
-    const c = idx[i + 2] * 3;
-    signedVolume +=
-      (p[a] * (p[b + 1] * p[c + 2] - p[b + 2] * p[c + 1]) +
-        p[a + 1] * (p[b + 2] * p[c] - p[b] * p[c + 2]) +
-        p[a + 2] * (p[b] * p[c + 1] - p[b + 1] * p[c])) /
-      6;
-  }
-  const approxVolumeMm3 = Math.abs(signedVolume);
+  const approxVolumeMm3 = meshDataVolume(mesh);
 
   // Components: vertices connected through shared triangles (welding makes
   // vertex sharing equivalent to geometric adjacency).
+  const idx = mesh.indices;
   const vertexCount = mesh.positions.length / 3;
   const uf = new UnionFind(vertexCount);
   const used = new Uint8Array(vertexCount);

@@ -32,8 +32,26 @@ import {
   meshDataSurfaceArea,
   meshDataVolume,
   transformMeshData,
+  triangleCross,
   type MeshData,
 } from "./meshData";
+
+/**
+ * How deep a paint region may reach as a fraction of the body's THINNEST
+ * dimension, with an absolute floor. Past roughly half the thickness the
+ * offset copy turns inside out, and the kernel reports NoError while doing
+ * it — this bound is what keeps the split honest.
+ */
+const MAX_PAINT_DEPTH_FRACTION = 0.45;
+const MIN_PAINT_DEPTH_MM = 0.05;
+
+/**
+ * Relative slack allowed when checking that a split conserved volume, with
+ * an absolute floor for very small bodies. Tight enough to catch an
+ * inside-out piece; loose enough for the kernel's own rounding.
+ */
+const VOLUME_CONSERVATION_TOLERANCE_FRACTION = 1e-3;
+const MIN_VOLUME_CONSERVATION_TOLERANCE_MM3 = 0.05;
 
 /** Depth a painted region reaches into the body, in mm. */
 export const DEFAULT_PAINT_DEPTH_MM = 0.8;
@@ -182,11 +200,7 @@ export function paintAnchorsFor(mesh: MeshData, triangles: readonly number[]): n
     const cx = (p[a] + p[b] + p[c]) / 3;
     const cy = (p[a + 1] + p[b + 1] + p[c + 1]) / 3;
     const cz = (p[a + 2] + p[b + 2] + p[c + 2]) / 3;
-    const ux = p[b] - p[a], uy = p[b + 1] - p[a + 1], uz = p[b + 2] - p[a + 2];
-    const vx = p[c] - p[a], vy = p[c + 1] - p[a + 1], vz = p[c + 2] - p[a + 2];
-    let nx = uy * vz - uz * vy;
-    let ny = uz * vx - ux * vz;
-    let nz = ux * vy - uy * vx;
+    let [nx, ny, nz] = triangleCross(p, idx[t * 3], idx[t * 3 + 1], idx[t * 3 + 2]);
     const len = Math.hypot(nx, ny, nz) || 1;
     nx /= len; ny /= len; nz /= len;
     const r = Math.max(
@@ -417,15 +431,7 @@ export function buildPaintShellMesh(
     const a = patch[i] * 3;
     const b = patch[i + 1] * 3;
     const c = patch[i + 2] * 3;
-    const ux = outer[b] - outer[a];
-    const uy = outer[b + 1] - outer[a + 1];
-    const uz = outer[b + 2] - outer[a + 2];
-    const vx = outer[c] - outer[a];
-    const vy = outer[c + 1] - outer[a + 1];
-    const vz = outer[c + 2] - outer[a + 2];
-    const nx = uy * vz - uz * vy;
-    const ny = uz * vx - ux * vz;
-    const nz = ux * vy - uy * vx;
+    const [nx, ny, nz] = triangleCross(outer, patch[i], patch[i + 1], patch[i + 2]);
     patchNx += nx;
     patchNy += ny;
     patchNz += nz;
@@ -535,7 +541,10 @@ export function splitSolidByPaint(
     bounds.max.y - bounds.min.y,
     bounds.max.z - bounds.min.z
   );
-  const maxDepth = Math.max(0.05, thinnest * 0.45);
+  const maxDepth = Math.max(
+    MIN_PAINT_DEPTH_MM,
+    thinnest * MAX_PAINT_DEPTH_FRACTION
+  );
 
   const result: PaintedSolid[] = [];
   let remainder = solid;
@@ -586,7 +595,10 @@ export function splitSolidByPaint(
       const regionVolume = region.volumeMm3();
       const restVolume = rest.volumeMm3();
       const volumeAfter = regionVolume + restVolume;
-      const tolerance = Math.max(0.05, volumeBefore * 1e-3);
+      const tolerance = Math.max(
+        MIN_VOLUME_CONSERVATION_TOLERANCE_MM3,
+        volumeBefore * VOLUME_CONSERVATION_TOLERANCE_FRACTION
+      );
       const conserved =
         Number.isFinite(volumeAfter) &&
         regionVolume > 0 &&

@@ -12,6 +12,7 @@
 import type { ReactNode } from "react";
 import { NumberField } from "@/components/ui/NumberField";
 import { ToggleGroup } from "@/components/ui/ToggleGroup";
+import type { Axis } from "@/types/design";
 import type { EditorTool, SnapSettings } from "./store";
 
 export interface ToolsPanelProps {
@@ -30,12 +31,12 @@ export interface ToolsPanelProps {
   onSetSnap: (snap: Partial<SnapSettings>) => void;
   onDropToPlate: () => void;
   onCenterOnPlate: () => void;
-  onMirror: (axis: "x" | "y" | "z") => void;
+  onMirror: (axis: Axis) => void;
   onDuplicate: () => void;
-  onAlign: (axis: "x" | "y" | "z", mode: "min" | "center" | "max") => void;
-  onDistribute: (axis: "x" | "y" | "z") => void;
+  onAlign: (axis: Axis, mode: "min" | "center" | "max") => void;
+  onDistribute: (axis: Axis) => void;
   onSnapToCenter: () => void;
-  onSnapToEdge: (axis: "x" | "y" | "z") => void;
+  onSnapToEdge: (axis: Axis) => void;
   onBoolean: (kind: "union" | "difference" | "intersection") => void;
   onCut: () => void;
   onSplitComponents: () => void;

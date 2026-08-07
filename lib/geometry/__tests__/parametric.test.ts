@@ -28,7 +28,9 @@ import {
   identityTransform,
   type DesignDocument,
   type DesignLayer,
+  type PrimitiveLayer,
 } from "@/types/design";
+import { testBoxLayer, testDocumentWith } from "@/lib/testing/fixtures";
 
 const NO_VARS = new Map<string, number>();
 
@@ -254,34 +256,10 @@ describe("modifier stack", () => {
 });
 
 describe("hierarchy and pivots", () => {
-  function layer(id: string, overrides: Partial<DesignLayer> = {}): DesignLayer {
-    return {
-      id,
-      type: "primitive",
-      name: id,
-      visible: true,
-      locked: false,
-      materialSlotId: "slot1",
-      transform: identityTransform(),
-      previewOpacity: 1,
-      ...defaultPrimitive("box"),
-      ...overrides,
-    } as DesignLayer;
-  }
+  const layer = (id: string, overrides: Partial<DesignLayer> = {}): DesignLayer =>
+    testBoxLayer({ id, name: id, ...overrides } as Partial<PrimitiveLayer>);
 
-  function doc(layers: DesignLayer[]): DesignDocument {
-    return {
-      schemaVersion: 3,
-      baseMode: "baseless",
-      layers,
-      materialSlots: [{ id: "slot1", nameHe: "חומר", colorHex: "#888888" }],
-      printerProfileId: "genericFdm220",
-      printabilityProfileId: "fdmPla",
-      customPrintability: null,
-      usageProfileId: null,
-      templateId: null,
-    };
-  }
+  const doc = (layers: DesignLayer[]): DesignDocument => testDocumentWith(layers);
 
   it("a child inherits its parent's transform", () => {
     const parent = layer("p", { transform: { ...identityTransform(), x: 10, y: 5 } });

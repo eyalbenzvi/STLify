@@ -18,8 +18,6 @@ import {
   type Transform3D,
 } from "@/types/design";
 
-export type PatternKind = "linear" | "circular" | "grid" | "mirror";
-
 export interface LinearPatternSettings {
   kind: "linear";
   /** Number of copies INCLUDING the original. */

@@ -337,7 +337,7 @@ the plan they were executed against.
 | Operations | `lib/geometry/operations/*` | Booleans, cut/split, connectors, hollow/drain, thicken/smooth/simplify, placement math |
 | Analysis | `lib/geometry/analysis/*` | Overhang, contact, floating parts, build volume, wall thickness, orientation scoring, estimates |
 | Import | `lib/import/{stl,svg,image}.ts` | Validated STL/SVG/image parsing → mesh data / contours |
-| Export | `lib/export/{stl,stlData,zip,package}.ts` | Binary STL, dependency-free ZIP (STORE), multi-part package |
+| Export | `lib/export/{stlData,threeMF,zip,package,exportDocument}.ts` | Binary STL, 3MF, dependency-free ZIP (STORE), multi-part package; `exportDocument.ts` picks between them |
 | Serialization | `lib/serialization/designFile.ts` | Portable `.formadesign.json` v3 with strict validation |
 | History | `lib/history/history.ts` | In-memory undo/redo (session only) |
 | Repair | `lib/geometry/repair/*` | Topology analysis, hole filling, self-intersection, voxel remesh, component cleanup, staged repair pipeline |
@@ -353,7 +353,9 @@ the plan they were executed against.
 | Batch | `cli/batch.ts`, `cli/batchCore.ts` | Headless CSV → ZIP production runs (local Node process) |
 | Keyboard | `lib/keyboard/keymap.ts` | Editable, locally persisted shortcut map |
 | Benchmarks | `bench/perf.bench.ts` | Performance budgets (`npm run bench`) |
-| UI | `components/**`, `hooks/useDocumentBuilder.ts` | RTL Hebrew editor, R3F viewer, dialogs |
+| UI shell | `components/Editor.tsx`, `components/editor/**` | Composition: panels, viewport, dialogs. Owns wiring, not operations |
+| UI logic | `hooks/**` | One hook per family: ops plumbing, dialogs, placement, body operations, print aids, region tools, persistence, shortcuts |
+| UI | `components/dialogs/**`, `components/viewer/**` | RTL Hebrew dialogs and the R3F viewport |
 
 ### Why Manifold (manifold-3d)
 
@@ -443,7 +445,13 @@ worth repeating, updated for V6:
 - **The batch CLI drives parameters and text content.** Other layer fields
   (colours, transforms) are not CSV-addressable; bind them to parameters
   where the field supports it.
-- **`Editor.tsx` is still large** (3,242 lines — V6 added print-prep,
-  library, keymap and touch wiring faster than extraction removed it). The
-  operation handlers still share a dense web of state that would need
-  lifting into the store before they can follow the V5 extractions.
+- **`Editor.tsx` is composition, not logic** (1,384 lines, down from
+  3,242). Its operations live in `hooks/**`, one hook per family, sharing
+  the `EditorOps` object (`hooks/useEditorOps.ts`) rather than a web of
+  closures. What remains is the panel layout, the viewport, and the dialog
+  block — declarative JSX over state the shell owns, which would only get
+  worse behind a component taking forty-five props.
+- **`lib/serialization/designFile.ts` is long** (896 lines) but cohesive:
+  one function per untrusted field, all serving the single job of turning
+  arbitrary JSON into a valid document. Splitting it would scatter the
+  primitives its sanitizers share.

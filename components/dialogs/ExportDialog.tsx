@@ -11,6 +11,7 @@ import { useMemo, useState } from "react";
 import type { DesignDocument, ModelIssue } from "@/types/design";
 import type { BuiltPart } from "@/hooks/useDocumentBuilder";
 import { getPrintabilityProfile } from "@/types/profiles";
+import { unionBounds } from "@/lib/geometry/bounds";
 import { Modal, ModalButton } from "@/components/ui/Modal";
 
 export type ExportKind = "stl" | "zip" | "threemf" | "design";
@@ -74,20 +75,10 @@ export function ExportDialog({
   const needsAck = kind !== "design" && warningIssues.length > 0;
   const canExport = !geometryBlocked && (!needsAck || acknowledged) && fileName.trim().length > 0;
 
-  const bounds = useMemo(() => {
-    if (parts.length === 0) return null;
-    const min = { x: Infinity, y: Infinity, z: Infinity };
-    const max = { x: -Infinity, y: -Infinity, z: -Infinity };
-    for (const p of parts) {
-      min.x = Math.min(min.x, p.stats.bounds.min.x);
-      min.y = Math.min(min.y, p.stats.bounds.min.y);
-      min.z = Math.min(min.z, p.stats.bounds.min.z);
-      max.x = Math.max(max.x, p.stats.bounds.max.x);
-      max.y = Math.max(max.y, p.stats.bounds.max.y);
-      max.z = Math.max(max.z, p.stats.bounds.max.z);
-    }
-    return { min, max };
-  }, [parts]);
+  const bounds = useMemo(
+    () => unionBounds(parts.map((p) => p.stats.bounds)),
+    [parts]
+  );
 
   return (
     <Modal

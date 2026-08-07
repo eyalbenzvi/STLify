@@ -16,9 +16,8 @@
  * the worker path end to end.
  */
 
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
+import { installNodeFontFetch } from "../../nodeFontFetch";
 import type { DesignDocument, ImportedMeshLayer } from "@/types/design";
 import { buildDocument } from "../../buildDocument";
 import { createTemplateDocument } from "../../documentTemplates";
@@ -28,18 +27,7 @@ import type { MeshData } from "../../meshData";
 import { executeJob, JobCancelledError, type JobContext } from "../registry";
 import { buildDocumentViaJob } from "../buildDocumentClient";
 
-beforeAll(() => {
-  // Serve /fonts/* requests from the public directory.
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = String(input);
-    if (url.startsWith("/fonts/")) {
-      const buffer = readFileSync(join(process.cwd(), "public", url));
-      return new Response(new Uint8Array(buffer), { status: 200 });
-    }
-    return originalFetch(input, init);
-  }) as typeof fetch;
-});
+beforeAll(installNodeFontFetch);
 
 function passiveContext(): JobContext {
   return { onProgress: () => undefined, throwIfCancelled: () => undefined };

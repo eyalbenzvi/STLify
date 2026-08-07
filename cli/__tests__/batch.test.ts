@@ -9,26 +9,15 @@
  * is on the produced files, not on the code that produced them.
  */
 
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
+import { installNodeFontFetch } from "@/lib/geometry/nodeFontFetch";
 import type { DesignDocument, PrimitiveLayer, TextLayer } from "@/types/design";
 import { createTemplateDocument } from "@/lib/geometry/documentTemplates";
 import { defaultPrimitive, identityTransform } from "@/types/design";
 import { serializeDesignFile } from "@/lib/serialization/designFile";
 import { applyRow, parseCsv, runBatch } from "../batchCore";
 
-beforeAll(() => {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = String(input);
-    if (url.startsWith("/fonts/")) {
-      const buffer = readFileSync(join(process.cwd(), "public", url));
-      return new Response(new Uint8Array(buffer), { status: 200 });
-    }
-    return originalFetch(input, init);
-  }) as typeof fetch;
-});
+beforeAll(installNodeFontFetch);
 
 /** Walk a STORE-only ZIP into name → bytes. */
 function readStoreZip(bytes: Uint8Array): Map<string, Uint8Array> {

@@ -14,7 +14,7 @@
  * that share a plane (for planar faces) or vary smoothly (for curved ones).
  */
 
-import type { MeshData } from "../meshData";
+import { triangleCross, type MeshData } from "../meshData";
 
 export interface Vec3 {
   x: number;
@@ -54,19 +54,15 @@ export function buildAdjacency(mesh: MeshData): MeshAdjacency {
 
   const normals = new Float32Array(triangleCount * 3);
   const areas = new Float32Array(triangleCount);
+  const cross: [number, number, number] = [0, 0, 0];
   for (let t = 0; t < triangleCount; t++) {
-    const a = idx[t * 3] * 3;
-    const b = idx[t * 3 + 1] * 3;
-    const c = idx[t * 3 + 2] * 3;
-    const ux = pos[b] - pos[a];
-    const uy = pos[b + 1] - pos[a + 1];
-    const uz = pos[b + 2] - pos[a + 2];
-    const vx = pos[c] - pos[a];
-    const vy = pos[c + 1] - pos[a + 1];
-    const vz = pos[c + 2] - pos[a + 2];
-    const nx = uy * vz - uz * vy;
-    const ny = uz * vx - ux * vz;
-    const nz = ux * vy - uy * vx;
+    const [nx, ny, nz] = triangleCross(
+      pos,
+      idx[t * 3],
+      idx[t * 3 + 1],
+      idx[t * 3 + 2],
+      cross
+    );
     const length = Math.hypot(nx, ny, nz);
     areas[t] = length / 2;
     if (length > 1e-20) {

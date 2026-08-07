@@ -13,12 +13,13 @@
  * controls lie.
  */
 
-import type {
-  DesignLayer,
-  PrimitiveKind,
-  PrimitiveLayer,
-  SketchEntity,
-  SketchLayer,
+import {
+  PRIMITIVE_NAMES_HE,
+  type DesignLayer,
+  type PrimitiveKind,
+  type PrimitiveLayer,
+  type SketchEntity,
+  type SketchLayer,
 } from "@/types/design";
 import { NumberField } from "@/components/ui/NumberField";
 
@@ -62,16 +63,6 @@ const PRIMITIVE_FIELDS: Record<
 
 /** Kinds whose surface is curved and therefore has a facet count. */
 const CURVED_KINDS: PrimitiveKind[] = ["cylinder", "sphere", "cone", "torus", "tube"];
-
-const PRIMITIVE_NAMES_HE: Record<PrimitiveKind, string> = {
-  box: "תיבה",
-  cylinder: "גליל",
-  sphere: "כדור",
-  cone: "חרוט",
-  torus: "טבעת",
-  wedge: "טריז",
-  tube: "צינור",
-};
 
 export function PrimitiveProps({
   layer,

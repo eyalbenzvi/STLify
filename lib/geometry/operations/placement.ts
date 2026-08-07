@@ -129,42 +129,6 @@ export function placeOnSurface(
   return snapTransformNoise(matrix4ToTransform(matrix));
 }
 
-/**
- * Rotate the object so a chosen face normal on it points along (or against)
- * a target face normal, keeping the object's centre in place. Used by
- * "align face to face".
- */
-export function alignFaceToFace(
-  transform: Transform3D,
-  bounds: WorldBounds,
-  sourceNormal: { x: number; y: number; z: number },
-  targetNormal: { x: number; y: number; z: number },
-  opposite: boolean
-): Transform3D {
-  const from = new THREE.Vector3(sourceNormal.x, sourceNormal.y, sourceNormal.z).normalize();
-  const to = new THREE.Vector3(targetNormal.x, targetNormal.y, targetNormal.z).normalize();
-  if (opposite) to.negate();
-  const q = new THREE.Quaternion().setFromUnitVectors(from, to);
-  const centre = new THREE.Vector3(
-    (bounds.min.x + bounds.max.x) / 2,
-    (bounds.min.y + bounds.max.y) / 2,
-    (bounds.min.z + bounds.max.z) / 2
-  );
-  const m = transformToMatrix4(transform);
-  const rotation = new THREE.Matrix4().makeRotationFromQuaternion(q);
-  const toCentre = new THREE.Matrix4().makeTranslation(-centre.x, -centre.y, -centre.z);
-  const back = new THREE.Matrix4().makeTranslation(centre.x, centre.y, centre.z);
-  const result = back.multiply(rotation).multiply(toCentre).multiply(m);
-  return snapTransformNoise(matrix4ToTransform(result));
-}
-
-/** Snap a translation to the given grid (0 disables). */
-export function snapToGrid(transform: Transform3D, gridMm: number): Transform3D {
-  if (gridMm <= 0) return transform;
-  const snap = (v: number) => Math.round(v / gridMm) * gridMm;
-  return { ...transform, x: snap(transform.x), y: snap(transform.y), z: snap(transform.z) };
-}
-
 /** Move object A so its centre coincides with object B's centre. */
 export function snapToObjectCenter(
   transform: Transform3D,

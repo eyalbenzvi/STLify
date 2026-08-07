@@ -15,7 +15,7 @@
  * printing app handles.
  */
 
-import type { MeshData } from "./meshData";
+import { triangleCross, type MeshData } from "./meshData";
 
 interface BvhNode {
   minX: number;
@@ -437,22 +437,20 @@ export function closestPointOnTriangle(mesh: MeshData, t: number, p: Vec3Like): 
   };
 }
 
+// Reused across calls: this runs per ray per candidate triangle, which the
+// voxel remesher drives into the millions.
+const facingCross: [number, number, number] = [0, 0, 0];
+
 /** True when the triangle's outward normal points away from the ray. */
 function triangleFacesAway(mesh: MeshData, t: number, direction: Vec3Like): boolean {
-  const pos = mesh.positions;
   const idx = mesh.indices;
-  const ia = idx[t * 3] * 3;
-  const ib = idx[t * 3 + 1] * 3;
-  const ic = idx[t * 3 + 2] * 3;
-  const ux = pos[ib] - pos[ia];
-  const uy = pos[ib + 1] - pos[ia + 1];
-  const uz = pos[ib + 2] - pos[ia + 2];
-  const vx = pos[ic] - pos[ia];
-  const vy = pos[ic + 1] - pos[ia + 1];
-  const vz = pos[ic + 2] - pos[ia + 2];
-  const nx = uy * vz - uz * vy;
-  const ny = uz * vx - ux * vz;
-  const nz = ux * vy - uy * vx;
+  const [nx, ny, nz] = triangleCross(
+    mesh.positions,
+    idx[t * 3],
+    idx[t * 3 + 1],
+    idx[t * 3 + 2],
+    facingCross
+  );
   return nx * direction.x + ny * direction.y + nz * direction.z > 0;
 }
 

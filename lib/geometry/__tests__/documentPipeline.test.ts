@@ -4,9 +4,8 @@
  * watertight solids they produced in V2).
  */
 
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
+import { installNodeFontFetch } from "../nodeFontFetch";
 import type { DesignDocument, TextLayer } from "@/types/design";
 import { identityTransform } from "@/types/design";
 import { buildDocument } from "../buildDocument";
@@ -20,18 +19,7 @@ import {
 } from "../documentTemplates";
 import { validateDocument } from "../documentValidation";
 
-beforeAll(() => {
-  // Serve /fonts/* requests from the public directory.
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = String(input);
-    if (url.startsWith("/fonts/")) {
-      const buffer = readFileSync(join(process.cwd(), "public", url));
-      return new Response(new Uint8Array(buffer), { status: 200 });
-    }
-    return originalFetch(input, init);
-  }) as typeof fetch;
-});
+beforeAll(installNodeFontFetch);
 
 async function buildOk(document: DesignDocument) {
   const result = await buildDocument(document);

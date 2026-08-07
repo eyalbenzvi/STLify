@@ -43,8 +43,8 @@ export interface Transform3D {
   scaleZ: number;
 }
 
-/** Gizmo/numeric-entry coordinate space. World = build-plate axes. */
-export type TransformSpace = "world" | "local";
+/** One of the three world axes. */
+export type Axis = "x" | "y" | "z";
 
 export function identityTransform(): Transform3D {
   return {
@@ -313,6 +313,17 @@ export type PrimitiveKind =
   | "wedge"
   | "tube";
 
+/** Display name per primitive kind — the create menu and the layer name. */
+export const PRIMITIVE_NAMES_HE: Record<PrimitiveKind, string> = {
+  box: "תיבה",
+  cylinder: "גליל",
+  sphere: "כדור",
+  cone: "חרוט",
+  torus: "טבעת",
+  wedge: "טריז",
+  tube: "צינור",
+};
+
 /**
  * A parametric primitive solid. Every kind is built from the same parameter
  * set so the properties panel and the design-file validator stay simple; each
@@ -435,6 +446,13 @@ export interface MaterialSlot {
   colorHex: string;
 }
 
+/**
+ * The id every document's first material slot carries. Also the last-resort
+ * value when a layer names a slot that no longer exists — a design file
+ * written by an older version, or a slot the user deleted.
+ */
+export const FALLBACK_MATERIAL_SLOT_ID = "slot1";
+
 export interface DesignDocument {
   schemaVersion: typeof DESIGN_SCHEMA_VERSION;
   /** Design mode: with a base plate (V2 behaviour) or independent objects. */
@@ -502,14 +520,6 @@ export interface CutPlaneDefinition {
   /** Custom-plane rotation (applied to the base orientation), degrees. */
   rotationX: number;
   rotationY: number;
-}
-
-export interface SplitOperation {
-  layerId: string;
-  plane: CutPlaneDefinition;
-  keep: "top" | "bottom" | "both";
-  /** Caps are inherent to manifold cutting; false trims without closing. */
-  cap: boolean;
 }
 
 export type ConnectorType = "pin" | "key" | "dovetail" | "magnetPocket";
@@ -582,18 +592,6 @@ export interface Measurement {
   valueMm: number;
 }
 
-/** How many points the user must pick for each measurement kind. */
-export function measurementPointCount(kind: MeasurementKind): number {
-  if (kind === "thickness") return 1;
-  if (kind === "radius") return 3;
-  return 2;
-}
-
-/** Unit suffix shown next to a measurement's value. */
-export function measurementUnit(kind: MeasurementKind): string {
-  return kind === "angle" ? "°" : "מ״מ";
-}
-
 // ---------------------------------------------------------------------------
 // Validation / analysis results
 // ---------------------------------------------------------------------------
@@ -609,24 +607,6 @@ export interface ModelIssue {
   actionHe?: string;
   /** World-space location to highlight, when known. */
   location?: { x: number; y: number; z: number };
-}
-
-export interface ModelValidationResult {
-  ok: boolean;
-  watertight: boolean;
-  issues: ModelIssue[];
-  triangleCount: number;
-  volumeMm3: number;
-  surfaceAreaMm2: number;
-  dimensionsMm: { x: number; y: number; z: number };
-}
-
-export interface RepairResult {
-  attempted: boolean;
-  succeeded: boolean;
-  messageHe: string;
-  /** Mesh-store id of the repaired mesh when succeeded. */
-  meshId: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -695,6 +675,11 @@ export function newId(prefix: string): string {
 
 export function isShapeLayer(layer: DesignLayer): layer is ShapeLayer {
   return layer.type !== "hole";
+}
+
+/** The slot a newly created layer is assigned to: the document's first. */
+export function primaryMaterialSlotId(document: DesignDocument): string {
+  return document.materialSlots[0]?.id ?? FALLBACK_MATERIAL_SLOT_ID;
 }
 
 /** Layers that are live 2D-contour extrusions (support bevel + combine). */
