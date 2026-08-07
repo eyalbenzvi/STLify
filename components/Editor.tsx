@@ -160,6 +160,7 @@ import {
   hasStalePaint,
   paintedTriangleSlots,
   paintTriangles,
+  reanchorPaints,
   splitPartsByPaint,
   unpaintTriangles,
 } from "@/lib/geometry/painting";
@@ -1816,7 +1817,9 @@ function EditorInner() {
           resolvedPaintSlotId,
           sel.triangles,
           paintTriangleCount,
-          paintDepthMm
+          paintDepthMm,
+          // Spatial anchors: what lets the paint survive a rebuild (V6).
+          faceSelectionPart?.localMesh
         ),
       },
       "צביעת אזור"
@@ -1828,6 +1831,7 @@ function EditorInner() {
     paintTriangleCount,
     paintDepthMm,
     updateLayer,
+    faceSelectionPart,
   ]);
 
   const handleUnpaintRegion = useCallback(() => {
@@ -1839,12 +1843,13 @@ function EditorInner() {
         facePaint: unpaintTriangles(
           paintTargetLayer.facePaint,
           sel.triangles,
-          paintTriangleCount
+          paintTriangleCount,
+          faceSelectionPart?.localMesh
         ),
       },
       "הסרת צבע מאזור"
     );
-  }, [state.ui.faceSelection, paintTargetLayer, paintTriangleCount, updateLayer]);
+  }, [state.ui.faceSelection, paintTargetLayer, paintTriangleCount, updateLayer, faceSelectionPart]);
 
   const handleClearPaint = useCallback(() => {
     if (!paintTargetLayer || paintTargetLayer.locked) return;
@@ -1914,6 +1919,31 @@ function EditorInner() {
     );
     if (result.removed > 0) setMemoryVersion((v) => v + 1);
   }, [state.history]);
+
+  // Paint recorded with spatial anchors survives a rebuild by re-projection
+  // (V6 item 17): after each completed build, a layer whose paint no longer
+  // matches its body is re-anchored onto the new mesh — quietly, with no
+  // history entry, exactly like a derived value. Entries without anchors
+  // (pre-V6 paint) keep the old discard-with-warning behaviour.
+  useEffect(() => {
+    if (build.parts.length === 0) return;
+    let changed = false;
+    const document = state.history.present.document;
+    const layers = document.layers.map((layer) => {
+      if (!layer.facePaint || layer.facePaint.length === 0) return layer;
+      const part = build.parts.find((p) => p.primaryLayerId === layer.id);
+      if (!part) return layer;
+      const count = part.localMesh.indices.length / 3;
+      if (!hasStalePaint(layer.facePaint, count)) return layer;
+      const result = reanchorPaints(layer.facePaint, part.localMesh);
+      if (result.reanchored === 0 && result.dropped === 0) return layer;
+      changed = true;
+      return { ...layer, facePaint: result.paints };
+    });
+    if (changed) {
+      dispatch({ type: "document/replaceTransient", document: { ...document, layers } });
+    }
+  }, [build.buildId, build.parts, state.history.present.document, dispatch]);
 
   const handleCollectGarbage = useCallback(() => {
     // Sweep against the union of every state in the history: a mesh that only

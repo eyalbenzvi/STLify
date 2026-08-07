@@ -54,13 +54,20 @@ export function paintTriangles(
   materialSlotId: string,
   triangles: Iterable<number>,
   meshTriangleCount: number,
-  depthMm: number = DEFAULT_PAINT_DEPTH_MM
+  depthMm: number = DEFAULT_PAINT_DEPTH_MM,
+  /** The painted mesh; when given, spatial anchors are (re)computed so the
+   *  paint survives a rebuild by re-projection (see reanchorPaints). */
+  mesh?: MeshData
 ): FacePaint[] {
   const added = new Set<number>();
   for (const t of triangles) {
     if (Number.isInteger(t) && t >= 0 && t < meshTriangleCount) added.add(t);
   }
   if (added.size === 0) return activePaints(existing, meshTriangleCount);
+  const withAnchors = (paints: FacePaint[]): FacePaint[] =>
+    mesh
+      ? paints.map((paint) => ({ ...paint, anchors: paintAnchorsFor(mesh, paint.triangles) }))
+      : paints;
 
   const result: FacePaint[] = [];
   let merged = false;
@@ -83,20 +90,28 @@ export function paintTriangles(
       depthMm,
     });
   }
-  return result;
+  return withAnchors(result);
 }
 
 /** Remove `triangles` from every painted region. */
 export function unpaintTriangles(
   existing: readonly FacePaint[] | undefined,
   triangles: Iterable<number>,
-  meshTriangleCount: number
+  meshTriangleCount: number,
+  /** When given, anchors are refreshed to match the kept triangles. */
+  mesh?: MeshData
 ): FacePaint[] {
   const removed = new Set(triangles);
   const result: FacePaint[] = [];
   for (const paint of activePaints(existing, meshTriangleCount)) {
     const kept = paint.triangles.filter((t) => !removed.has(t));
-    if (kept.length > 0) result.push({ ...paint, triangles: kept });
+    if (kept.length > 0) {
+      result.push({
+        ...paint,
+        triangles: kept,
+        anchors: mesh ? paintAnchorsFor(mesh, kept) : paint.anchors,
+      });
+    }
   }
   return result;
 }
@@ -140,6 +155,190 @@ export function hasStalePaint(
 ): boolean {
   if (!existing || existing.length === 0) return false;
   return existing.some((p) => p.meshTriangleCount !== meshTriangleCount);
+}
+
+// ---------------------------------------------------------------------------
+// Spatial re-anchoring (V6 item 17)
+// ---------------------------------------------------------------------------
+
+/** Values per anchor: centroid xyz, normal xyz, size r. */
+const ANCHOR_STRIDE = 7;
+
+/**
+ * Spatial anchors for the given triangles: centroid, outward normal and a
+ * size (max distance from centroid to a vertex) per triangle, in the mesh's
+ * own (local) frame. Stored on the paint entry so a rebuilt body can be
+ * repainted by PROXIMITY instead of by index.
+ */
+export function paintAnchorsFor(mesh: MeshData, triangles: readonly number[]): number[] {
+  const p = mesh.positions;
+  const idx = mesh.indices;
+  const anchors = new Array<number>(triangles.length * ANCHOR_STRIDE);
+  let cursor = 0;
+  for (const t of triangles) {
+    const a = idx[t * 3] * 3;
+    const b = idx[t * 3 + 1] * 3;
+    const c = idx[t * 3 + 2] * 3;
+    const cx = (p[a] + p[b] + p[c]) / 3;
+    const cy = (p[a + 1] + p[b + 1] + p[c + 1]) / 3;
+    const cz = (p[a + 2] + p[b + 2] + p[c + 2]) / 3;
+    const ux = p[b] - p[a], uy = p[b + 1] - p[a + 1], uz = p[b + 2] - p[a + 2];
+    const vx = p[c] - p[a], vy = p[c + 1] - p[a + 1], vz = p[c + 2] - p[a + 2];
+    let nx = uy * vz - uz * vy;
+    let ny = uz * vx - ux * vz;
+    let nz = ux * vy - uy * vx;
+    const len = Math.hypot(nx, ny, nz) || 1;
+    nx /= len; ny /= len; nz /= len;
+    const r = Math.max(
+      Math.hypot(p[a] - cx, p[a + 1] - cy, p[a + 2] - cz),
+      Math.hypot(p[b] - cx, p[b + 1] - cy, p[b + 2] - cz),
+      Math.hypot(p[c] - cx, p[c + 1] - cy, p[c + 2] - cz)
+    );
+    anchors[cursor++] = cx; anchors[cursor++] = cy; anchors[cursor++] = cz;
+    anchors[cursor++] = nx; anchors[cursor++] = ny; anchors[cursor++] = nz;
+    anchors[cursor++] = r;
+  }
+  return anchors;
+}
+
+export interface ReanchorResult {
+  paints: FacePaint[];
+  /** Regions that survived the re-projection. */
+  reanchored: number;
+  /** Regions dropped (no anchors, or nothing landed within tolerance). */
+  dropped: number;
+}
+
+/** Minimum normal agreement for a match — keeps paint off the far side of thin walls. */
+const REANCHOR_NORMAL_DOT = 0.7;
+
+/**
+ * Re-project stale paint onto a rebuilt mesh by anchor proximity.
+ *
+ * A new triangle joins a region when its centroid lies within the catch
+ * radius of one of the region's anchors (1.5× the LARGER of the two
+ * triangle sizes, floored at 0.75mm) AND its normal agrees with the
+ * anchor's — the normal test is what keeps paint from bleeding through to
+ * the far side of a thin wall. Entries that never had anchors (pre-V6
+ * paint) or catch nothing are dropped, exactly like before.
+ */
+export function reanchorPaints(
+  existing: readonly FacePaint[] | undefined,
+  mesh: MeshData,
+  options?: { minCatchMm?: number }
+): ReanchorResult {
+  const triangleCount = mesh.indices.length / 3;
+  const still = activePaints(existing, triangleCount);
+  const stale = (existing ?? []).filter(
+    (paint) => paint.meshTriangleCount !== triangleCount && paint.triangles.length > 0
+  );
+  if (stale.length === 0) {
+    return { paints: still, reanchored: 0, dropped: 0 };
+  }
+  const minCatch = options?.minCatchMm ?? 0.75;
+
+  // Hash-grid over all stale anchors, cell size = the largest catch radius,
+  // so a lookup only ever probes the 27 neighbouring cells.
+  interface GridAnchor {
+    slotIndex: number;
+    x: number; y: number; z: number;
+    nx: number; ny: number; nz: number;
+    r: number;
+  }
+  const gridAnchors: GridAnchor[] = [];
+  let maxCatch = minCatch;
+  stale.forEach((paint, slotIndex) => {
+    const anchors = paint.anchors ?? [];
+    for (let i = 0; i + ANCHOR_STRIDE <= anchors.length; i += ANCHOR_STRIDE) {
+      const r = anchors[i + 6];
+      maxCatch = Math.max(maxCatch, 1.5 * r);
+      gridAnchors.push({
+        slotIndex,
+        x: anchors[i], y: anchors[i + 1], z: anchors[i + 2],
+        nx: anchors[i + 3], ny: anchors[i + 4], nz: anchors[i + 5],
+        r,
+      });
+    }
+  });
+  const dropped = stale.filter((p) => !p.anchors || p.anchors.length === 0).length;
+  if (gridAnchors.length === 0) {
+    return { paints: still, reanchored: 0, dropped };
+  }
+  const cell = maxCatch;
+  const grid = new Map<string, GridAnchor[]>();
+  const keyOf = (x: number, y: number, z: number) =>
+    `${Math.floor(x / cell)}_${Math.floor(y / cell)}_${Math.floor(z / cell)}`;
+  for (const anchor of gridAnchors) {
+    const key = keyOf(anchor.x, anchor.y, anchor.z);
+    const bucket = grid.get(key);
+    if (bucket) bucket.push(anchor);
+    else grid.set(key, [anchor]);
+  }
+
+  // Assign each new triangle to the nearest catching anchor's region.
+  const newAnchors = paintAnchorsFor(
+    mesh,
+    Array.from({ length: triangleCount }, (_, t) => t)
+  );
+  const claimed = new Map<number, number>(); // triangle → stale slot index
+  for (let t = 0; t < triangleCount; t++) {
+    const base = t * ANCHOR_STRIDE;
+    const cx = newAnchors[base], cy = newAnchors[base + 1], cz = newAnchors[base + 2];
+    const nx = newAnchors[base + 3], ny = newAnchors[base + 4], nz = newAnchors[base + 5];
+    const size = newAnchors[base + 6];
+    let best = Infinity;
+    let bestSlot = -1;
+    const gx = Math.floor(cx / cell), gy = Math.floor(cy / cell), gz = Math.floor(cz / cell);
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dz = -1; dz <= 1; dz++) {
+          const bucket = grid.get(`${gx + dx}_${gy + dy}_${gz + dz}`);
+          if (!bucket) continue;
+          for (const anchor of bucket) {
+            const catchRadius = Math.max(minCatch, 1.5 * Math.max(anchor.r, size));
+            const distance = Math.hypot(cx - anchor.x, cy - anchor.y, cz - anchor.z);
+            if (distance > catchRadius) continue;
+            if (nx * anchor.nx + ny * anchor.ny + nz * anchor.nz < REANCHOR_NORMAL_DOT) continue;
+            if (distance < best) {
+              best = distance;
+              bestSlot = anchor.slotIndex;
+            }
+          }
+        }
+      }
+    }
+    if (bestSlot >= 0) claimed.set(t, bestSlot);
+  }
+
+  const paints: FacePaint[] = [...still];
+  let reanchored = 0;
+  let droppedTotal = dropped;
+  stale.forEach((paint, slotIndex) => {
+    if (!paint.anchors || paint.anchors.length === 0) return;
+    const triangles = [...claimed.entries()]
+      .filter(([, slot]) => slot === slotIndex)
+      .map(([t]) => t)
+      .sort((a, b) => a - b);
+    if (triangles.length === 0) {
+      droppedTotal++;
+      return;
+    }
+    reanchored++;
+    paints.push({
+      materialSlotId: paint.materialSlotId,
+      triangles,
+      meshTriangleCount: triangleCount,
+      depthMm: paint.depthMm,
+      anchors: paintAnchorsFor(mesh, triangles),
+    });
+  });
+  // Merge with any same-slot survivors through the canonical path, then
+  // refresh anchors so they describe the MERGED triangle sets.
+  const merged = activePaints(paints, triangleCount).map((paint) => ({
+    ...paint,
+    anchors: paintAnchorsFor(mesh, paint.triangles),
+  }));
+  return { paints: merged, reanchored, dropped: droppedTotal };
 }
 
 /** triangle index → material slot id, for preview and hit-testing. */
