@@ -50,7 +50,7 @@ test.describe("demand frameloop", () => {
 
     // -- numeric translate: the pose is applied imperatively (no rebuild).
     await setNumberField(page, "X", 40);
-    last = await expectRepaint(page, last, "numeric translate");
+    await expectRepaint(page, last, "numeric translate");
 
     // -- select: moving the selection to another body moves the highlight.
     //    (Creation auto-selects, so a same-body click would be a no-change

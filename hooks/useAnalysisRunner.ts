@@ -165,7 +165,17 @@ export function useAnalysisRunner(context: AnalysisContext) {
         setAnalysisBusy(false);
       }
     }, 30);
-  }, [build.parts, doc, printer, overlay, showError]);
+  }, [
+    build.parts,
+    doc,
+    printer,
+    overlay,
+    showError,
+    setAnalysisBusy,
+    setEstimate,
+    setModelIssues,
+    setOverlayColors,
+  ]);
 
   // Invalidate analysis results when the geometry changes (state adjustment
   // derived from the build id, done during render — no effect cascade).
@@ -192,7 +202,7 @@ export function useAnalysisRunner(context: AnalysisContext) {
         setAnalysisBusy(false);
       }
     }, 30);
-  }, [selectedParts, build.parts, doc, showError]);
+  }, [selectedParts, build.parts, doc, showError, setAnalysisBusy, setOrientationCandidates]);
 
   const handleApplyOrientation = useCallback(
     (candidate: OrientationCandidate) => {
@@ -217,7 +227,7 @@ export function useAnalysisRunner(context: AnalysisContext) {
       next.z -= bounds.min.z;
       commitTransform(layer.id, next);
     },
-    [selectedParts, build.parts, doc.layers, commitTransform]
+    [selectedParts, build.parts, doc.layers, commitTransform, setOrientationCandidates]
   );
 
   return { runAnalysis, handleSuggestOrientation, handleApplyOrientation };

@@ -117,7 +117,7 @@ export function useImportHandlers(context: ImportHandlersContext) {
         });
       });
     },
-    [runOp]
+    [runOp, pendingStlRef, setStlPreview]
   );
 
   const confirmStlImport = useCallback(() => {
@@ -145,7 +145,7 @@ export function useImportHandlers(context: ImportHandlersContext) {
     };
     applyDocument({ ...doc, layers: [...doc.layers, layer] }, "ייבוא STL");
     dispatch({ type: "ui/select", selection: [layer.id] });
-  }, [doc, applyDocument, dispatch]);
+  }, [doc, applyDocument, dispatch, pendingStlRef, setStlPreview]);
 
   const handleSvgConfirm = useCallback(
     (options: SvgImportOptionsValue) => {
@@ -192,7 +192,7 @@ export function useImportHandlers(context: ImportHandlersContext) {
         }
       });
     },
-    [svgPending, doc, applyDocument, dispatch, runOp]
+    [svgPending, setSvgPending, doc, applyDocument, dispatch, runOp, setMessage]
   );
 
   /**
@@ -207,7 +207,7 @@ export function useImportHandlers(context: ImportHandlersContext) {
       return;
     }
     setImagePending({ file, fileName: file.name });
-  }, []);
+  }, [setImagePending, setMessage]);
 
   const handleImageConfirm = useCallback(
     (options: ImageImportOptionsValue) => {
@@ -312,7 +312,7 @@ export function useImportHandlers(context: ImportHandlersContext) {
         dispatch({ type: "ui/select", selection: [layer.id] });
       });
     },
-    [imagePending, doc, applyDocument, dispatch, runOp]
+    [imagePending, setImagePending, doc, applyDocument, dispatch, runOp, setMessage]
   );
 
   const handleDesignFile = useCallback(
@@ -331,7 +331,7 @@ export function useImportHandlers(context: ImportHandlersContext) {
         }
       });
     },
-    [runOp, applyDocument, dispatch]
+    [runOp, applyDocument, dispatch, setMessage]
   );
   return {
     handleStlFile,
