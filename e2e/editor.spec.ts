@@ -176,6 +176,26 @@ test.describe("sub-object editing", () => {
     assertSilent();
   });
 
+  test("a single STL says it will not carry the paint", async ({ page }) => {
+    // The panel promised separation "at export"; the DEFAULT export format is
+    // a single STL, which cannot carry a second material and silently merged
+    // the region back in.
+    await openEditor(page);
+    await startBlank(page);
+    await addFirstPrimitive(page, "תיבה");
+    await page.getByRole("button", { name: "הפעל בחירת פאות" }).click();
+    await clickViewportCenter(page);
+    await page.getByRole("button", { name: "צבע בחירה" }).click();
+    await expect(page.locator("body")).toContainText(/צבע משני: \d+ משולשים/);
+
+    await page.getByRole("button", { name: "ייצוא ⬇" }).click();
+    const dialog = page.getByRole("dialog");
+    await expect(dialog).toContainText("לא יופרדו");
+    // ...and the warning goes away for a format that does carry them.
+    await dialog.getByText("קובץ 3MF", { exact: false }).click();
+    await expect(dialog).not.toContainText("לא יופרדו");
+  });
+
   test("leaving face mode clears the selection", async ({ page }) => {
     await openEditor(page);
     await startBlank(page);

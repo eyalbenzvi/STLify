@@ -206,11 +206,46 @@ describe("export split", () => {
     } as DesignLayer;
   }
 
-  it("passes unpainted parts through untouched", async () => {
-    const doc = baseDoc([boxLayer()]);
+  it("leaves an unpainted part alone while splitting a painted one", async () => {
+    // `toEqual(build.parts)` on an all-unpainted document compared the array
+    // to itself: splitPartsByPaint early-returns a copy, so that assertion
+    // could not fail. Mixing a painted and an unpainted body is the case that
+    // actually exercises the loop.
+    const plain = await buildDocument(baseDoc([boxLayer()]));
+    const mesh = plain.parts[0].localMesh;
+    const count = meshDataTriangleCount(mesh);
+    const top: number[] = [];
+    for (let t = 0; t < count; t++) {
+      let onTop = true;
+      for (let k = 0; k < 3; k++) {
+        if (Math.abs(mesh.positions[mesh.indices[t * 3 + k] * 3 + 2] - 20) > 1e-6) {
+          onTop = false;
+          break;
+        }
+      }
+      if (onTop) top.push(t);
+    }
+
+    const other = {
+      ...(boxLayer() as unknown as Record<string, unknown>),
+      id: "other",
+      name: "שנייה",
+      transform: { ...identityTransform(), x: 60 },
+    } as unknown as DesignLayer;
+    const doc = baseDoc([
+      boxLayer([
+        { materialSlotId: "slot2", triangles: top, meshTriangleCount: count, depthMm: 1 },
+      ]),
+      other,
+    ]);
     const build = await buildDocument(doc);
     const split = await splitPartsByPaint(doc, build.parts);
-    expect(split.parts).toEqual(build.parts);
+
+    // Painted body -> two parts; unpainted body -> the very same object.
+    expect(split.parts).toHaveLength(3);
+    const untouched = split.parts.find((p) => p.primaryLayerId === "other");
+    expect(untouched).toBe(build.parts.find((p) => p.primaryLayerId === "other"));
+    expect(split.parts.filter((p) => p.primaryLayerId === "box")).toHaveLength(2);
     expect(split.warningsHe).toEqual([]);
   });
 

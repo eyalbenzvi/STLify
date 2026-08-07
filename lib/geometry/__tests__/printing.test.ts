@@ -590,3 +590,198 @@ describe("nozzle resolution", () => {
     ).toBeGreaterThan(0);
   });
 });
+
+/**
+ * Regressions from the external QA audit.
+ *
+ * The elephant-foot correction contracted every vertex of the bottom slab
+ * radially towards the part's centre. That is wrong in two directions at
+ * once, and the only test of the feature — "volume went down" — could not
+ * see either.
+ */
+describe("elephant foot moves each wall, not everything towards the centre", () => {
+  const calibration: CalibrationSettings = {
+    measuredClearanceMm: 0.2,
+    holeCompensationMm: 0,
+    elephantFootCompensationMm: 0.4,
+    elephantFootHeightMm: 0.8,
+  };
+
+  function doc(layers: DesignLayer[], compensate: boolean): DesignDocument {
+    return {
+      schemaVersion: 3,
+      baseMode: "baseless",
+      layers,
+      materialSlots: [{ id: "slot1", nameHe: "חומר", colorHex: "#888888" }],
+      printerProfileId: "genericFdm220",
+      printabilityProfileId: "fdmPla",
+      customPrintability: null,
+      usageProfileId: null,
+      templateId: null,
+      calibration: compensate ? calibration : undefined,
+    } as DesignDocument;
+  }
+
+  const box = (): DesignLayer =>
+    ({
+      id: "box",
+      type: "primitive",
+      name: "תיבה",
+      visible: true,
+      locked: false,
+      materialSlotId: "slot1",
+      transform: identityTransform(),
+      previewOpacity: 1,
+      ...defaultPrimitive("box"),
+      widthMm: 40,
+      depthMm: 40,
+      heightMm: 20,
+    }) as DesignLayer;
+
+  const bore = (): DesignLayer =>
+    ({
+      id: "hole",
+      type: "hole",
+      name: "חור",
+      visible: true,
+      locked: false,
+      materialSlotId: "slot1",
+      transform: identityTransform(),
+      previewOpacity: 1,
+      diameterMm: 6,
+      depthMode: "through",
+      depthMm: 40,
+    }) as DesignLayer;
+
+  /** Outer half-width and bore radius on the plane z = height. */
+  function measureAt(mesh: MeshData, height: number) {
+    let outer = -Infinity;
+    let bore = Infinity;
+    for (let v = 0; v < mesh.positions.length / 3; v++) {
+      if (Math.abs(mesh.positions[v * 3 + 2] - height) > 1e-4) continue;
+      const x = mesh.positions[v * 3];
+      const y = mesh.positions[v * 3 + 1];
+      outer = Math.max(outer, x);
+      const radius = Math.hypot(x, y);
+      if (radius < 15) bore = Math.min(bore, radius);
+    }
+    return { outer, bore };
+  }
+
+  it("insets a wall by exactly the compensation, corners included", async () => {
+    const build = await buildDocument(doc([box()], true));
+    const mesh = build.parts[0].worldMesh;
+    // Radially, a corner moved 0.4mm along the DIAGONAL, so each face landed
+    // at 19.717 instead of 19.6. The wall has to end up where the wall goes.
+    expect(measureAt(mesh, 0).outer).toBeCloseTo(19.6, 3);
+    // ...and nothing above the fade height may move at all.
+    expect(measureAt(mesh, 20).outer).toBeCloseTo(20, 6);
+  });
+
+  it("OPENS a hole at the bed instead of closing it", async () => {
+    const build = await buildDocument(doc([box(), bore()], true));
+    const mesh = build.parts[0].worldMesh;
+    const atBed = measureAt(mesh, 0);
+    const atTop = measureAt(mesh, 20);
+    // The squashed first layer narrows a bore, so the model must widen it.
+    // Contracting towards the centre did the opposite: 3.0 -> 2.8, which
+    // fights holeCompensationMm, the other half of the same feature.
+    expect(atBed.bore).toBeGreaterThan(atTop.bore);
+    expect(atBed.bore).toBeCloseTo(3.4, 2);
+    expect(atTop.bore).toBeCloseTo(3, 3);
+    // The outer wall still goes the other way, in the same build.
+    expect(atBed.outer).toBeLessThan(atTop.outer);
+  });
+
+  it("stays cheap on a large plate at the default fade height", async () => {
+    const plate = { ...box(), widthMm: 150, depthMm: 150, heightMm: 60 } as DesignLayer;
+    const plain = await buildDocument(doc([plate], false));
+    const compensated = await buildDocument(doc([plate], true));
+    // 2,050,608 triangles, 6.6s per rebuild, before the band split.
+    expect(compensated.parts[0].stats.triangleCount).toBeLessThanOrEqual(
+      plain.parts[0].stats.triangleCount * 4
+    );
+  });
+
+  it("survives the smallest fade height the panel offers", async () => {
+    const build = await buildDocument({
+      ...doc([{ ...box(), widthMm: 60, depthMm: 60, heightMm: 60 } as DesignLayer], true),
+      calibration: { ...calibration, elephantFootHeightMm: 0.1 },
+    });
+    // This aborted the WASM module for the rest of the session, and the throw
+    // escaped buildDocument entirely.
+    expect(build.status).toBe("ok");
+    expect(build.parts[0].stats.volumeMm3).toBeGreaterThan(0);
+  });
+});
+
+describe("clearance precedence", () => {
+  it("lets an explicit printability override beat the calibration", async () => {
+    const base = (clearanceMm: number | undefined, calibrated: boolean): DesignDocument =>
+      ({
+        schemaVersion: 3,
+        baseMode: "withBase",
+        layers: [
+          {
+            id: "base",
+            type: "base",
+            name: "בסיס",
+            visible: true,
+            locked: false,
+            materialSlotId: "slot1",
+            transform: identityTransform(),
+            previewOpacity: 1,
+            shape: "rectangle",
+            widthMm: 60,
+            heightMm: 40,
+            thicknessMm: 4,
+            cornerRadiusMm: 0,
+            rimEnabled: false,
+            rimWidthMm: 2.5,
+            rimHeightMm: 1.2,
+          },
+          {
+            id: "inlay",
+            type: "sketch",
+            name: "שיבוץ",
+            visible: true,
+            locked: false,
+            materialSlotId: "slot1",
+            transform: identityTransform(),
+            previewOpacity: 1,
+            entities: [{ kind: "circle", x: 0, y: 0, radiusMm: 10 }],
+            extrudeMm: 2,
+            combine: "inlay",
+            bevel: { enabled: false, sizeMm: 0.4, segments: 3 },
+          },
+        ],
+        materialSlots: [{ id: "slot1", nameHe: "חומר", colorHex: "#888888" }],
+        printerProfileId: "genericFdm220",
+        printabilityProfileId: "fdmPla",
+        customPrintability: clearanceMm === undefined ? null : { clearanceMm },
+        usageProfileId: null,
+        templateId: null,
+        calibration: calibrated
+          ? {
+              measuredClearanceMm: 0.2,
+              holeCompensationMm: 0,
+              elephantFootCompensationMm: 0,
+              elephantFootHeightMm: 0.6,
+            }
+          : undefined,
+      }) as DesignDocument;
+
+    const plateVolume = (result: Awaited<ReturnType<typeof buildDocument>>) =>
+      result.parts.find((p) => p.primaryLayerId === "base")!.stats.volumeMm3;
+
+    const typedOnly = await buildDocument(base(0.6, false));
+    const typedAndCalibrated = await buildDocument(base(0.6, true));
+    // The field stays editable in the analysis panel, so a calibration
+    // silently overriding it meant typing a number that did nothing.
+    expect(plateVolume(typedAndCalibrated)).toBeCloseTo(plateVolume(typedOnly), 3);
+
+    // With no override, the calibration is still what decides.
+    const calibratedOnly = await buildDocument(base(undefined, true));
+    expect(plateVolume(calibratedOnly)).not.toBeCloseTo(plateVolume(typedOnly), 1);
+  });
+});

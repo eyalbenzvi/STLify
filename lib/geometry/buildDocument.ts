@@ -189,15 +189,16 @@ export function effectiveCombineMode(
 
 /** Printing clearance used for inlay pockets, mm. */
 function inlayClearanceMm(document: DesignDocument): number {
-  // A calibrated machine overrides the profile's guess: the whole point of
-  // measuring is that the measurement wins.
+  // Precedence, most specific first. A calibrated machine beats the profile's
+  // guess — that is the whole point of measuring — but it must NOT beat a
+  // number the user typed into the printability panel: that field stays
+  // editable and kept accepting edits that did nothing.
+  const override = document.customPrintability?.clearanceMm;
+  if (override !== undefined) return override;
   if (document.calibration) {
     return clearanceForFit(document.calibration, "sliding");
   }
-  return (
-    document.customPrintability?.clearanceMm ??
-    getPrintabilityProfile(document.printabilityProfileId).clearanceMm
-  );
+  return getPrintabilityProfile(document.printabilityProfileId).clearanceMm;
 }
 
 function issueForLayerFailure(layer: DesignLayer, err: unknown): ModelIssue {
@@ -260,6 +261,177 @@ function worldBoundsOf(solid: Solid, worldMatrix: THREE.Matrix4): THREE.Box3 {
 }
 
 /**
+ * Move each near-vertical wall of the bottom slab inward, perpendicular to
+ * itself. Consumes `slab`; returns null when the result is not a valid solid.
+ *
+ * Contracting radially towards the part's centre — the obvious first
+ * implementation — is wrong in two ways that matter:
+ *
+ *  - **It closes holes.** A hole's wall lies on the far side of the centre
+ *    from itself, so pulling everything inward makes the bore SMALLER at the
+ *    bed. That is the exact opposite of the correction, and it fights
+ *    `holeCompensationMm`, the other half of the same feature. Offsetting
+ *    along each wall's own outward normal instead widens a bore and narrows
+ *    an outer wall, which is what the squashed first layer actually does.
+ *  - **It rounds corners.** A radial pull moves a corner by the compensation
+ *    along the diagonal, so each face lands short: 0.283 mm per axis for a
+ *    0.4 mm setting on a box. A corner vertex has to satisfy BOTH of its
+ *    walls' offset planes at once — a miter — which is a 2x2 solve.
+ *
+ * Only walls take part: a vertex whose faces are all horizontal (the bed
+ * face, the cut plane) has no in-plane direction to move along and stays put,
+ * which is what keeps the part flat on the plate and keeps the cut plane
+ * matching the untouched top half.
+ */
+function insetSlabWalls(
+  kernel: GeometryKernel,
+  slab: Solid,
+  calibration: NonNullable<DesignDocument["calibration"]>,
+  toWorld: THREE.Matrix4,
+  toLocal: THREE.Matrix4
+): Solid | null {
+  const mesh = slab.toMeshData();
+  slab.dispose();
+  const vertexCount = mesh.positions.length / 3;
+  const triangleCount = mesh.indices.length / 3;
+
+  // World-space copy: the bed is a world plane, and so is the offset.
+  const world = new Float64Array(mesh.positions.length);
+  const point = new THREE.Vector3();
+  for (let v = 0; v < vertexCount; v++) {
+    point
+      .set(mesh.positions[v * 3], mesh.positions[v * 3 + 1], mesh.positions[v * 3 + 2])
+      .applyMatrix4(toWorld);
+    world[v * 3] = point.x;
+    world[v * 3 + 1] = point.y;
+    world[v * 3 + 2] = point.z;
+  }
+
+  // Distinct wall directions per vertex. Distinct matters: a cylinder's
+  // vertex has two nearly-parallel facets and must not be mitered between
+  // them, while a box corner has two genuinely different walls and must.
+  const walls: number[][] = Array.from({ length: vertexCount }, () => []);
+  for (let t = 0; t < triangleCount; t++) {
+    const a = mesh.indices[t * 3] * 3;
+    const b = mesh.indices[t * 3 + 1] * 3;
+    const c = mesh.indices[t * 3 + 2] * 3;
+    const ux = world[b] - world[a];
+    const uy = world[b + 1] - world[a + 1];
+    const uz = world[b + 2] - world[a + 2];
+    const vx = world[c] - world[a];
+    const vy = world[c + 1] - world[a + 1];
+    const vz = world[c + 2] - world[a + 2];
+    const nz = ux * vy - uy * vx;
+    const nx = uy * vz - uz * vy;
+    const ny = uz * vx - ux * vz;
+    const horizontal = Math.hypot(nx, ny);
+    const length = Math.hypot(nx, ny, nz);
+    if (length < 1e-12) continue;
+    // Near-horizontal faces have no in-plane direction to offset along.
+    if (horizontal / length < 0.05) continue;
+    const dx = nx / horizontal;
+    const dy = ny / horizontal;
+    for (let k = 0; k < 3; k++) {
+      const list = walls[mesh.indices[t * 3 + k]];
+      let known = false;
+      for (let i = 0; i < list.length; i += 2) {
+        if (list[i] * dx + list[i + 1] * dy > 0.999) {
+          known = true;
+          break;
+        }
+      }
+      if (!known) list.push(dx, dy);
+    }
+  }
+
+  let moved = false;
+  for (let v = 0; v < vertexCount; v++) {
+    const inset = elephantFootInsetAtHeight(calibration, world[v * 3 + 2]);
+    if (inset <= 0) continue;
+    const list = walls[v];
+    if (list.length === 0) continue;
+
+    const px = world[v * 3];
+    const py = world[v * 3 + 1];
+    let targetX: number;
+    let targetY: number;
+
+    if (list.length === 2) {
+      targetX = px - list[0] * inset;
+      targetY = py - list[1] * inset;
+    } else {
+      // The two most divergent walls define the corner; a third would be
+      // over-determined, and the sharpest pair is the one that decides where
+      // the corner actually lands.
+      let bestI = 0;
+      let bestJ = 2;
+      let bestDot = Infinity;
+      for (let i = 0; i < list.length; i += 2) {
+        for (let j = i + 2; j < list.length; j += 2) {
+          const dot = list[i] * list[j] + list[i + 1] * list[j + 1];
+          if (dot < bestDot) {
+            bestDot = dot;
+            bestI = i;
+            bestJ = j;
+          }
+        }
+      }
+      const n1x = list[bestI];
+      const n1y = list[bestI + 1];
+      const n2x = list[bestJ];
+      const n2y = list[bestJ + 1];
+      const det = n1x * n2y - n1y * n2x;
+      if (Math.abs(det) < 0.02) {
+        // Effectively one wall (or a fold sharper than the miter can express).
+        targetX = px - n1x * inset;
+        targetY = py - n1y * inset;
+      } else {
+        const d1 = n1x * px + n1y * py - inset;
+        const d2 = n2x * px + n2y * py - inset;
+        targetX = (d1 * n2y - d2 * n1y) / det;
+        targetY = (n1x * d2 - n2x * d1) / det;
+      }
+    }
+
+    // A very sharp corner sends the miter off to infinity; clamping keeps a
+    // spike from turning the slab inside out.
+    const limit = inset * 4;
+    const dx = targetX - px;
+    const dy = targetY - py;
+    const distance = Math.hypot(dx, dy);
+    if (distance > limit && distance > 1e-12) {
+      targetX = px + (dx / distance) * limit;
+      targetY = py + (dy / distance) * limit;
+    }
+    world[v * 3] = targetX;
+    world[v * 3 + 1] = targetY;
+    moved = true;
+  }
+
+  if (!moved) {
+    const { solid: unchanged, status } = kernel.fromMeshData(mesh);
+    if (status !== "NoError") {
+      unchanged.dispose();
+      return null;
+    }
+    return unchanged;
+  }
+
+  for (let v = 0; v < vertexCount; v++) {
+    point.set(world[v * 3], world[v * 3 + 1], world[v * 3 + 2]).applyMatrix4(toLocal);
+    mesh.positions[v * 3] = point.x;
+    mesh.positions[v * 3 + 1] = point.y;
+    mesh.positions[v * 3 + 2] = point.z;
+  }
+  const { solid: inset, status } = kernel.fromMeshData(mesh);
+  if (status !== "NoError" || inset.isEmpty()) {
+    inset.dispose();
+    return null;
+  }
+  return inset;
+}
+
+/**
  * Shrink the first layers of a part inward.
  *
  * "Elephant foot" is the bulge left when the nozzle squashes the opening
@@ -308,23 +480,6 @@ function applyElephantFoot(
   const centreY = (worldBounds.min.y + worldBounds.max.y) / 2;
   const toWorld = worldMatrix;
   const toLocal = worldMatrix.clone().invert();
-  const point = new THREE.Vector3();
-
-  const insetInWorld = (p: { x: number; y: number; z: number }) => {
-    point.set(p.x, p.y, p.z).applyMatrix4(toWorld);
-    const inset = elephantFootInsetAtHeight(calibration, point.z);
-    if (inset > 0) {
-      const dx = point.x - centreX;
-      const dy = point.y - centreY;
-      const distance = Math.hypot(dx, dy);
-      if (distance >= 1e-6) {
-        const scale = Math.max(0, (distance - inset) / distance);
-        point.set(centreX + dx * scale, centreY + dy * scale, point.z);
-      }
-    }
-    point.applyMatrix4(toLocal);
-    return { x: point.x, y: point.y, z: point.z };
-  };
 
   // Work on a duplicate so a mid-way kernel failure cannot leave the caller
   // holding a consumed handle — `refine`/`warp`/`split` all consume.
@@ -349,8 +504,12 @@ function applyElephantFoot(
       top.dispose();
       return { solid, failed: false };
     }
-    const warped = bottom.warp(insetInWorld);
+    const warped = insetSlabWalls(kernel, bottom, calibration, toWorld, toLocal);
     bottom = null;
+    if (!warped) {
+      top.dispose();
+      return { solid, failed: true };
+    }
     const merged = top.isEmpty() ? (top.dispose(), warped) : warped.union(top);
     top = null;
     if (merged.status() !== "NoError" || merged.isEmpty()) {

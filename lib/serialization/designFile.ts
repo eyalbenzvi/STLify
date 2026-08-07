@@ -660,7 +660,12 @@ function sanitizeCustomPrinters(value: unknown): PrinterProfile[] | undefined {
         y: Math.max(1, Math.min(finiteNumber(volume.y, 220), 5000)),
         z: Math.max(1, Math.min(finiteNumber(volume.z, 250), 5000)),
       },
-      nozzleDiameterMm: Math.max(0.05, Math.min(finiteNumber(raw.nozzleDiameterMm, 0.4), 5)),
+      // A resin printer has no nozzle, and clamping null to 0.4 made the
+      // lattice check warn about extrusion width on an SLA machine.
+      nozzleDiameterMm:
+        raw.technology === "sla" && raw.nozzleDiameterMm == null
+          ? null
+          : Math.max(0.05, Math.min(finiteNumber(raw.nozzleDiameterMm, 0.4), 5)),
       defaultLayerHeightMm: Math.max(
         0.01,
         Math.min(finiteNumber(raw.defaultLayerHeightMm, 0.2), 2)

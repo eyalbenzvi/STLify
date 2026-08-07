@@ -74,7 +74,11 @@ the plan they were executed against.
   threads — instead of each guessing separately.
 - **Hole compensation and elephant-foot compensation**: a printed hole comes
   out undersized and a first layer squashes outward; both are corrected in
-  the model so the printed part measures what was designed.
+  the model so the printed part measures what was designed. The first-layer
+  correction moves each wall perpendicular to itself, so a bore OPENS by the
+  compensation while the outer wall closes by it, and a corner lands where
+  both of its faces say it should. Only the band below the fade height is
+  touched, which is what keeps a rebuild cheap.
 - **Support generation**: conical pillars under overhangs, wide at the base
   and narrow at the tip so they snap off.
 - **Bridging analysis**: unsupported horizontal spans are found and reported
@@ -85,10 +89,11 @@ the plan they were executed against.
 - **Per-face material painting**: paint regions of a body with a material
   slot. The paint is metadata — the body stays one editable object — and at
   export each painted region is separated into its own watertight part, so a
-  two-colour print is actually producible. The pieces reassemble exactly into
-  the original: nothing is lost or double-counted. The paint depth is bounded
-  by the body's own thinnest dimension — a deeper region would turn the
-  offset copy inside out — and the user is told when that bound applies.
+  two-colour print is actually producible in ZIP or 3MF (a single STL carries
+  no materials, and the export dialog says so before you download one). Every
+  split is checked against the invariant it exists to serve: each piece must
+  have positive volume and the pieces must add back up to the body. A split
+  that fails is refused with a reason rather than shipped.
 - **Lattice vs nozzle check**: struts thinner than two nozzle widths raise a
   warning naming the minimum the selected printer can actually resolve. It is
   a warning rather than a refusal because a slicer set to a smaller extrusion

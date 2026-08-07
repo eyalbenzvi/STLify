@@ -290,6 +290,26 @@ describe("hostile input to the wave C fields", () => {
       .toBeGreaterThan(100);
   });
 
+  it("keeps a resin printer nozzle-less across a round trip", () => {
+    // Clamping null to 0.4 made the new lattice check warn about extrusion
+    // width on a machine that does not extrude.
+    const { document } = importDesignFile(
+      fileWith({
+        customPrinters: [
+          {
+            id: "myResin",
+            nameHe: "שרף",
+            technology: "sla",
+            buildVolumeMm: { x: 143, y: 90, z: 175 },
+            nozzleDiameterMm: null,
+          },
+        ],
+      })
+    );
+    expect(document.customPrinters?.[0].technology).toBe("sla");
+    expect(document.customPrinters?.[0].nozzleDiameterMm).toBeNull();
+  });
+
   it("merges paint entries that claim the same material slot", () => {
     const { document } = importDesignFile(
       fileWith({

@@ -68,3 +68,31 @@ plan, recorded rather than quietly dropped:
 Verification at the end of Wave C: 403 unit tests, 16 Playwright journeys,
 `eslint` clean (9 pre-existing hook-dependency warnings), `tsc --noEmit`
 clean, `next build` clean.
+
+## External review
+
+Two independent reviewers — a senior code auditor and a QA engineer — went
+over the three waves after they were committed. Between them they confirmed
+two shipping blockers and around twenty smaller defects; all are fixed, and
+each fix is pinned by a test that measures the thing that was wrong.
+
+The two blockers were the same species: a pure function that was right, and
+the place where it met the document that was wrong and untested.
+
+- **Elephant foot** refined the whole part (12 -> 65,292 triangles on a cube,
+  2 million on a 150mm plate, 6.6s per debounced rebuild) and, at the panel's
+  own minimum fade height, aborted the WASM module for the rest of the
+  session with no error shown and no recovery. It also contracted vertices
+  radially towards the part centre, which CLOSED holes at the bed — the exact
+  opposite of the correction, fighting the hole compensation shipped beside
+  it.
+- **Paint depth** greater than the wall it was painted on inverted the offset
+  shell. The kernel reports negative-volume solids as `NoError`, so a
+  1mm-walled tube of 2,446mm3 exported as 7,102mm3 of parts.
+
+The lesson recorded for next time: three of the four worst defects were in
+code that had passing tests. The tests asserted direction ("volume went
+down") where they should have asserted magnitude and sign, and none of them
+crossed a module boundary. Two features — the lattice nozzle check and the
+thread fit classes — were fully tested and completely unreachable from the
+UI.

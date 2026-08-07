@@ -32,6 +32,9 @@ export function CalibrationPanel({
 }: CalibrationPanelProps) {
   const value = calibration ?? DEFAULT_CALIBRATION;
   const set = (patch: Partial<CalibrationSettings>) => onChange({ ...value, ...patch });
+  // An uncalibrated document must not look calibrated. Showing the defaults
+  // and their derived fits made the panel display numbers the build ignores.
+  const active = calibration !== undefined;
 
   return (
     <div className="flex flex-col gap-3">
@@ -41,6 +44,21 @@ export function CalibrationPanel({
         ייגזרו ממנו אוטומטית.
       </p>
 
+      {!active && (
+        <div className="rounded-md border border-slate-200 bg-slate-50 p-2">
+          <p className="mb-2 text-[11px] leading-snug text-slate-500">
+            העיצוב הזה אינו מכויל. כרגע כל מרווח נלקח מפרופיל ההדפסה.
+          </p>
+          <button
+            type="button"
+            className="rounded-md border border-blue-500 bg-blue-600 px-2 py-1 text-xs text-white hover:bg-blue-700"
+            onClick={() => onChange(DEFAULT_CALIBRATION)}
+          >
+            הפעל כיול לעיצוב הזה
+          </button>
+        </div>
+      )}
+
       <button
         type="button"
         className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs text-slate-600 hover:bg-slate-50"
@@ -49,6 +67,8 @@ export function CalibrationPanel({
         צור מבחן סבולות להדפסה
       </button>
 
+      {active && (
+        <>
       <NumberField
         label="מרווח נמדד"
         value={value.measuredClearanceMm}
@@ -105,8 +125,11 @@ export function CalibrationPanel({
       )}
       <p className="text-[11px] leading-snug text-slate-400">
         השכבות הראשונות נמעכות אל המשטח ומרחיבות את בסיס החלק. הפיצוי מכווץ
-        אותן פנימה כדי שהחלק יישב ישר.
+        אותן פנימה כדי שהחלק יישב ישר. הדפנות נסוגות בניצב לעצמן, וחורים
+        <b> נפתחים</b> באותה מידה — כך שהברגים עדיין נכנסים.
       </p>
+        </>
+      )}
     </div>
   );
 }

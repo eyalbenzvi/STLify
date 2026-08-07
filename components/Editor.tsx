@@ -930,7 +930,11 @@ function EditorInner() {
               floorMm: num("floorMm", 2),
               cornerRadiusMm: num("cornerRadiusMm", 3),
               lipHeightMm: num("lipHeightMm", 4),
-              clearanceMm: num("clearanceMm", 0.2),
+              // The calibration panel promises enclosures derive from the
+              // measured value; until now they took the dialog's guess.
+              clearanceMm: doc.calibration
+                ? clearanceForFit(doc.calibration, "sliding")
+                : num("clearanceMm", 0.2),
             });
             layers.push(generatorToLayer(box, "מארז — קופסה", slot, "גוף המארז"));
             const lidLayer = generatorToLayer(lid, "מארז — מכסה", slot, "מכסה המארז");
@@ -1284,48 +1288,73 @@ function EditorInner() {
     [doc, applyDocument]
   );
 
+  /**
+   * Supports for every part on the plate, or just the selected ones.
+   *
+   * Taking `parts[0]` and calling it done left the other four parts of a
+   * plate unsupported with nothing said about them — the report read as a
+   * verdict on the whole print.
+   */
   const handleGenerateSupports = useCallback(() => {
-    const part = selectedParts[0] ?? build.parts[0];
-    if (!part) return;
+    const targets = selectedParts.length > 0 ? selectedParts : build.parts;
+    if (targets.length === 0) return;
     void runOp("יצירת תמיכות", async () => {
       const kernel = await getGeometryKernel();
       const profile = getPrintabilityProfile(doc.printabilityProfileId);
       const maxOverhangDeg =
         doc.customPrintability?.maxOverhangDeg ?? profile.maxOverhangDeg;
-      const { solid, result } = buildSupports(kernel, part.worldMesh, {
-        ...DEFAULT_SUPPORT_SETTINGS,
-        maxOverhangDeg,
-      });
-      if (!solid) {
-        setMessage({ titleHe: "תמיכות", bodyHe: result.summaryHe, kind: "info" });
+
+      const layers: DesignLayer[] = [];
+      const lines: string[] = [];
+      for (const part of targets) {
+        const { solid, result } = buildSupports(kernel, part.worldMesh, {
+          ...DEFAULT_SUPPORT_SETTINGS,
+          maxOverhangDeg,
+        });
+        lines.push(`${part.nameHe}: ${result.summaryHe}`);
+        if (!solid) continue;
+        layers.push(
+          generatorToLayer(
+            solid,
+            `${part.nameHe} — תמיכות`,
+            doc.materialSlots[0]?.id ?? "slot1",
+            result.summaryHe
+          )
+        );
+      }
+      if (layers.length === 0) {
+        setMessage({ titleHe: "תמיכות", bodyHe: lines.join("\n"), kind: "info" });
         return;
       }
-      const layer = generatorToLayer(
-        solid,
-        `${part.nameHe} — תמיכות`,
-        doc.materialSlots[0]?.id ?? "slot1",
-        result.summaryHe
-      );
-      applyDocument({ ...doc, layers: [...doc.layers, layer] }, "יצירת תמיכות");
-      dispatch({ type: "ui/select", selection: [layer.id] });
-      setMessage({ titleHe: "תמיכות נוצרו", bodyHe: result.summaryHe, kind: "success" });
+      applyDocument({ ...doc, layers: [...doc.layers, ...layers] }, "יצירת תמיכות");
+      dispatch({ type: "ui/select", selection: layers.map((l) => l.id) });
+      setMessage({ titleHe: "תמיכות נוצרו", bodyHe: lines.join("\n"), kind: "success" });
     });
   }, [selectedParts, build.parts, doc, runOp, applyDocument, dispatch]);
 
   const handleCheckBridging = useCallback(() => {
-    const part = selectedParts[0] ?? build.parts[0];
-    if (!part) return;
+    const targets = selectedParts.length > 0 ? selectedParts : build.parts;
+    if (targets.length === 0) return;
     void runOp("בדיקת גישורים", async () => {
-      const report = analyzeBridging(part.worldMesh);
+      // Every part, named. A verdict computed from one body out of five read
+      // as a verdict on the print.
+      const reports = targets.map((part) => ({
+        part,
+        report: analyzeBridging(part.worldMesh),
+      }));
+      const worst = reports.reduce((a, b) =>
+        b.report.longestMm > a.report.longestMm ? b : a
+      );
+      const lines = reports.map((r) => `${r.part.nameHe}: ${r.report.summaryHe}`);
       setMessage({
         titleHe: "בדיקת גישורים",
         bodyHe:
-          report.spans.length === 0
-            ? report.summaryHe
-            : `${report.summaryHe}\n\nגישור נדרש כאשר יש חומר ללא תמיכה מתחתיו. עד 5 מ״מ המדפסת מגשרת ללא בעיה; מעל 20 מ״מ סביר שהחוט יישבר.`,
-        kind: report.longestMm > 20 ? "error" : "info",
+          worst.report.spans.length === 0
+            ? lines.join("\n")
+            : `${lines.join("\n")}\n\nגישור נדרש כאשר יש חומר ללא תמיכה מתחתיו. עד 5 מ״מ המדפסת מגשרת ללא בעיה; מעל 20 מ״מ סביר שהחוט יישבר.`,
+        kind: worst.report.longestMm > 20 ? "error" : "info",
       });
-      if (report.spans[0]) setFocusTarget({ ...report.spans[0].center });
+      if (worst.report.spans[0]) setFocusTarget({ ...worst.report.spans[0].center });
     });
   }, [selectedParts, build.parts, runOp]);
 
