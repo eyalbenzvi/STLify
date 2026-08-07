@@ -35,9 +35,8 @@ import { getPrintabilityProfile, getPrinterProfile, MATERIAL_PROFILES, USAGE_PRO
 import { useDocumentBuilder, type BuiltPart } from "@/hooks/useDocumentBuilder";
 import { createTemplateDocument, makeBaseLayer, makeHoleLayer, makeTextLayer, PRODUCT_TEMPLATES } from "@/lib/geometry/documentTemplates";
 import { getGeometryKernel } from "@/lib/geometry/kernel";
-import { meshDataBounds, transformMeshData } from "@/lib/geometry/meshData";
+import { meshDataBounds } from "@/lib/geometry/meshData";
 import { getMesh, storeMesh } from "@/lib/geometry/meshStore";
-import { matrix4ToTransform, transformToMatrix4 } from "@/lib/geometry/transform";
 import { performBoolean } from "@/lib/geometry/operations/booleans";
 import { performPlaneCut, splitDisconnectedParts } from "@/lib/geometry/operations/cut";
 import { addConnectors } from "@/lib/geometry/operations/connectors";
@@ -57,7 +56,12 @@ import {
   snapToObjectCenter,
   snapToObjectEdge,
 } from "@/lib/geometry/operations/placement";
+import type { OrientationCandidate } from "@/lib/geometry/analysis";
+import type { DetailedEstimateResult } from "@/lib/geometry/analysis/estimateDetailed";
 import { attemptMeshRepair } from "@/lib/geometry/repair/repair";
+import { StlImportError } from "@/lib/import/stl";
+import { SvgImportError } from "@/lib/import/svg";
+import { IMAGE_INPUT_ACCEPT, ImageImportError } from "@/lib/import/image";
 import type {
   MeshDiagnosis,
   MeshRepairReport,
@@ -75,6 +79,8 @@ import {
   type RevolveSettings,
 } from "@/lib/geometry/operations/advancedOps";
 import { useGeometryJobs } from "@/hooks/useGeometryJobs";
+import { useImportHandlers } from "@/hooks/useImportHandlers";
+import { useAnalysisRunner } from "@/hooks/useAnalysisRunner";
 import { JobProgressOverlay } from "@/components/editor/JobProgressOverlay";
 import type { FilletSettings, ShellSettings } from "@/lib/geometry/operations/fillet";
 import type { LatticeSettings } from "@/lib/geometry/operations/lattice";
@@ -93,36 +99,11 @@ import {
   buildToleranceTest,
   GeneratorError,
 } from "@/lib/geometry/generators";
-import {
-  analyzeBuildVolume,
-  analyzeContact,
-  analyzeFloatingParts,
-  analyzeOverhangs,
-  analyzeThickness,
-  overhangToVertexColors,
-  suggestOrientations,
-  thicknessToVertexColors,
-  type OrientationCandidate,
-} from "@/lib/geometry/analysis";
-import { estimateDetailed, type DetailedEstimateResult } from "@/lib/geometry/analysis/estimateDetailed";
-import { parseStl, StlImportError, summarizeStlMesh } from "@/lib/import/stl";
-import { parseSvgToContours, SvgImportError } from "@/lib/import/svg";
-import { sanitizeSvg } from "@/lib/import/svgSanitize";
-import {
-  decodeImageToGrid,
-  gridToSilhouetteContours,
-  heightFieldToClosedMesh,
-  IMAGE_INPUT_ACCEPT,
-  ImageImportError,
-  smoothGrid,
-  stripImageExtension,
-  validateImageFile,
-} from "@/lib/import/image";
 import { downloadBlob } from "@/lib/export/stl";
 import { meshDataToBinaryStl } from "@/lib/export/stlData";
 import { buildMultiPartZip } from "@/lib/export/package";
 import { buildThreeMf } from "@/lib/export/threeMF";
-import { DESIGN_FILE_EXTENSION, DesignFileError, importDesignFile, serializeDesignFile } from "@/lib/serialization/designFile";
+import { DESIGN_FILE_EXTENSION, DesignFileError, serializeDesignFile } from "@/lib/serialization/designFile";
 import { decodeShareHash, encodeShareHash, SHARE_HASH_PREFIX, shareLinkEligibility } from "@/lib/serialization/shareLink";
 import type { ModelIssue } from "@/types/design";
 import { Section } from "@/components/ui/Section";
@@ -149,9 +130,7 @@ import {
   ImageImportDialog,
   StlImportDialog,
   SvgImportDialog,
-  type ImageImportOptionsValue,
   type StlImportPreview,
-  type SvgImportOptionsValue,
 } from "@/components/dialogs/ImportDialogs";
 import { ExportDialog, type ExportKind } from "@/components/dialogs/ExportDialog";
 import { CreatePanel, type GeneratorKind } from "@/components/editor/CreatePanel";
@@ -231,10 +210,6 @@ export function Editor() {
 }
 
 /** Read a File as ArrayBuffer. */
-function readFileBuffer(file: File): Promise<ArrayBuffer> {
-  return file.arrayBuffer();
-}
-
 function EditorInner() {
   const { state, dispatch, document: doc, selection, selectedLayers, canUndo, canRedo } =
     useEditor();
@@ -1565,409 +1540,49 @@ function EditorInner() {
 
   // ---- analysis ------------------------------------------------------------
 
-  const runAnalysis = useCallback(() => {
-    if (build.parts.length === 0) return;
-    setAnalysisBusy(true);
-    // Yield to paint the busy state before the synchronous analysis work.
-    setTimeout(async () => {
-      try {
-        const kernel = await getGeometryKernel();
-        const profile = getPrintabilityProfile(doc.printabilityProfileId);
-        const custom = doc.customPrintability;
-        const minWall = custom?.minWallMm ?? profile.minWallMm;
-        const minFeature = custom?.minFeatureMm ?? profile.minFeatureMm;
-        const maxOverhang = custom?.maxOverhangDeg ?? profile.maxOverhangDeg;
-
-        const issues: ModelIssue[] = [];
-        const colors = new Map<string, Float32Array>();
-        let totalVolume = 0;
-        let maxHeight = 0;
-
-        for (const part of build.parts) {
-          const mesh = part.worldMesh;
-          totalVolume += part.stats.volumeMm3;
-          maxHeight = Math.max(maxHeight, part.stats.bounds.max.z);
-
-          const overhang = analyzeOverhangs(mesh, maxOverhang);
-          const contact = analyzeContact(mesh);
-          const floating = analyzeFloatingParts(mesh);
-          const volume = analyzeBuildVolume(part.stats.bounds, printer);
-
-          const { solid, status } = kernel.fromMeshData(mesh);
-          let thicknessIssues: ModelIssue[] = [];
-          if (status === "NoError") {
-            const thickness = analyzeThickness(solid, mesh, {
-              minWallMm: minWall,
-              minFeatureMm: minFeature,
-            });
-            thicknessIssues = thickness.issues;
-            colors.set(
-              part.primaryLayerId,
-              state.ui.overlay === "overhang"
-                ? overhangToVertexColors(mesh, overhang.triangleFlags)
-                : thicknessToVertexColors(mesh, thickness, minWall)
-            );
-          }
-          solid.dispose();
-
-          const prefix = build.parts.length > 1 ? `${part.nameHe}: ` : "";
-          for (const issue of [
-            ...overhang.issues,
-            ...contact.issues,
-            ...floating.issues,
-            ...volume.issues,
-            ...thicknessIssues,
-          ]) {
-            issues.push({ ...issue, titleHe: `${prefix}${issue.titleHe}` });
-          }
-        }
-
-        setModelIssues(issues);
-        setOverlayColors(colors);
-
-        const usage = USAGE_PROFILES.find((u) => u.id === doc.usageProfileId);
-        const material =
-          MATERIAL_PROFILES.find((m) => m.id === usage?.suggestedMaterialId) ??
-          MATERIAL_PROFILES[0];
-        const layerHeight = custom?.layerHeightMm ?? profile.layerHeightMm;
-        let bounds = { x: 0, y: 0, z: maxHeight };
-        for (const part of build.parts) {
-          bounds = {
-            x: Math.max(bounds.x, part.stats.dimensionsMm.x),
-            y: Math.max(bounds.y, part.stats.dimensionsMm.y),
-            z: bounds.z,
-          };
-        }
-        setEstimate(
-          estimateDetailed({
-            modelVolumeMm3: totalVolume,
-            boundsMm: bounds,
-            technology: profile.technology,
-            layerHeightMm: layerHeight,
-            nozzleDiameterMm: custom?.nozzleDiameterMm ?? profile.nozzleDiameterMm,
-            infillPercent: usage?.suggestedInfillPct ?? 20,
-            densityGCm3: material.densityGCm3,
-            pricePerKgIls: material.pricePerKgIls,
-          })
-        );
-      } catch (err) {
-        showError(err, "ניתוח המודל נכשל");
-      } finally {
-        setAnalysisBusy(false);
-      }
-    }, 30);
-  }, [build.parts, doc, printer, state.ui.overlay, showError]);
-
-  // Invalidate analysis results when the geometry changes (state adjustment
-  // derived from the build id, done during render — no effect cascade).
-  const [lastBuildId, setLastBuildId] = useState(0);
-  if (build.buildId !== lastBuildId) {
-    setLastBuildId(build.buildId);
-    setModelIssues([]);
-    setOverlayColors(new Map());
-    setEstimate(null);
-  }
-
-  const handleSuggestOrientation = useCallback(() => {
-    const part = selectedParts[0] ?? build.parts[0];
-    if (!part) return;
-    setAnalysisBusy(true);
-    setTimeout(() => {
-      try {
-        const profile = getPrintabilityProfile(doc.printabilityProfileId);
-        const maxOverhang = doc.customPrintability?.maxOverhangDeg ?? profile.maxOverhangDeg;
-        setOrientationCandidates(suggestOrientations(part.worldMesh, maxOverhang));
-      } catch (err) {
-        showError(err, "הצעת תנוחה נכשלה");
-      } finally {
-        setAnalysisBusy(false);
-      }
-    }, 30);
-  }, [selectedParts, build.parts, doc, showError]);
-
-  const handleApplyOrientation = useCallback(
-    (candidate: OrientationCandidate) => {
-      setOrientationCandidates(null);
-      const part = selectedParts[0] ?? build.parts[0];
-      if (!part) return;
-      const layer = doc.layers.find((l) => l.id === part.primaryLayerId);
-      if (!layer || layer.locked) return;
-      const rotation = new THREE.Matrix4().makeRotationFromEuler(
-        new THREE.Euler(
-          (candidate.rotation.xDeg * Math.PI) / 180,
-          (candidate.rotation.yDeg * Math.PI) / 180,
-          (candidate.rotation.zDeg * Math.PI) / 180,
-          "XYZ"
-        )
-      );
-      const current = transformToMatrix4(layer.transform);
-      const next = matrix4ToTransform(rotation.multiply(current));
-      // Drop the rotated body onto the plate.
-      const rotated = transformMeshData(part.localMesh, transformToMatrix4(next));
-      const bounds = meshDataBounds(rotated);
-      next.z -= bounds.min.z;
-      commitTransform(layer.id, next);
-    },
-    [selectedParts, build.parts, doc.layers, commitTransform]
-  );
+  // Extracted to hooks/useAnalysisRunner.ts.
+  const { runAnalysis, handleSuggestOrientation, handleApplyOrientation } =
+    useAnalysisRunner({
+      doc,
+      build,
+      printer,
+      overlay: state.ui.overlay,
+      selectedParts,
+      showError,
+      commitTransform,
+      setAnalysisBusy,
+      setModelIssues,
+      setOverlayColors,
+      setEstimate,
+      setOrientationCandidates,
+    });
 
   // ---- imports --------------------------------------------------------------
 
-  const handleStlFile = useCallback(
-    async (file: File) => {
-      await runOp("ייבוא STL", async () => {
-        const buffer = await readFileBuffer(file);
-        const parsed = parseStl(buffer);
-        // Rebase: centre XY, rest on Z=0.
-        const bounds = meshDataBounds(parsed.mesh);
-        const cx = (bounds.min.x + bounds.max.x) / 2;
-        const cy = (bounds.min.y + bounds.max.y) / 2;
-        const rebased = transformMeshData(
-          parsed.mesh,
-          new THREE.Matrix4().makeTranslation(-cx, -cy, -bounds.min.z)
-        );
-        const kernel = await getGeometryKernel();
-        const { solid, status } = kernel.fromMeshData(rebased);
-        solid.dispose();
-        let manifold = status === "NoError";
-        let repairMessageHe: string | null = null;
-        let finalMesh = rebased;
-        if (!manifold) {
-          const repair = await attemptMeshRepair(rebased);
-          if (repair.succeeded && repair.mesh) {
-            finalMesh = repair.mesh;
-            manifold = true;
-            repairMessageHe = repair.messageHe;
-          } else {
-            repairMessageHe = repair.messageHe;
-          }
-        }
-        const meshId = storeMesh(finalMesh);
-        pendingStlRef.current = { meshId, fileName: file.name };
-        setStlPreview({
-          fileName: file.name,
-          summary: summarizeStlMesh(finalMesh),
-          manifold,
-          repairMessageHe,
-        });
-      });
-    },
-    [runOp]
-  );
+  // Extracted to hooks/useImportHandlers.ts: STL, SVG, image and design-file
+  // loading is a self-contained domain, and Editor.tsx had grown past 2,800
+  // lines holding every concern at once.
+  const {
+    handleStlFile,
+    confirmStlImport,
+    handleSvgConfirm,
+    handleImageFile,
+    handleImageConfirm,
+    handleDesignFile,
+  } = useImportHandlers({
+    doc,
+    dispatch,
+    runOp,
+    applyDocument,
+    setMessage,
+    setStlPreview,
+    pendingStlRef,
+    svgPending,
+    setSvgPending,
+    imagePending,
+    setImagePending,
+  });
 
-  const confirmStlImport = useCallback(() => {
-    const pending = pendingStlRef.current;
-    setStlPreview(null);
-    pendingStlRef.current = null;
-    if (!pending) return;
-    const layer: ImportedMeshLayer = {
-      id: newId("layer"),
-      type: "importedMesh",
-      name: pending.fileName.replace(/\.stl$/i, ""),
-      visible: true,
-      locked: false,
-      materialSlotId: doc.materialSlots[0]?.id ?? "slot1",
-      transform: {
-        x: 0, y: 0, z: 0,
-        rotationX: 0, rotationY: 0, rotationZ: 0,
-        scaleX: 1, scaleY: 1, scaleZ: 1,
-      },
-      previewOpacity: 1,
-      meshId: pending.meshId,
-      provenance: { kind: "stlImport", fileName: pending.fileName },
-      originalMeshId: pending.meshId,
-      combine: "standalone",
-    };
-    applyDocument({ ...doc, layers: [...doc.layers, layer] }, "ייבוא STL");
-    dispatch({ type: "ui/select", selection: [layer.id] });
-  }, [doc, applyDocument, dispatch]);
-
-  const handleSvgConfirm = useCallback(
-    (options: SvgImportOptionsValue) => {
-      const pending = svgPending;
-      setSvgPending(null);
-      if (!pending) return;
-      void runOp("ייבוא SVG", async () => {
-        // Security first: strip scripts/external refs, collect Hebrew warnings.
-        const sanitized = sanitizeSvg(pending.text);
-        if (!sanitized.ok) {
-          throw new SvgImportError(sanitized.error ?? "קובץ ה-SVG אינו תקין");
-        }
-        const result = parseSvgToContours(sanitized.svgText, {
-          targetWidthMm: options.targetWidthMm,
-        });
-        result.warningsHe.push(...sanitized.warnings);
-        const layer: DesignLayer = {
-          id: newId("layer"),
-          type: "svg",
-          name: pending.fileName.replace(/\.svg$/i, ""),
-          visible: true,
-          locked: false,
-          materialSlotId: doc.materialSlots[0]?.id ?? "slot1",
-          transform: {
-            x: 0, y: 0, z: 0,
-            rotationX: 0, rotationY: 0, rotationZ: 0,
-            scaleX: 1, scaleY: 1, scaleZ: 1,
-          },
-          previewOpacity: 1,
-          sourceName: pending.fileName,
-          contours: result.contours,
-          extrudeMm: options.extrudeMm,
-          combine: doc.baseMode === "withBase" ? "raised" : "standalone",
-          bevel: { enabled: false, sizeMm: 0.6, segments: 4 },
-        };
-        applyDocument({ ...doc, layers: [...doc.layers, layer] }, "ייבוא SVG");
-        dispatch({ type: "ui/select", selection: [layer.id] });
-        if (result.warningsHe.length > 0) {
-          setMessage({
-            titleHe: "ייבוא SVG — הערות",
-            bodyHe: result.warningsHe.join("\n"),
-            kind: "info",
-          });
-        }
-      });
-    },
-    [svgPending, doc, applyDocument, dispatch, runOp]
-  );
-
-  /**
-   * The image input accepts `image/*` so mobile pickers expose every source
-   * on the device, which means an unsuitable file can reach us — check it
-   * here instead of relying on the picker's filter.
-   */
-  const handleImageFile = useCallback((file: File) => {
-    const error = validateImageFile({ name: file.name, type: file.type, size: file.size });
-    if (error) {
-      setMessage({ titleHe: "ייבוא תמונה", bodyHe: error, kind: "error" });
-      return;
-    }
-    setImagePending({ file, fileName: file.name });
-  }, []);
-
-  const handleImageConfirm = useCallback(
-    (options: ImageImportOptionsValue) => {
-      const pending = imagePending;
-      setImagePending(null);
-      if (!pending) return;
-      void runOp("ייבוא תמונה", async () => {
-        const decoded = await decodeImageToGrid(pending.file, options.resolution, {
-          removeBackgroundTolerance: options.removeBackground ? options.bgToleranceMm : null,
-          brightness: options.brightness,
-          contrast: options.contrast,
-        });
-        if (options.removeBackground && decoded.backgroundRemovedFraction < 0.01) {
-          setMessage({
-            titleHe: "הסרת רקע",
-            bodyHe: "כמעט שלא זוהה רקע להסרה — נסו להגדיל את סבילות הצבע",
-            kind: "info",
-          });
-        }
-        const grid = smoothGrid(decoded.grid, options.smoothingLevel);
-        const pixelSizeMm = options.targetWidthMm / grid.width;
-        let layer: DesignLayer;
-        if (options.mode === "silhouette") {
-          const contours = gridToSilhouetteContours(grid, {
-            threshold: options.threshold,
-            invert: options.invert,
-            pixelSizeMm,
-          });
-          if (contours.length === 0) {
-            throw new ImageImportError(
-              "לא נמצאה צורה בתמונה — נסו לשנות את סף הבהירות או להפעיל היפוך"
-            );
-          }
-          layer = {
-            id: newId("layer"),
-            type: "imageRelief",
-            name: stripImageExtension(pending.fileName),
-            visible: true,
-            locked: false,
-            materialSlotId: doc.materialSlots[0]?.id ?? "slot1",
-            transform: { x: 0, y: 0, z: 0, rotationX: 0, rotationY: 0, rotationZ: 0, scaleX: 1, scaleY: 1, scaleZ: 1 },
-            previewOpacity: 1,
-            sourceName: pending.fileName,
-            mode: "silhouette",
-            contours,
-            meshId: null,
-            settings: {
-              targetWidthMm: options.targetWidthMm,
-              threshold: options.threshold,
-              invert: options.invert,
-              reliefHeightMm: options.reliefHeightMm,
-              minThicknessMm: options.minThicknessMm,
-              resolution: options.resolution,
-              smoothingLevel: options.smoothingLevel,
-            },
-            extrudeMm: options.extrudeMm,
-            combine: doc.baseMode === "withBase" ? "raised" : "standalone",
-            bevel: { enabled: false, sizeMm: 0.6, segments: 4 },
-          };
-        } else {
-          const mesh = heightFieldToClosedMesh(grid, {
-            pixelSizeMm,
-            minThicknessMm: options.minThicknessMm,
-            reliefHeightMm: options.reliefHeightMm,
-            invert: options.invert,
-          });
-          const kernel = await getGeometryKernel();
-          const { solid, status } = kernel.fromMeshData(mesh);
-          solid.dispose();
-          if (status !== "NoError") {
-            throw new ImageImportError("יצירת גוף התבליט נכשלה — נסו רזולוציה אחרת");
-          }
-          const meshId = storeMesh(mesh);
-          layer = {
-            id: newId("layer"),
-            type: "imageRelief",
-            name: stripImageExtension(pending.fileName),
-            visible: true,
-            locked: false,
-            materialSlotId: doc.materialSlots[0]?.id ?? "slot1",
-            transform: { x: 0, y: 0, z: 0, rotationX: 0, rotationY: 0, rotationZ: 0, scaleX: 1, scaleY: 1, scaleZ: 1 },
-            previewOpacity: 1,
-            sourceName: pending.fileName,
-            mode: "relief",
-            contours: [],
-            meshId,
-            settings: {
-              targetWidthMm: options.targetWidthMm,
-              threshold: options.threshold,
-              invert: options.invert,
-              reliefHeightMm: options.reliefHeightMm,
-              minThicknessMm: options.minThicknessMm,
-              resolution: options.resolution,
-              smoothingLevel: options.smoothingLevel,
-            },
-            extrudeMm: options.extrudeMm,
-            combine: "standalone",
-            bevel: { enabled: false, sizeMm: 0.6, segments: 4 },
-          };
-        }
-        applyDocument({ ...doc, layers: [...doc.layers, layer] }, "ייבוא תמונה");
-        dispatch({ type: "ui/select", selection: [layer.id] });
-      });
-    },
-    [imagePending, doc, applyDocument, dispatch, runOp]
-  );
-
-  const handleDesignFile = useCallback(
-    async (file: File) => {
-      await runOp("טעינת קובץ עיצוב", async () => {
-        const text = await file.text();
-        const { document: imported, warningsHe } = importDesignFile(text);
-        applyDocument(imported, "טעינת קובץ עיצוב");
-        dispatch({ type: "ui/select", selection: [] });
-        if (warningsHe.length > 0) {
-          setMessage({
-            titleHe: "קובץ העיצוב נטען עם הערות",
-            bodyHe: warningsHe.join("\n"),
-            kind: "info",
-          });
-        }
-      });
-    },
-    [runOp, applyDocument, dispatch]
-  );
 
   // ---- export ---------------------------------------------------------------
 
