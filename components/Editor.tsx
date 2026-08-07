@@ -110,7 +110,7 @@ import { downloadBlob } from "@/lib/export/stl";
 import { meshDataToBinaryStl } from "@/lib/export/stlData";
 import type { PrintablePart } from "@/lib/geometry/buildDocument";
 import { buildMultiPartZip } from "@/lib/export/package";
-import { buildThreeMf } from "@/lib/export/threeMF";
+import { buildThreeMf, matrixToThreeMfTransform } from "@/lib/export/threeMF";
 import { DESIGN_FILE_EXTENSION, DesignFileError, serializeDesignFile } from "@/lib/serialization/designFile";
 import { decodeShareHash, encodeShareHash, SHARE_HASH_PREFIX, shareLinkEligibility } from "@/lib/serialization/shareLink";
 import type { ModelIssue } from "@/types/design";
@@ -2036,13 +2036,32 @@ function EditorInner() {
           const blob = buildThreeMf(
             parts.map((part) => {
               const slot = doc.materialSlots.find((s) => s.id === part.materialSlotId);
+              // LOCAL geometry placed by a build transform — the slicer sees
+              // a movable object, so repositioning there needs no re-bake
+              // here. The layer hierarchy travels as an assembly: a child
+              // part rides its parent's assembly object at its relative
+              // placement.
+              const layer = doc.layers.find((l) => l.id === part.primaryLayerId);
+              const parentPart = layer?.parentId
+                ? parts.find((p) => p.primaryLayerId === layer.parentId)
+                : undefined;
+              const relativeTransform = parentPart
+                ? matrixToThreeMfTransform(
+                    parentPart.worldMatrix.clone().invert().multiply(part.worldMatrix)
+                      .elements
+                  )
+                : undefined;
               return {
+                id: part.id,
                 name: part.nameHe,
                 colorHex: slot?.colorHex ?? "#8a8f98",
                 materialName: slot ? `${slot.nameHe} (${material.nameHe})` : material.nameHe,
-                vertices: part.worldMesh.positions,
-                triangles: part.worldMesh.indices,
+                vertices: part.localMesh.positions,
+                triangles: part.localMesh.indices,
                 role: roleOf(part),
+                buildTransform: matrixToThreeMfTransform(part.worldMatrix.elements),
+                parentId: parentPart?.id ?? null,
+                relativeTransform,
               };
             }),
             fileName

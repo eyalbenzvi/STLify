@@ -5,7 +5,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { buildModelXml, buildThreeMf, type ThreeMfPart } from "../threeMF";
+import { buildModelXml, buildThreeMf, matrixToThreeMfTransform, type ThreeMfPart } from "../threeMF";
 
 /** A unit cube as indexed mesh arrays (12 triangles). */
 function cubePart(name: string, colorHex: string): ThreeMfPart {
@@ -113,5 +113,75 @@ describe("3MF support marking (V6 item 10)", () => {
     expect(xml).not.toContain("<components>");
     expect(xml).toContain('<item objectid="2"/>');
     expect(xml).toContain('<item objectid="4"/>');
+  });
+});
+
+describe("3MF production structure (V6 item 13)", () => {
+  it("assigns STABLE object ids from part identity, not input order", () => {
+    const a = { ...cubePart("א", "#ff0000"), id: "part_layer_a" };
+    const b = { ...cubePart("ב", "#00ff00"), id: "part_layer_b" };
+
+    const xmlAB = buildModelXml([a, b], "בדיקה");
+    const xmlBA = buildModelXml([b, a], "בדיקה");
+
+    // Same design, different input order → the SAME object gets the same id.
+    const idOf = (xml: string, name: string) => {
+      const match = xml.match(new RegExp(`<object id="(\\d+)" type="model" name="${name}"`));
+      return match?.[1];
+    };
+    expect(idOf(xmlAB, "א")).toBeDefined();
+    expect(idOf(xmlAB, "א")).toBe(idOf(xmlBA, "א"));
+    expect(idOf(xmlAB, "ב")).toBe(idOf(xmlBA, "ב"));
+  });
+
+  it("places parts via build transforms instead of world-baked geometry", () => {
+    const part = {
+      ...cubePart("גוף", "#2f6feb"),
+      id: "part_1",
+      buildTransform: [1, 0, 0, 0, 1, 0, 0, 0, 1, 25, -10, 3],
+    };
+    const xml = buildModelXml([part], "בדיקה");
+    expect(xml).toContain('transform="1 0 0 0 1 0 0 0 1 25 -10 3"');
+    // The geometry itself stays local (the unit cube's own coordinates).
+    expect(xml).toContain('<vertex x="0" y="0" z="0"/>');
+  });
+
+  it("preserves the layer hierarchy as assembly components", () => {
+    const parent = { ...cubePart("הורה", "#2f6feb"), id: "part_parent" };
+    const child = {
+      ...cubePart("ילד", "#00ff00"),
+      id: "part_child",
+      parentId: "part_parent",
+      relativeTransform: [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 12],
+    };
+    const xml = buildModelXml([parent, child], "בדיקה");
+
+    // The parent grows an assembly object whose components are its own mesh
+    // and the child at its relative placement.
+    const parentMeshId = xml.match(/<object id="(\d+)" type="model" name="הורה" pid/)?.[1];
+    const childMeshId = xml.match(/<object id="(\d+)" type="model" name="ילד" pid/)?.[1];
+    expect(parentMeshId).toBeDefined();
+    expect(childMeshId).toBeDefined();
+    const assembly = xml.match(
+      /<object id="(\d+)" type="model" name="הורה">\s*<components>([\s\S]*?)<\/components>/
+    );
+    expect(assembly).not.toBeNull();
+    expect(assembly![2]).toContain(`<component objectid="${parentMeshId}"/>`);
+    expect(assembly![2]).toContain(
+      `<component objectid="${childMeshId}" transform="1 0 0 0 1 0 0 0 1 0 0 12"/>`
+    );
+
+    // The build references ONLY the assembly — the child is not flattened
+    // into a loose sibling.
+    expect(xml).toContain(`<item objectid="${assembly![1]}"/>`);
+    expect(xml).not.toContain(`<item objectid="${childMeshId}"`);
+  });
+
+  it("converts a column-major matrix to the 3MF row layout", () => {
+    // translate(5,6,7) in column-major THREE layout.
+    const elements = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 5, 6, 7, 1];
+    expect(matrixToThreeMfTransform(elements)).toEqual([
+      1, 0, 0, 0, 1, 0, 0, 0, 1, 5, 6, 7,
+    ]);
   });
 });
