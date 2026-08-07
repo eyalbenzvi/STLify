@@ -8,7 +8,7 @@
  */
 
 import dynamic from "next/dynamic";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import type * as THREE from "three";
 import type {
   CutPlaneDefinition,
@@ -40,23 +40,27 @@ import { usePrintAids } from "@/hooks/usePrintAids";
 import { useRegionTools } from "@/hooks/useRegionTools";
 import { useImportHandlers } from "@/hooks/useImportHandlers";
 import { useAnalysisRunner } from "@/hooks/useAnalysisRunner";
+import { useSessionPersistence } from "@/hooks/useSessionPersistence";
+import { usePaintReanchor } from "@/hooks/usePaintReanchor";
+import {
+  useEditorShortcuts,
+  type FocusTarget,
+  type ViewPreset,
+} from "@/hooks/useEditorShortcuts";
 
 // Geometry and serialization the shell itself still calls.
 import { getGeometryKernel } from "@/lib/geometry/kernel";
-import { boundsCenter, boundsRadius, boundsSize, unionBounds } from "@/lib/geometry/bounds";
-import { garbageCollect, meshStoreStats, type MeshStoreStats } from "@/lib/geometry/meshStore";
+import { boundsSize, unionBounds } from "@/lib/geometry/bounds";
 import { getMesh, storeMesh } from "@/lib/geometry/meshStore";
 import { OpError } from "@/lib/geometry/operations/layerOps";
 import { buildGeneratorLayers } from "@/lib/geometry/generators/buildGeneratorLayers";
 import type { GeneratorKind, GeneratorParams } from "@/lib/geometry/generators/specs";
 import {
-  createTemplateDocument,
   makeBaseLayer,
   makeHoleLayer,
   makeTextLayer,
-  PRODUCT_TEMPLATES,
 } from "@/lib/geometry/documentTemplates";
-import { DEFAULT_PAINT_DEPTH_MM, hasStalePaint, reanchorPaints, splitPartsByPaint } from "@/lib/geometry/painting";
+import { DEFAULT_PAINT_DEPTH_MM, splitPartsByPaint } from "@/lib/geometry/painting";
 import { defaultModifier, type Modifier, type ModifierKind } from "@/lib/geometry/modifiers";
 import { resolveParameters, type ParameterDefinition } from "@/lib/geometry/expression";
 import type { CalibrationSettings } from "@/lib/geometry/calibration";
@@ -66,9 +70,6 @@ import type { OrientationCandidate } from "@/lib/geometry/analysis";
 import type { DetailedEstimateResult } from "@/lib/geometry/analysis/estimateDetailed";
 import type { SlicedEstimateResult } from "@/lib/geometry/analysis/estimateSliced";
 import type { MeshDiagnosis, MeshRepairReport, RepairOptions } from "@/lib/geometry/repair/diagnose";
-import { referencedMeshIds } from "@/lib/history/history";
-import { sweepUnreferencedMeshes } from "@/lib/history/retention";
-import { IMAGE_INPUT_ACCEPT } from "@/lib/import/image";
 import { downloadBlob } from "@/lib/export/download";
 import {
   buildStlExport,
@@ -79,22 +80,8 @@ import {
   DESIGN_FILE_EXTENSION,
   serializeDesignFile,
 } from "@/lib/serialization/designFile";
-import {
-  decodeShareHash,
-  encodeShareHash,
-  SHARE_HASH_PREFIX,
-  shareLinkEligibility,
-} from "@/lib/serialization/shareLink";
-import {
-  clearSnapshot,
-  describeSnapshotAge,
-  peekSnapshot,
-  restoreSnapshot,
-  saveSnapshot,
-  setRecoveryDisabled,
-  type RecoverySnapshot,
-} from "@/lib/serialization/crashRecovery";
-import { actionForEvent, loadKeymap, type Keymap } from "@/lib/keyboard/keymap";
+import { describeSnapshotAge } from "@/lib/serialization/crashRecovery";
+import { loadKeymap, type Keymap } from "@/lib/keyboard/keymap";
 
 // Panels and dialogs.
 import { Section } from "@/components/ui/Section";
@@ -109,6 +96,7 @@ import { CreatePanel } from "@/components/editor/CreatePanel";
 import { SubObjectPanel } from "@/components/editor/SubObjectPanel";
 import { CalibrationPanel, CustomPrinterPanel } from "@/components/editor/CalibrationPanel";
 import { JobProgressOverlay } from "@/components/editor/JobProgressOverlay";
+import { EditorHeader } from "@/components/editor/EditorHeader";
 import {
   HistoryPanel,
   MemoryPanel,
@@ -212,18 +200,8 @@ function EditorInner() {
   /** Below lg the tool panel is a collapsible bottom sheet. */
   const [panelOpen, setPanelOpen] = useState(true);
   const [keymap, setKeymap] = useState<Keymap>(() => loadKeymap());
-  const [viewPreset, setViewPreset] = useState<{
-    kind: "top" | "front" | "side" | "iso";
-    center: { x: number; y: number; z: number };
-    radius: number;
-    nonce: number;
-  } | null>(null);
-  const [focusTarget, setFocusTarget] = useState<{
-    x: number;
-    y: number;
-    z: number;
-    fitRadius?: number;
-  } | null>(null);
+  const [viewPreset, setViewPreset] = useState<ViewPreset | null>(null);
+  const [focusTarget, setFocusTarget] = useState<FocusTarget | null>(null);
 
   // Analysis results.
   const [orientationCandidates, setOrientationCandidates] = useState<OrientationCandidate[] | null>(null);
@@ -236,9 +214,6 @@ function EditorInner() {
   const [repairReport, setRepairReport] = useState<MeshRepairReport | null>(null);
   const [interference, setInterference] = useState<InterferenceReport | null>(null);
 
-  /** Bumped by the GC handler, which changes the store without changing doc. */
-  const [memoryVersion, setMemoryVersion] = useState(0);
-  const [recovery, setRecovery] = useState<RecoverySnapshot | null>(null);
   const [editingModifierId, setEditingModifierId] = useState<string | null>(null);
 
   // Sub-object tool settings.
@@ -246,11 +221,6 @@ function EditorInner() {
   const [filletRegionMm, setFilletRegionMm] = useState(DEFAULT_REGION_FILLET_MM);
   const [paintSlotId, setPaintSlotId] = useState<string | null>(null);
   const [paintDepthMm, setPaintDepthMm] = useState(DEFAULT_PAINT_DEPTH_MM);
-
-  const stlInputRef = useRef<HTMLInputElement>(null);
-  const svgInputRef = useRef<HTMLInputElement>(null);
-  const imageInputRef = useRef<HTMLInputElement>(null);
-  const designInputRef = useRef<HTMLInputElement>(null);
 
   const busy = state.ui.busyCount > 0;
 
@@ -620,69 +590,22 @@ function EditorInner() {
     setEditingModifierId(id);
   }, []);
 
-  // The mesh store is an external mutable source, but it only ever changes
-  // alongside the document (or when the GC handler runs), so deriving the
-  // readout is correct and avoids a setState-in-effect cascade.
-  const memoryStats: MeshStoreStats = useMemo(() => {
-    void doc;
-    void memoryVersion;
-    return meshStoreStats();
-  }, [doc, memoryVersion]);
+  // Paint survives a rebuild by re-projection (V6 item 17).
+  usePaintReanchor({
+    document: state.history.present.document,
+    parts: build.parts,
+    buildId: build.buildId,
+    dispatch,
+  });
 
-  // The history is bounded (HISTORY_CAPACITY): entries that fall off the old
-  // end may hold the last reference to a stored mesh, so every history change
-  // sweeps the store. A pending STL import (stored, previewed, not yet a
-  // layer) is passed as an extra root or an edit made while its dialog is
-  // open would free it out from under the confirm button.
-  useEffect(() => {
-    const pendingStl = pendingStlRef.current;
-    const result = sweepUnreferencedMeshes(
-      state.history,
-      pendingStl ? [pendingStl.meshId] : []
-    );
-    if (result.removed > 0) setMemoryVersion((v) => v + 1);
-  }, [state.history]);
-
-  // Paint recorded with spatial anchors survives a rebuild by re-projection
-  // (V6 item 17): after each completed build, a layer whose paint no longer
-  // matches its body is re-anchored onto the new mesh — quietly, with no
-  // history entry, exactly like a derived value. Entries without anchors
-  // (pre-V6 paint) keep the old discard-with-warning behaviour.
-  useEffect(() => {
-    if (build.parts.length === 0) return;
-    let changed = false;
-    const document = state.history.present.document;
-    const layers = document.layers.map((layer) => {
-      if (!layer.facePaint || layer.facePaint.length === 0) return layer;
-      const part = build.parts.find((p) => p.primaryLayerId === layer.id);
-      if (!part) return layer;
-      const count = part.localMesh.indices.length / 3;
-      if (!hasStalePaint(layer.facePaint, count)) return layer;
-      const result = reanchorPaints(layer.facePaint, part.localMesh);
-      if (result.reanchored === 0 && result.dropped === 0) return layer;
-      changed = true;
-      return { ...layer, facePaint: result.paints };
-    });
-    if (changed) {
-      dispatch({ type: "document/replaceTransient", document: { ...document, layers } });
-    }
-  }, [build.buildId, build.parts, state.history.present.document, dispatch]);
-
-  const handleCollectGarbage = useCallback(() => {
-    // Sweep against the union of every state in the history: a mesh that only
-    // a past state references must survive, or undo would produce an empty
-    // layer.
-    const result = garbageCollect(referencedMeshIds(state.history));
-    setMemoryVersion((v) => v + 1);
-    setMessage({
-      titleHe: "פינוי זיכרון",
-      bodyHe:
-        result.removed === 0
-          ? "לא נמצאו גופים מיותרים בזיכרון"
-          : `שוחררו ${result.removed} גופים (${(result.freedBytes / 1048576).toFixed(1)} מ״ב). נותרו ${result.remaining}.`,
-      kind: "success",
-    });
-  }, [state.history]);
+  const {
+    memoryStats,
+    handleCollectGarbage,
+    recovery,
+    handleAcceptRecovery,
+    handleDismissRecovery,
+    handleShareLink,
+  } = useSessionPersistence({ ops, history: state.history, pendingStlRef });
 
   const handleHistoryJump = useCallback(
     (delta: number) => {
@@ -690,52 +613,6 @@ function EditorInner() {
     },
     [dispatch]
   );
-
-  // Offer crash recovery once, on startup.
-  useEffect(() => {
-    let cancelled = false;
-    void peekSnapshot().then((snapshot) => {
-      if (!cancelled && snapshot) setRecovery(snapshot);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  // Autosave the single recovery slot, debounced so typing does not thrash
-  // IndexedDB. Failures are silent by design — this is a safety net, not a
-  // save button.
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      void saveSnapshot(doc);
-    }, 4000);
-    return () => clearTimeout(timer);
-  }, [doc]);
-
-  const handleAcceptRecovery = useCallback(() => {
-    const snapshot = recovery;
-    if (!snapshot) return;
-    setRecovery(null);
-    try {
-      const result = restoreSnapshot(snapshot);
-      applyDocument(result.document, "שחזור עבודה");
-      if (result.warningsHe.length > 0) {
-        setMessage({
-          titleHe: "העבודה שוחזרה עם הערות",
-          bodyHe: result.warningsHe.join("\n"),
-          kind: "info",
-        });
-      }
-    } catch (err) {
-      showError(err, "שחזור העבודה נכשל");
-    }
-  }, [recovery, applyDocument, showError]);
-
-  const handleDismissRecovery = useCallback((disableFuture: boolean) => {
-    setRecovery(null);
-    if (disableFuture) setRecoveryDisabled(true);
-    void clearSnapshot();
-  }, []);
 
   // ---- analysis ------------------------------------------------------------
 
@@ -906,200 +783,21 @@ function EditorInner() {
     [dispatch]
   );
 
-  // ---- share links -----------------------------------------------------------
+  // ---- keyboard shortcuts ---------------------------------------------------
 
-  const handleShareLink = useCallback(() => {
-    const eligibility = shareLinkEligibility(doc);
-    if (!eligibility.ok) {
-      setMessage({ titleHe: "שיתוף בקישור", bodyHe: eligibility.reasonHe, kind: "info" });
-      return;
-    }
-    void runOp("יצירת קישור שיתוף", async () => {
-      const hash = await encodeShareHash(doc);
-      if (!hash) {
-        setMessage({
-          titleHe: "שיתוף בקישור",
-          bodyHe: "העיצוב גדול מדי לקישור — יש לשתף כקובץ עיצוב",
-          kind: "info",
-        });
-        return;
-      }
-      const url = `${window.location.origin}${window.location.pathname}${hash}`;
-      await navigator.clipboard.writeText(url);
-      setMessage({
-        titleHe: "הקישור הועתק",
-        bodyHe:
-          "הקישור מכיל את העיצוב עצמו (אין שרת ואין שמירה בענן) — כל מי שמקבל אותו רואה את העיצוב. פתיחת הקישור טוענת את העיצוב לזיכרון הדפדפן בלבד.",
-        kind: "success",
-      });
-    });
-  }, [doc, runOp]);
-
-  // Load a shared design from the URL hash once, on startup.
-  const hashLoadedRef = useRef(false);
-  useEffect(() => {
-    if (hashLoadedRef.current) return;
-    hashLoadedRef.current = true;
-    const hash = window.location.hash;
-    if (!hash.startsWith(SHARE_HASH_PREFIX)) return;
-    void (async () => {
-      try {
-        const { document: shared, warningsHe } = await decodeShareHash(hash);
-        applyDocument(shared, "טעינת עיצוב מקישור");
-        window.history.replaceState(null, "", window.location.pathname);
-        if (warningsHe.length > 0) {
-          setMessage({
-            titleHe: "העיצוב מהקישור נטען עם הערות",
-            bodyHe: warningsHe.join("\n"),
-            kind: "info",
-          });
-        }
-      } catch {
-        setMessage({
-          titleHe: "טעינת קישור",
-          bodyHe: "הקישור אינו מכיל עיצוב תקין",
-          kind: "error",
-        });
-      }
-    })();
-  }, [applyDocument]);
-
-  // ---- keyboard shortcuts -----------------------------------------------------
-  // The full 3D-tool set (V6 item 18), driven by an EDITABLE keymap stored
-  // on this device (lib/keyboard/keymap.ts). Esc stays hardcoded — a panic
-  // key must not be remappable into oblivion.
-
-  /** Bounds of the selection (fallback: all parts) for framing and views. */
-  const selectionFrame = useCallback(() => {
-    const parts = selectedParts.length > 0 ? selectedParts : build.parts;
-    const bounds = unionBounds(parts.map((part) => part.stats.bounds));
-    if (!bounds) return null;
-    return { center: boundsCenter(bounds), radius: boundsRadius(bounds) };
-  }, [selectedParts, build.parts]);
-
-  const handleFrameSelection = useCallback(() => {
-    const frame = selectionFrame();
-    if (!frame) return;
-    setFocusTarget({ ...frame.center, fitRadius: frame.radius });
-  }, [selectionFrame]);
-
-  const handleViewPreset = useCallback(
-    (kind: "top" | "front" | "side" | "iso") => {
-      const frame = selectionFrame();
-      if (!frame) return;
-      setViewPreset((prev) => ({
-        kind,
-        center: frame.center,
-        radius: frame.radius,
-        nonce: (prev?.nonce ?? 0) + 1,
-      }));
-    },
-    [selectionFrame]
-  );
-
-  const handleSelectAll = useCallback(() => {
-    dispatch({
-      type: "ui/select",
-      selection: build.parts.map((p) => p.primaryLayerId),
-    });
-  }, [dispatch, build.parts]);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const target = e.target as HTMLElement | null;
-      // Never swallow typing: form fields and editable content keep every key.
-      if (
-        target &&
-        (["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName) || target.isContentEditable)
-      ) {
-        return;
-      }
-      if (e.code === "Escape") {
-        dispatch({ type: "ui/setTool", tool: "select" });
-        return;
-      }
-      const action = actionForEvent(e, keymap);
-      if (!action) return;
-      switch (action) {
-        case "undo":
-          e.preventDefault();
-          dispatch({ type: "history/undo" });
-          break;
-        case "redo":
-          e.preventDefault();
-          dispatch({ type: "history/redo" });
-          break;
-        case "delete": {
-          // One document update for the whole selection. The old per-layer
-          // loop called the single-delete handler repeatedly over the SAME
-          // stale document, so only the last deletion survived.
-          const doomed = new Set(
-            selectedLayers.filter((l) => !l.locked).map((l) => l.id)
-          );
-          if (doomed.size > 0) {
-            const current = state.history.present.document;
-            applyDocument(
-              { ...current, layers: current.layers.filter((l) => !doomed.has(l.id)) },
-              doomed.size === 1 ? "מחיקת שכבה" : `מחיקת ${doomed.size} שכבות`
-            );
-          }
-          break;
-        }
-        case "toolSelect":
-          dispatch({ type: "ui/setTool", tool: "select" });
-          break;
-        case "toolTranslate":
-          dispatch({ type: "ui/setTool", tool: "translate" });
-          break;
-        case "toolRotate":
-          dispatch({ type: "ui/setTool", tool: "rotate" });
-          break;
-        case "toolScale":
-          dispatch({ type: "ui/setTool", tool: "scale" });
-          break;
-        case "frameSelection":
-          handleFrameSelection();
-          break;
-        case "duplicate":
-          e.preventDefault();
-          handleDuplicate();
-          break;
-        case "selectAll":
-          e.preventDefault();
-          handleSelectAll();
-          break;
-        case "viewTop":
-          handleViewPreset("top");
-          break;
-        case "viewFront":
-          handleViewPreset("front");
-          break;
-        case "viewSide":
-          handleViewPreset("side");
-          break;
-        case "viewIso":
-          handleViewPreset("iso");
-          break;
-        case "shortcutHelp":
-          e.preventDefault();
-          dialogs.open("shortcuts");
-          break;
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [
-    dispatch,
-    dialogs,
+  useEditorShortcuts({
+    ops,
+    history: state.history,
     keymap,
+    dispatch,
+    parts: build.parts,
+    selectedParts,
     selectedLayers,
-    state.history.present.document,
-    applyDocument,
-    handleFrameSelection,
-    handleViewPreset,
-    handleDuplicate,
-    handleSelectAll,
-  ]);
+    onDuplicate: handleDuplicate,
+    onShowShortcutHelp: () => dialogs.open("shortcuts"),
+    setFocusTarget,
+    setViewPreset,
+  });
 
   // ---- derived UI -----------------------------------------------------------
 
@@ -1117,121 +815,25 @@ function EditorInner() {
 
   return (
     <div className="flex h-dvh flex-col bg-slate-100">
-      {/* Header */}
-      <header className="flex flex-wrap items-center gap-2 border-b border-slate-200 bg-white px-4 py-2 shadow-sm">
-        <h1 className="text-lg font-bold text-slate-800">PrintCraft STL Studio</h1>
-
-        <select
-          className="rounded-md border border-slate-300 px-2 py-1 text-sm"
-          value={doc.templateId ?? ""}
-          aria-label="בחירת תבנית"
-          onChange={(e) => {
-            if (!e.target.value) return;
-            applyDocument(createTemplateDocument(e.target.value), "טעינת תבנית");
-          }}
-        >
-          <option value="">תבנית…</option>
-          {PRODUCT_TEMPLATES.map((t) => (
-            <option key={t.id} value={t.id}>
-              {t.icon} {t.nameHe}
-            </option>
-          ))}
-        </select>
-
-        {/* Base mode selector */}
-        <div className="flex overflow-hidden rounded-md border border-slate-300" role="group" aria-label="מצב בסיס">
-          {(
-            [
-              ["withBase", "עם בסיס"],
-              ["baseless", "ללא בסיס"],
-            ] as const
-          ).map(([mode, label]) => (
-            <button
-              key={mode}
-              type="button"
-              aria-pressed={doc.baseMode === mode}
-              className={`px-3 py-1 text-sm ${
-                doc.baseMode === mode
-                  ? "bg-blue-600 text-white"
-                  : "bg-white text-slate-600 hover:bg-slate-100"
-              }`}
-              onClick={() => doc.baseMode !== mode && setModeSwitchTarget(mode)}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
-
-        <div className="flex items-center gap-1">
-          <button
-            type="button"
-            disabled={!canUndo}
-            title="ביטול (Ctrl+Z)"
-            aria-label="ביטול"
-            className="rounded-md border border-slate-300 px-2 py-1 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-30"
-            onClick={() => dispatch({ type: "history/undo" })}
-          >
-            ↶
-          </button>
-          <button
-            type="button"
-            disabled={!canRedo}
-            title="ביצוע מחדש (Ctrl+Y)"
-            aria-label="ביצוע מחדש"
-            className="rounded-md border border-slate-300 px-2 py-1 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-30"
-            onClick={() => dispatch({ type: "history/redo" })}
-          >
-            ↷
-          </button>
-        </div>
-
-        <div className="ms-auto flex flex-wrap items-center gap-1.5">
-          <button type="button" className="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-sm text-slate-600 hover:bg-slate-50" onClick={() => stlInputRef.current?.click()}>
-            ייבוא STL
-          </button>
-          <button type="button" className="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-sm text-slate-600 hover:bg-slate-50" onClick={() => svgInputRef.current?.click()}>
-            ייבוא SVG
-          </button>
-          <button type="button" className="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-sm text-slate-600 hover:bg-slate-50" onClick={() => imageInputRef.current?.click()}>
-            ייבוא תמונה
-          </button>
-          <button type="button" className="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-sm text-slate-600 hover:bg-slate-50" onClick={() => designInputRef.current?.click()}>
-            טעינת עיצוב
-          </button>
-          <button
-            type="button"
-            className="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-sm text-slate-600 hover:bg-slate-50"
-            title="ספריית עיצובים עם גרסאות — במכשיר זה בלבד, ללא חשבון וללא סנכרון"
-            onClick={() => dialogs.open("library")}
-          >
-            ספרייה
-          </button>
-          <button
-            type="button"
-            className="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-sm text-slate-600 hover:bg-slate-50"
-            title="קיצורי מקלדת (Shift+?)"
-            aria-label="קיצורי מקלדת"
-            onClick={() => dialogs.open("shortcuts")}
-          >
-            ⌨
-          </button>
-          <button
-            type="button"
-            className="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-sm text-slate-600 hover:bg-slate-50"
-            title="קישור שמכיל את העיצוב עצמו — לעיצובים קטנים בלבד"
-            onClick={handleShareLink}
-          >
-            שיתוף בקישור
-          </button>
-          <button
-            type="button"
-            className="rounded-md bg-blue-600 px-3 py-1 text-sm font-semibold text-white hover:bg-blue-700"
-            onClick={() => dialogs.open("export")}
-          >
-            ייצוא ⬇
-          </button>
-        </div>
-      </header>
+      <EditorHeader
+        document={doc}
+        canUndo={canUndo}
+        canRedo={canRedo}
+        onUndo={() => dispatch({ type: "history/undo" })}
+        onRedo={() => dispatch({ type: "history/redo" })}
+        onApplyTemplate={(template) => applyDocument(template, "טעינת תבנית")}
+        onRequestBaseMode={setModeSwitchTarget}
+        onStlFile={(file) => void handleStlFile(file)}
+        onSvgFile={(file) =>
+          void file.text().then((text) => setSvgPending({ text, fileName: file.name }))
+        }
+        onImageFile={handleImageFile}
+        onDesignFile={(file) => void handleDesignFile(file)}
+        onOpenLibrary={() => dialogs.open("library")}
+        onOpenShortcuts={() => dialogs.open("shortcuts")}
+        onShareLink={handleShareLink}
+        onOpenExport={() => dialogs.open("export")}
+      />
 
       {/* Session-only notice */}
       <div className="border-b border-amber-100 bg-amber-50 px-4 py-1 text-center text-xs text-amber-800">
@@ -1581,12 +1183,6 @@ function EditorInner() {
           )}
         </section>
       </main>
-
-      {/* Hidden file inputs */}
-      <input ref={stlInputRef} type="file" accept=".stl" className="hidden" aria-label="קובץ STL" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void handleStlFile(f); }} />
-      <input ref={svgInputRef} type="file" accept=".svg" className="hidden" aria-label="קובץ SVG" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) { void f.text().then((text) => setSvgPending({ text, fileName: f.name })); } }} />
-      <input ref={imageInputRef} type="file" accept={IMAGE_INPUT_ACCEPT} className="hidden" aria-label="קובץ תמונה" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) handleImageFile(f); }} />
-      <input ref={designInputRef} type="file" accept=".json,.formadesign.json" className="hidden" aria-label="קובץ עיצוב" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void handleDesignFile(f); }} />
 
       {/* Dialogs */}
       <MessageDialog message={message} onClose={() => setMessage(null)} />
