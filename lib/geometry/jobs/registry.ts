@@ -39,6 +39,7 @@ import { isotropicRemesh, type RemeshSettings } from "../operations/remesh";
 import { findSelfIntersections } from "../repair/selfIntersection";
 import { latticeFill, type LatticeSettings } from "../operations/lattice";
 import { roundEdges, shellSolid, type FilletSettings, type ShellSettings } from "../operations/fillet";
+import { filletRegion } from "../operations/filletRegion";
 
 /** Progress callback shape shared by both execution paths. */
 export type ProgressReporter = (fraction: number, labelHe: string) => void;
@@ -191,6 +192,10 @@ export interface GeometryJobMap {
   };
   fillet: {
     payload: { mesh: MeshData; settings: FilletSettings };
+    result: { mesh: MeshData; warningsHe: string[] };
+  };
+  filletRegion: {
+    payload: { mesh: MeshData; regionTriangles: number[]; settings: FilletSettings };
     result: { mesh: MeshData; warningsHe: string[] };
   };
   shell: {
@@ -405,6 +410,16 @@ export const JOB_HANDLERS: Handlers = {
     outcome.solid.dispose();
     ctx.onProgress(1, "הושלם");
     return { mesh: out, warningsHe: outcome.warningsHe };
+  },
+
+  filletRegion: async ({ mesh, regionTriangles, settings }, ctx) => {
+    ctx.onProgress(0.1, "מכין את הגוף");
+    const kernel = await getGeometryKernel();
+    ctx.throwIfCancelled();
+    ctx.onProgress(0.3, "מעגל את האזור הנבחר");
+    const outcome = filletRegion(kernel, mesh, new Set(regionTriangles), settings);
+    ctx.onProgress(1, "הושלם");
+    return outcome;
   },
 
   shell: async ({ mesh, settings }, ctx) => {

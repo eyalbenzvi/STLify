@@ -337,6 +337,7 @@ function EditorInner() {
   const [recovery, setRecovery] = useState<RecoverySnapshot | null>(null);
   const [editingModifierId, setEditingModifierId] = useState<string | null>(null);
   const [pushPullMm, setPushPullMm] = useState(2);
+  const [filletRegionMm, setFilletRegionMm] = useState(2);
   const [paintSlotId, setPaintSlotId] = useState<string | null>(null);
   const [paintDepthMm, setPaintDepthMm] = useState(DEFAULT_PAINT_DEPTH_MM);
   const [revolveOpen, setRevolveOpen] = useState(false);
@@ -1683,7 +1684,7 @@ function EditorInner() {
       fn: (
         mesh: import("@/lib/geometry/meshData").MeshData,
         triangles: Set<number>
-      ) => Promise<{ layers: DesignLayer[]; warningsHe: string[] }>
+      ) => Promise<{ layers: DesignLayer[]; warningsHe: string[] } | null>
     ) => {
       const sel = state.ui.faceSelection;
       if (!sel || sel.triangles.length === 0) return;
@@ -1691,13 +1692,43 @@ function EditorInner() {
       const layer = doc.layers.find((l) => l.id === sel.layerId);
       if (!part || !layer || layer.locked) return;
       void runOp(labelHe, async () => {
-        const { layers, warningsHe } = await fn(part.worldMesh, new Set(sel.triangles));
+        const outcome = await fn(part.worldMesh, new Set(sel.triangles));
+        // null = the user cancelled the job; nothing must change.
+        if (!outcome) return;
         dispatch({ type: "ui/setFaceSelection", selection: null });
-        applyOpResult(labelHe, layers, [layer.id], "hide", warningsHe);
+        applyOpResult(labelHe, outcome.layers, [layer.id], "hide", outcome.warningsHe);
       });
     },
     [state.ui.faceSelection, partByLayer, doc.layers, runOp, applyOpResult, dispatch]
   );
+
+  const handleFilletRegion = useCallback(() => {
+    const sel = state.ui.faceSelection;
+    const layer = sel ? doc.layers.find((l) => l.id === sel.layerId) : null;
+    if (!layer || !isShapeLayer(layer)) return;
+    runRegionOp("עיגול אזור", async (mesh, triangles) => {
+      // Runs as a job (worker + cancel): whole-body rounding is Minkowski.
+      // transferables=[]: the worldMesh must stay live on this thread.
+      const result = await jobs.run(
+        "filletRegion",
+        {
+          mesh,
+          regionTriangles: [...triangles],
+          settings: { sizeMm: filletRegionMm, style: "fillet", scope: "both" },
+        },
+        "עיגול אזור",
+        { transferables: [] }
+      );
+      if (!result) return null; // cancelled — nothing changes
+      const resultLayer = await meshToResultLayer(result.mesh, {
+        nameHe: `${layer.name} — עיגול אזור`,
+        descriptionHe: `עיגול אזור נבחר ברדיוס ${filletRegionMm} מ״מ`,
+        materialSlotId: layer.materialSlotId,
+        sourceLayerId: layer.id,
+      });
+      return { layers: [resultLayer], warningsHe: result.warningsHe };
+    });
+  }, [state.ui.faceSelection, doc.layers, runRegionOp, filletRegionMm, jobs]);
 
   const handlePushPull = useCallback(() => {
     const sel = state.ui.faceSelection;
@@ -2859,6 +2890,9 @@ function EditorInner() {
               onSetGrowAngle={(degrees) => dispatch({ type: "ui/setFaceGrowAngle", degrees })}
               onSetPushPull={setPushPullMm}
               onPushPull={handlePushPull}
+              filletRegionMm={filletRegionMm}
+              onSetFilletRegionMm={setFilletRegionMm}
+              onFilletRegion={handleFilletRegion}
               onSmooth={handleRegionSmooth}
               onDelete={handleRegionDelete}
               onSplit={handleRegionSplit}
