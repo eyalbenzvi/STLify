@@ -20,10 +20,14 @@ import type {
   DesignLayer,
   HoleLayer,
   ImageReliefLayer,
+  PrimitiveLayer,
+  SketchLayer,
   StoredContour,
   SvgLayer,
   TextLayer,
 } from "@/types/design";
+import { sketchToContours } from "./sketch";
+import { compensatedHoleDiameterMm, type CalibrationSettings } from "./calibration";
 import { loadFont } from "./fonts";
 import type { Contour, GeometryKernel, Solid } from "./kernel";
 import { getMesh } from "./meshStore";
@@ -115,8 +119,12 @@ function storedContoursResult(stored: StoredContour[]): LayerContoursResult {
 
 /** 2D outlines of a contour-based layer, in the layer's local mm space. */
 export async function layerContours(
-  layer: TextLayer | SvgLayer | ImageReliefLayer
+  kernel: GeometryKernel,
+  layer: TextLayer | SvgLayer | ImageReliefLayer | SketchLayer
 ): Promise<LayerContoursResult> {
+  if (layer.type === "sketch") {
+    return storedContoursResult(sketchToContours(kernel, layer.entities));
+  }
   if (layer.type === "text") {
     if (layer.content.trim().length === 0) {
       return { contours: [], bounds: { minX: 0, maxX: 0, minY: 0, maxY: 0 }, isEmpty: true };
@@ -214,10 +222,10 @@ export type EffectiveCombine = "standalone" | "raised" | "engraved" | "inlay";
  */
 export async function buildContourLayerSolid(
   kernel: GeometryKernel,
-  layer: TextLayer | SvgLayer | ImageReliefLayer,
+  layer: TextLayer | SvgLayer | ImageReliefLayer | SketchLayer,
   effectiveCombine: EffectiveCombine
 ): Promise<Solid | null> {
-  const result = await layerContours(layer);
+  const result = await layerContours(kernel, layer);
   if (result.isEmpty) return null;
   const depth = layer.extrudeMm;
   if (depth <= 0) {
@@ -252,10 +260,10 @@ export async function buildContourLayerSolid(
  */
 export async function buildInlayPocketCutter(
   kernel: GeometryKernel,
-  layer: TextLayer | SvgLayer | ImageReliefLayer,
+  layer: TextLayer | SvgLayer | ImageReliefLayer | SketchLayer,
   clearanceMm: number
 ): Promise<Solid | null> {
-  const result = await layerContours(layer);
+  const result = await layerContours(kernel, layer);
   if (result.isEmpty) return null;
   const depth = layer.extrudeMm;
   const inflated =
@@ -287,15 +295,112 @@ export function buildStoredMeshSolid(
 }
 
 /**
+ * Solid of a parametric primitive, in local coordinates.
+ *
+ * Every kind is centred on the XY origin and sits on z = 0, matching the
+ * convention used by the base plate and contour layers, so a freshly created
+ * primitive lands on the build plate rather than half-buried in it.
+ */
+export function buildPrimitiveSolid(
+  kernel: GeometryKernel,
+  layer: PrimitiveLayer
+): Solid {
+  const segments = Math.max(3, Math.round(layer.segments));
+  const fail = (messageHe: string): never => {
+    throw new LayerBuildError(layer.id, messageHe);
+  };
+
+  switch (layer.kind) {
+    case "box":
+      if (layer.widthMm <= 0 || layer.depthMm <= 0 || layer.heightMm <= 0) {
+        fail("מידות התיבה חייבות להיות גדולות מאפס");
+      }
+      return kernel
+        .box(layer.widthMm, layer.depthMm, layer.heightMm, true)
+        .translate(0, 0, layer.heightMm / 2);
+
+    case "cylinder":
+      if (layer.radiusMm <= 0 || layer.heightMm <= 0) {
+        fail("רדיוס וגובה הגליל חייבים להיות גדולים מאפס");
+      }
+      return kernel.cylinder(layer.radiusMm, layer.heightMm, segments);
+
+    case "sphere":
+      if (layer.radiusMm <= 0) fail("רדיוס הכדור חייב להיות גדול מאפס");
+      return kernel.sphere(layer.radiusMm, segments).translate(0, 0, layer.radiusMm);
+
+    case "cone":
+      if (layer.radiusMm <= 0 || layer.heightMm <= 0) {
+        fail("רדיוס וגובה החרוט חייבים להיות גדולים מאפס");
+      }
+      if (layer.radius2Mm < 0) fail("הרדיוס העליון אינו יכול להיות שלילי");
+      return kernel.cone(layer.radiusMm, layer.radius2Mm, layer.heightMm, segments);
+
+    case "torus":
+      if (layer.radiusMm <= 0 || layer.radius2Mm <= 0) {
+        fail("רדיוסי הטבעת חייבים להיות גדולים מאפס");
+      }
+      if (layer.radius2Mm >= layer.radiusMm) {
+        fail("רדיוס החתך חייב להיות קטן מהרדיוס הראשי");
+      }
+      return kernel
+        .torus(layer.radiusMm, layer.radius2Mm, segments)
+        .translate(0, 0, layer.radius2Mm);
+
+    case "tube": {
+      if (layer.radiusMm <= 0 || layer.heightMm <= 0) {
+        fail("רדיוס וגובה הצינור חייבים להיות גדולים מאפס");
+      }
+      if (layer.radius2Mm >= layer.radiusMm) {
+        fail("הרדיוס הפנימי חייב להיות קטן מהחיצוני");
+      }
+      const outer = kernel.cylinder(layer.radiusMm, layer.heightMm, segments);
+      if (layer.radius2Mm <= 0) return outer;
+      // Overshoot the bore so the end caps are never coplanar with the walls.
+      const bore = kernel
+        .cylinder(layer.radius2Mm, layer.heightMm + BOOLEAN_OVERLAP_MM * 2, segments)
+        .translate(0, 0, -BOOLEAN_OVERLAP_MM);
+      return outer.subtract(bore);
+    }
+
+    case "wedge": {
+      if (layer.widthMm <= 0 || layer.depthMm <= 0 || layer.heightMm <= 0) {
+        fail("מידות הטריז חייבות להיות גדולות מאפס");
+      }
+      // A right triangular prism: the profile is drawn in XZ and revolved is
+      // not needed — extrude the triangle along Y by building it in XY and
+      // rotating it upright.
+      const w = layer.widthMm / 2;
+      const triangle: Contour = [
+        [-w, 0],
+        [w, 0],
+        [-w, layer.heightMm],
+      ];
+      return kernel
+        .extrude([triangle], layer.depthMm)
+        .rotate(90, 0, 0)
+        .translate(0, layer.depthMm / 2, 0);
+    }
+  }
+}
+
+/**
  * Cylinder cutter for a hole layer, in local coordinates. `spanMm` should
  * exceed the target body size so through-holes always pass fully through.
  */
 export function buildHoleCutter(
   kernel: GeometryKernel,
   layer: HoleLayer,
-  spanMm: number
+  spanMm: number,
+  calibration?: CalibrationSettings
 ): Solid {
-  const radius = layer.diameterMm / 2;
+  // A printed hole comes out undersized. Enlarging the CUTTER is what makes
+  // the printed hole measure what the user typed; asking them to oversize
+  // every diameter by hand is how screws end up not fitting.
+  const effectiveDiameter = calibration
+    ? compensatedHoleDiameterMm(calibration, layer.diameterMm)
+    : layer.diameterMm;
+  const radius = effectiveDiameter / 2;
   if (layer.depthMode === "through") {
     return kernel.cylinder(radius, spanMm * 2).translate(0, 0, -spanMm);
   }
@@ -318,7 +423,10 @@ export async function buildShapeLayerSolid(
       return buildBaseSolid(kernel, layer);
     case "text":
     case "svg":
+    case "sketch":
       return buildContourLayerSolid(kernel, layer, effectiveCombine);
+    case "primitive":
+      return buildPrimitiveSolid(kernel, layer);
     case "imageRelief":
       if (layer.mode === "silhouette") {
         return buildContourLayerSolid(kernel, layer, effectiveCombine);

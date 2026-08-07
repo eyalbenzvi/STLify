@@ -29,6 +29,7 @@ import type { DesignDocument, Measurement, Transform3D } from "@/types/design";
 import type { PrinterProfile } from "@/types/profiles";
 import type { BuiltPart } from "@/hooks/useDocumentBuilder";
 import { matrix4ToTransform, snapTransformNoise } from "@/lib/geometry/transform";
+import { activePaints } from "@/lib/geometry/painting";
 import type {
   EditorTool,
   OverlayMode,
@@ -63,6 +64,17 @@ export interface SceneViewProps {
   onCommitTransform: (layerId: string, transform: Transform3D) => void;
   onSurfacePick: (pick: SurfacePick) => void;
   onAddMeasurement: (a: THREE.Vector3, b: THREE.Vector3) => void;
+  /**
+   * World point to centre the camera on. Set by the mesh inspector and the
+   * interference report so a listed problem can be looked at rather than
+   * merely described. A new object identity re-triggers the move, so the
+   * same location can be revisited.
+   */
+  focusTarget?: { x: number; y: number; z: number } | null;
+  /** Highlighted triangles on one body, from the sub-object selection. */
+  faceSelection?: { layerId: string; triangles: number[] } | null;
+  /** Fired in faceSelect mode with the clicked triangle. */
+  onFacePick?: (primaryLayerId: string, triangleIndex: number, additive: boolean) => void;
 }
 
 /** Material color for a part, honouring its material slot. */
@@ -311,6 +323,9 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
     onSurfacePick,
     onAddMeasurement,
     onRemoveMeasurement,
+    focusTarget,
+    faceSelection,
+    onFacePick,
   } = props;
 
   const { gl } = useThree();
@@ -352,7 +367,11 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
     return [new THREE.Plane(normal, section.offsetMm * (section.flip ? -1 : 1))];
   }, [section]);
 
-  const pickMode = tool === "measure" || tool === "placeOnSurface" || tool === "drainHole";
+  const pickMode =
+    tool === "measure" ||
+    tool === "placeOnSurface" ||
+    tool === "drainHole" ||
+    tool === "faceSelect";
 
   const handlePartClick = useCallback(
     (event: ThreeEvent<MouseEvent>, part: BuiltPart) => {
@@ -365,6 +384,18 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
           onAddMeasurement(pendingPoint, point);
           setPendingPoint(null);
         }
+        return;
+      }
+      if (tool === "faceSelect") {
+        // three.js reports faceIndex against the rendered geometry, which is
+        // the part's local mesh — the same triangle ordering the region
+        // operations use, so the index carries straight through.
+        if (event.faceIndex === undefined || event.faceIndex === null) return;
+        onFacePick?.(
+          part.primaryLayerId,
+          event.faceIndex,
+          event.ctrlKey || event.metaKey || event.shiftKey
+        );
         return;
       }
       if (tool === "placeOnSurface" || tool === "drainHole") {
@@ -383,7 +414,7 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
       }
       onSelect([part.primaryLayerId], event.ctrlKey || event.metaKey || event.shiftKey);
     },
-    [tool, pendingPoint, onAddMeasurement, onSurfacePick, onSelect]
+    [tool, pendingPoint, onAddMeasurement, onSurfacePick, onSelect, onFacePick]
   );
 
   // Gizmo target: the single selected layer that owns a part.
@@ -448,6 +479,20 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
         />
       )}
 
+      <FacePaintOverlay
+        document={document}
+        parts={parts}
+        clippingPlanes={clippingPlanes}
+      />
+
+      {faceSelection && (
+        <FaceSelectionHighlight
+          parts={parts}
+          selection={faceSelection}
+          clippingPlanes={clippingPlanes}
+        />
+      )}
+
       {measurements.map((m) => (
         <MeasurementView key={m.id} measurement={m} onRemove={onRemoveMeasurement} />
       ))}
@@ -473,8 +518,184 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
       </GizmoHelper>
 
       <OrbitControls makeDefault enableDamping />
+      <CameraFocus target={focusTarget ?? null} />
     </>
   );
+}
+
+/**
+ * Draws painted regions in their material's colour.
+ *
+ * The painted body stays ONE object until export, so the paint has to be
+ * shown as an overlay rather than by colouring separate parts — otherwise
+ * there is no feedback at all until the ZIP is opened. Same technique as the
+ * selection highlight: its own geometry, offset forward so it does not
+ * z-fight with the surface it covers.
+ */
+function FacePaintOverlay({
+  document,
+  parts,
+  clippingPlanes,
+}: {
+  document: DesignDocument;
+  parts: BuiltPart[];
+  clippingPlanes: THREE.Plane[];
+}) {
+  const regions = useMemo(() => {
+    const layerById = new Map(document.layers.map((l) => [l.id, l]));
+    const out: {
+      key: string;
+      colorHex: string;
+      geometry: THREE.BufferGeometry;
+      worldMatrix: THREE.Matrix4;
+    }[] = [];
+    for (const part of parts) {
+      const layer = layerById.get(part.primaryLayerId);
+      const source = part.localMesh;
+      const triangleCount = source.indices.length / 3;
+      for (const paint of activePaints(layer?.facePaint, triangleCount)) {
+        const slot = document.materialSlots.find((s) => s.id === paint.materialSlotId);
+        if (!slot) continue;
+        const positions = new Float32Array(paint.triangles.length * 9);
+        let cursor = 0;
+        for (const t of paint.triangles) {
+          for (let k = 0; k < 3; k++) {
+            const v = source.indices[t * 3 + k] * 3;
+            positions[cursor++] = source.positions[v];
+            positions[cursor++] = source.positions[v + 1];
+            positions[cursor++] = source.positions[v + 2];
+          }
+        }
+        if (cursor === 0) continue;
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute(
+          "position",
+          new THREE.BufferAttribute(positions.subarray(0, cursor), 3)
+        );
+        geometry.computeVertexNormals();
+        out.push({
+          key: `${part.id}:${paint.materialSlotId}`,
+          colorHex: slot.colorHex,
+          geometry,
+          worldMatrix: part.worldMatrix,
+        });
+      }
+    }
+    return out;
+  }, [document, parts]);
+
+  useEffect(
+    () => () => {
+      for (const region of regions) region.geometry.dispose();
+    },
+    [regions]
+  );
+
+  if (regions.length === 0) return null;
+  return (
+    <>
+      {regions.map((region) => (
+        <group key={region.key} matrixAutoUpdate={false} matrix={region.worldMatrix}>
+          <mesh geometry={region.geometry} renderOrder={1}>
+            <meshStandardMaterial
+              color={region.colorHex}
+              metalness={0.05}
+              roughness={0.55}
+              side={THREE.DoubleSide}
+              polygonOffset
+              polygonOffsetFactor={-1}
+              polygonOffsetUnits={-1}
+              clippingPlanes={clippingPlanes}
+            />
+          </mesh>
+        </group>
+      ))}
+    </>
+  );
+}
+
+/**
+ * Draws the selected triangles on top of the body.
+ *
+ * Rendered as its own geometry rather than by recolouring vertices, because
+ * a selection changes far more often than the body does and rebuilding the
+ * part's own buffers on every click would stutter. `polygonOffset` keeps the
+ * highlight from z-fighting with the surface it sits on.
+ */
+function FaceSelectionHighlight({
+  parts,
+  selection,
+  clippingPlanes,
+}: {
+  parts: BuiltPart[];
+  selection: { layerId: string; triangles: number[] };
+  clippingPlanes: THREE.Plane[];
+}) {
+  const part = parts.find((p) => p.primaryLayerId === selection.layerId);
+
+  const geometry = useMemo(() => {
+    if (!part || selection.triangles.length === 0) return null;
+    const source = part.localMesh;
+    const triangleCount = source.indices.length / 3;
+    const positions = new Float32Array(selection.triangles.length * 9);
+    let cursor = 0;
+    for (const t of selection.triangles) {
+      if (t < 0 || t >= triangleCount) continue;
+      for (let k = 0; k < 3; k++) {
+        const v = source.indices[t * 3 + k] * 3;
+        positions[cursor++] = source.positions[v];
+        positions[cursor++] = source.positions[v + 1];
+        positions[cursor++] = source.positions[v + 2];
+      }
+    }
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute("position", new THREE.BufferAttribute(positions.subarray(0, cursor), 3));
+    geom.computeVertexNormals();
+    return geom;
+  }, [part, selection.triangles]);
+
+  useEffect(() => () => geometry?.dispose(), [geometry]);
+
+  if (!part || !geometry) return null;
+  return (
+    <group matrixAutoUpdate={false} matrix={part.worldMatrix}>
+      <mesh geometry={geometry} renderOrder={2}>
+        <meshBasicMaterial
+          color="#f59e0b"
+          transparent
+          opacity={0.75}
+          side={THREE.DoubleSide}
+          depthTest
+          polygonOffset
+          polygonOffsetFactor={-2}
+          polygonOffsetUnits={-2}
+          clippingPlanes={clippingPlanes}
+        />
+      </mesh>
+    </group>
+  );
+}
+
+/**
+ * Pans the orbit target onto a world point, keeping the current viewing
+ * direction and distance so the user does not lose their bearings.
+ */
+function CameraFocus({ target }: { target: { x: number; y: number; z: number } | null }) {
+  const camera = useThree((s) => s.camera);
+  const controls = useThree((s) => s.controls) as
+    | { target: THREE.Vector3; update: () => void }
+    | null;
+
+  useEffect(() => {
+    if (!target || !controls) return;
+    const next = new THREE.Vector3(target.x, target.y, target.z);
+    const offset = camera.position.clone().sub(controls.target);
+    controls.target.copy(next);
+    camera.position.copy(next).add(offset);
+    controls.update();
+  }, [target, controls, camera]);
+
+  return null;
 }
 
 export function SceneView(

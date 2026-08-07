@@ -10,6 +10,15 @@
  */
 
 import type { FontId, TextAlign } from "@/lib/geometry/types";
+import type { Modifier } from "@/lib/geometry/modifiers";
+import type { ParameterDefinition } from "@/lib/geometry/expression";
+import type { CalibrationSettings } from "@/lib/geometry/calibration";
+import type { PrinterProfile } from "@/types/profiles";
+
+// Re-exported so UI code can import the domain model from one place.
+export type { Modifier } from "@/lib/geometry/modifiers";
+export type { ParameterDefinition } from "@/lib/geometry/expression";
+export type { CalibrationSettings } from "@/lib/geometry/calibration";
 
 /** Schema version written into portable design files. */
 export const DESIGN_SCHEMA_VERSION = 3;
@@ -61,6 +70,8 @@ export type LayerType =
   | "svg"
   | "imageRelief"
   | "importedMesh"
+  | "primitive"
+  | "sketch"
   | "hole";
 
 /**
@@ -83,6 +94,29 @@ export interface BevelSettings {
 export interface LayerCommon {
   /** Stable unique id (never re-used within a document). */
   id: string;
+  /**
+   * Parent layer id, or null for a top-level layer. A child's transform is
+   * relative to its parent, so moving a group moves everything under it.
+   * Cycles are rejected by validation and broken defensively at build time.
+   */
+  parentId?: string | null;
+  /**
+   * Local-space point the layer rotates and scales around. Defaults to the
+   * layer's own origin. Without this, rotating a lid always spun it around
+   * the world origin rather than its hinge.
+   */
+  pivot?: { x: number; y: number; z: number };
+  /**
+   * Re-editable operations applied to this layer's body on every rebuild.
+   * See lib/geometry/modifiers.ts.
+   */
+  modifiers?: Modifier[];
+  /**
+   * Expressions bound to this layer's numeric fields, keyed by field name
+   * (e.g. `{ extrudeMm: "wall * 2" }`). An empty or invalid expression
+   * leaves the stored literal in place.
+   */
+  bindings?: Record<string, string>;
   type: LayerType;
   /** User-facing layer name (free text, usually Hebrew). */
   name: string;
@@ -90,6 +124,12 @@ export interface LayerCommon {
   locked: boolean;
   /** Id of the material slot used for preview + multi-part export colors. */
   materialSlotId: string;
+  /**
+   * Regions of this layer's body painted with a material other than the
+   * layer's own. See lib/geometry/painting.ts — the regions are separated
+   * into their own printable parts at export.
+   */
+  facePaint?: FacePaint[];
   transform: Transform3D;
   /** Preview-only opacity (1 = opaque). Never affects exported geometry. */
   previewOpacity: number;
@@ -205,6 +245,31 @@ export interface MeshProvenance {
   sourceLayerIds?: string[];
 }
 
+/**
+ * Per-face material assignment.
+ *
+ * Material was a per-LAYER property, so a two-colour print meant splitting
+ * the body into two layers by hand. Painting regions records the material per
+ * triangle instead, and the export pipeline separates the painted regions
+ * into their own parts.
+ */
+export interface FacePaint {
+  materialSlotId: string;
+  /** Triangle indices into the layer's BUILT body (localMesh order). */
+  triangles: number[];
+  /**
+   * Triangle count of the body the region was picked on. Indices only mean
+   * anything for that mesh, so paint recorded against a different one is
+   * discarded rather than applied to unrelated faces.
+   */
+  meshTriangleCount: number;
+  /**
+   * How deep the painted region reaches into the body when it is separated
+   * for a multi-material print (mm).
+   */
+  depthMm: number;
+}
+
 export interface ImportedMeshLayer extends LayerCommon {
   type: "importedMesh";
   /** Id of the mesh payload in the session mesh store. */
@@ -216,6 +281,107 @@ export interface ImportedMeshLayer extends LayerCommon {
    */
   originalMeshId: string | null;
   combine: CombineMode;
+}
+
+// ---------------------------------------------------------------------------
+// Primitive solids
+// ---------------------------------------------------------------------------
+
+export type PrimitiveKind =
+  | "box"
+  | "cylinder"
+  | "sphere"
+  | "cone"
+  | "torus"
+  | "wedge"
+  | "tube";
+
+/**
+ * A parametric primitive solid. Every kind is built from the same parameter
+ * set so the properties panel and the design-file validator stay simple; each
+ * kind documents which fields it reads and ignores the rest.
+ *
+ * All primitives are built centred on the local XY origin with z ∈ [0, height]
+ * (spheres and tori are centred on z = 0 and then dropped to sit on z = 0),
+ * matching the convention every other layer builder follows.
+ */
+export interface PrimitiveLayer extends LayerCommon {
+  type: "primitive";
+  kind: PrimitiveKind;
+  /** box, wedge: size along X. */
+  widthMm: number;
+  /** box, wedge: size along Y. */
+  depthMm: number;
+  /** box, wedge, cylinder, cone, tube: size along Z. */
+  heightMm: number;
+  /** cylinder/tube outer, sphere, cone bottom, torus major. */
+  radiusMm: number;
+  /** cone top, tube inner, torus minor. Ignored by the other kinds. */
+  radius2Mm: number;
+  /** Facets around the axis for curved kinds. */
+  segments: number;
+  combine: CombineMode;
+}
+
+// ---------------------------------------------------------------------------
+// Sketches
+// ---------------------------------------------------------------------------
+
+/**
+ * A 2D sketch entity, in millimetres, in the sketch layer's local XY plane.
+ * Entities are resolved together with the NonZero fill rule, so overlapping
+ * shapes merge and an opposite-wound shape cuts a hole — the same rule the
+ * kernel already applies to font glyphs and SVG artwork.
+ */
+export type SketchEntity =
+  | {
+      kind: "polyline";
+      points: [number, number][];
+      /** Open polylines are stroked to `strokeWidthMm`; closed ones are filled. */
+      closed: boolean;
+      strokeWidthMm: number;
+    }
+  | {
+      kind: "rectangle";
+      x: number;
+      y: number;
+      widthMm: number;
+      heightMm: number;
+      cornerRadiusMm: number;
+      rotationDeg: number;
+    }
+  | { kind: "circle"; x: number; y: number; radiusMm: number }
+  | {
+      kind: "ellipse";
+      x: number;
+      y: number;
+      radiusXMm: number;
+      radiusYMm: number;
+      rotationDeg: number;
+    }
+  | {
+      kind: "polygon";
+      x: number;
+      y: number;
+      radiusMm: number;
+      sides: number;
+      rotationDeg: number;
+    }
+  | {
+      /** A quadratic Bezier chain: [start, control, end, control, end, ...]. */
+      kind: "bezier";
+      points: [number, number][];
+      closed: boolean;
+      strokeWidthMm: number;
+    };
+
+/** A drawn 2D profile, extruded exactly like an imported SVG. */
+export interface SketchLayer extends LayerCommon {
+  type: "sketch";
+  entities: SketchEntity[];
+  extrudeMm: number;
+  combine: CombineMode;
+  bevel: BevelSettings;
 }
 
 /** A cylindrical cut. Direction is the layer's local +Z axis. */
@@ -233,6 +399,8 @@ export type DesignLayer =
   | SvgLayer
   | ImageReliefLayer
   | ImportedMeshLayer
+  | PrimitiveLayer
+  | SketchLayer
   | HoleLayer;
 
 /** Layers that produce a printable body of their own. */
@@ -263,6 +431,23 @@ export interface DesignDocument {
   usageProfileId: string | null;
   /** Template that seeded the document (display only). */
   templateId: string | null;
+  /**
+   * Named parameters driving expression-bound layer fields. Turns one
+   * document into a product family.
+   */
+  parameters?: ParameterDefinition[];
+  /**
+   * Measured printer behaviour: one calibrated clearance plus the hole and
+   * first-layer corrections. Every fit in the document derives from this, so
+   * calibrating once fixes connectors, inlays, enclosures and threads
+   * together.
+   */
+  calibration?: CalibrationSettings;
+  /**
+   * User-defined printers, stored in the document so a design carries the
+   * machine it was made for. Looked up before the built-in profiles.
+   */
+  customPrinters?: PrinterProfile[];
 }
 
 /** User-editable overrides on top of a printability profile. */
@@ -357,15 +542,39 @@ export interface SimplifySettings {
 // Measurements (editor-only, never exported into geometry)
 // ---------------------------------------------------------------------------
 
-export type MeasurementKind = "distance" | "distanceX" | "distanceY" | "distanceZ";
+export type MeasurementKind =
+  | "distance"
+  | "distanceX"
+  | "distanceY"
+  | "distanceZ"
+  /** Dihedral angle between the faces under two picked points. */
+  | "angle"
+  /** Radius of the circle through three picked points. */
+  | "radius"
+  /** Material thickness measured inward from one picked point. */
+  | "thickness";
 
 export interface Measurement {
   id: string;
   kind: MeasurementKind;
   a: { x: number; y: number; z: number };
   b: { x: number; y: number; z: number };
-  /** Computed value in mm. */
+  /** Third pick, used by "radius" only. */
+  c?: { x: number; y: number; z: number };
+  /** Computed value: mm for lengths, degrees for "angle". */
   valueMm: number;
+}
+
+/** How many points the user must pick for each measurement kind. */
+export function measurementPointCount(kind: MeasurementKind): number {
+  if (kind === "thickness") return 1;
+  if (kind === "radius") return 3;
+  return 2;
+}
+
+/** Unit suffix shown next to a measurement's value. */
+export function measurementUnit(kind: MeasurementKind): string {
+  return kind === "angle" ? "°" : "מ״מ";
 }
 
 // ---------------------------------------------------------------------------
@@ -474,12 +683,42 @@ export function isShapeLayer(layer: DesignLayer): layer is ShapeLayer {
 /** Layers that are live 2D-contour extrusions (support bevel + combine). */
 export function isContourLayer(
   layer: DesignLayer
-): layer is TextLayer | SvgLayer | ImageReliefLayer {
+): layer is TextLayer | SvgLayer | ImageReliefLayer | SketchLayer {
   return (
     layer.type === "text" ||
     layer.type === "svg" ||
+    layer.type === "sketch" ||
     (layer.type === "imageRelief" && layer.mode === "silhouette")
   );
+}
+
+/** Default parameters for a freshly created primitive of each kind. */
+export function defaultPrimitive(kind: PrimitiveKind): Omit<
+  PrimitiveLayer,
+  keyof LayerCommon | "type"
+> {
+  const base = {
+    kind,
+    widthMm: 20,
+    depthMm: 20,
+    heightMm: 20,
+    radiusMm: 10,
+    radius2Mm: 5,
+    segments: 64,
+    combine: "standalone" as CombineMode,
+  };
+  switch (kind) {
+    case "sphere":
+      return { ...base, segments: 48 };
+    case "torus":
+      return { ...base, radiusMm: 15, radius2Mm: 4, segments: 48 };
+    case "cone":
+      return { ...base, radius2Mm: 0 };
+    case "tube":
+      return { ...base, radiusMm: 10, radius2Mm: 7 };
+    default:
+      return base;
+  }
 }
 
 export function defaultBevel(): BevelSettings {

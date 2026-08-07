@@ -39,6 +39,15 @@ import {
   type MeshData,
 } from "./meshData";
 import { matrix4ToManifoldMat4, transformToMatrix4 } from "./transform";
+import { resolveParameters, resolveBinding } from "./expression";
+import {
+  clearanceForFit,
+  documentNozzleDiameterMm,
+  elephantFootInsetAtHeight,
+} from "./calibration";
+// Type-only in the other direction, so this is not a runtime cycle.
+import { hasStalePaint } from "./painting";
+import { applyModifiers } from "./modifiers";
 import {
   buildHoleCutter,
   buildInlayPocketCutter,
@@ -103,18 +112,68 @@ function isAnchoredToBase(document: DesignDocument, layer: DesignLayer): boolean
   return layer.combine !== "standalone";
 }
 
-/** World matrix of a layer, honouring base anchoring in withBase mode. */
+/**
+ * A layer's own transform, applied about its pivot.
+ *
+ * Without a pivot, rotation and scale always happen about the layer's
+ * origin — so rotating a lid spins it around the wrong point. Conjugating
+ * the transform by a translation to the pivot moves the centre of rotation
+ * without changing where the unrotated layer sits.
+ */
+function localMatrix(layer: DesignLayer): THREE.Matrix4 {
+  const pivot = layer.pivot;
+  if (!pivot || (pivot.x === 0 && pivot.y === 0 && pivot.z === 0)) {
+    return transformToMatrix4(layer.transform);
+  }
+  // The pivot must wrap the ROTATION AND SCALE only:
+  //   M = T · T(pivot) · R · S · T(-pivot)
+  // Putting both pivot translations after the fully composed T·R·S makes
+  // them cancel out, silently doing nothing.
+  const { x, y, z } = layer.transform;
+  const rotationScale = transformToMatrix4({ ...layer.transform, x: 0, y: 0, z: 0 });
+  const translation = new THREE.Matrix4().makeTranslation(x, y, z);
+  const toPivot = new THREE.Matrix4().makeTranslation(pivot.x, pivot.y, pivot.z);
+  const fromPivot = new THREE.Matrix4().makeTranslation(-pivot.x, -pivot.y, -pivot.z);
+  return translation.multiply(toPivot).multiply(rotationScale).multiply(fromPivot);
+}
+
+/**
+ * World matrix of a layer: its parent chain, then base anchoring, then its
+ * own pivot-aware transform.
+ *
+ * The parent walk is defensive about cycles. Validation rejects them, but a
+ * hand-edited or hostile design file could still contain one, and the build
+ * must not hang: the walk stops as soon as it revisits a layer.
+ */
 export function layerWorldMatrix(
   document: DesignDocument,
   layer: DesignLayer
 ): THREE.Matrix4 {
-  const own = transformToMatrix4(layer.transform);
-  if (!isAnchoredToBase(document, layer)) return own;
+  const own = localMatrix(layer);
+
+  let matrix = own;
+  if (layer.parentId) {
+    const byId = new Map(document.layers.map((l) => [l.id, l]));
+    const seen = new Set<string>([layer.id]);
+    const chain: DesignLayer[] = [];
+    let cursor = byId.get(layer.parentId);
+    while (cursor && !seen.has(cursor.id)) {
+      seen.add(cursor.id);
+      chain.push(cursor);
+      cursor = cursor.parentId ? byId.get(cursor.parentId) : undefined;
+    }
+    // Outermost ancestor first, so each multiplication nests inward.
+    for (let i = chain.length - 1; i >= 0; i--) {
+      matrix = localMatrix(chain[i]).multiply(matrix);
+    }
+  }
+
+  if (!isAnchoredToBase(document, layer)) return matrix;
   const base = findBaseLayer(document)!;
   const baseM = transformToMatrix4(base.transform);
   const anchorZ = layer.type === "hole" ? 0 : base.thicknessMm;
   const anchor = new THREE.Matrix4().makeTranslation(0, 0, anchorZ);
-  return baseM.multiply(anchor).multiply(own);
+  return baseM.multiply(anchor).multiply(matrix);
 }
 
 /** Effective combine mode of a shape layer under the document's base mode. */
@@ -130,10 +189,16 @@ export function effectiveCombineMode(
 
 /** Printing clearance used for inlay pockets, mm. */
 function inlayClearanceMm(document: DesignDocument): number {
-  return (
-    document.customPrintability?.clearanceMm ??
-    getPrintabilityProfile(document.printabilityProfileId).clearanceMm
-  );
+  // Precedence, most specific first. A calibrated machine beats the profile's
+  // guess — that is the whole point of measuring — but it must NOT beat a
+  // number the user typed into the printability panel: that field stays
+  // editable and kept accepting edits that did nothing.
+  const override = document.customPrintability?.clearanceMm;
+  if (override !== undefined) return override;
+  if (document.calibration) {
+    return clearanceForFit(document.calibration, "sliding");
+  }
+  return getPrintabilityProfile(document.printabilityProfileId).clearanceMm;
 }
 
 function issueForLayerFailure(layer: DesignLayer, err: unknown): ModelIssue {
@@ -152,11 +217,312 @@ function issueForLayerFailure(layer: DesignLayer, err: unknown): ModelIssue {
   };
 }
 
+/**
+ * Apply a layer's expression bindings to its numeric fields.
+ *
+ * Bindings live in a side table keyed by field name, so any numeric field
+ * can be driven by a parameter without every layer type growing a parallel
+ * "expression" property. A binding that does not evaluate leaves the stored
+ * literal alone — the document keeps building and the parameters panel shows
+ * the error.
+ */
+function resolveLayer<T extends ShapeLayer>(layer: T, parameters: ReadonlyMap<string, number>): T {
+  const bindings = layer.bindings;
+  if (!bindings) return layer;
+  const entries = Object.entries(bindings).filter(([, expr]) => expr && expr.trim());
+  if (entries.length === 0) return layer;
+
+  const patched = { ...layer } as T & Record<string, unknown>;
+  for (const [field, expression] of entries) {
+    const current = patched[field];
+    if (typeof current !== "number") continue;
+    const { value } = resolveBinding(expression, parameters, current);
+    patched[field] = value;
+  }
+  return patched as T;
+}
+
 interface PartBody {
   primary: ShapeLayer;
-  solid: Solid; // in the primary layer's local frame
+  /** In the primary layer's local frame. Reassigned by post-processing. */
+  solid: Solid;
   layerIds: string[];
   nameHe: string;
+}
+
+/** World-space bounds of a solid held in `worldMatrix`'s local frame. */
+function worldBoundsOf(solid: Solid, worldMatrix: THREE.Matrix4): THREE.Box3 {
+  const local = solid.boundingBox();
+  const box = new THREE.Box3(
+    new THREE.Vector3(local.min.x, local.min.y, local.min.z),
+    new THREE.Vector3(local.max.x, local.max.y, local.max.z)
+  );
+  return box.applyMatrix4(worldMatrix);
+}
+
+/**
+ * Move each near-vertical wall of the bottom slab inward, perpendicular to
+ * itself. Consumes `slab`; returns null when the result is not a valid solid.
+ *
+ * Contracting radially towards the part's centre — the obvious first
+ * implementation — is wrong in two ways that matter:
+ *
+ *  - **It closes holes.** A hole's wall lies on the far side of the centre
+ *    from itself, so pulling everything inward makes the bore SMALLER at the
+ *    bed. That is the exact opposite of the correction, and it fights
+ *    `holeCompensationMm`, the other half of the same feature. Offsetting
+ *    along each wall's own outward normal instead widens a bore and narrows
+ *    an outer wall, which is what the squashed first layer actually does.
+ *  - **It rounds corners.** A radial pull moves a corner by the compensation
+ *    along the diagonal, so each face lands short: 0.283 mm per axis for a
+ *    0.4 mm setting on a box. A corner vertex has to satisfy BOTH of its
+ *    walls' offset planes at once — a miter — which is a 2x2 solve.
+ *
+ * Only walls take part: a vertex whose faces are all horizontal (the bed
+ * face, the cut plane) has no in-plane direction to move along and stays put,
+ * which is what keeps the part flat on the plate and keeps the cut plane
+ * matching the untouched top half.
+ */
+function insetSlabWalls(
+  kernel: GeometryKernel,
+  slab: Solid,
+  calibration: NonNullable<DesignDocument["calibration"]>,
+  toWorld: THREE.Matrix4,
+  toLocal: THREE.Matrix4
+): Solid | null {
+  const mesh = slab.toMeshData();
+  slab.dispose();
+  const vertexCount = mesh.positions.length / 3;
+  const triangleCount = mesh.indices.length / 3;
+
+  // World-space copy: the bed is a world plane, and so is the offset.
+  const world = new Float64Array(mesh.positions.length);
+  const point = new THREE.Vector3();
+  for (let v = 0; v < vertexCount; v++) {
+    point
+      .set(mesh.positions[v * 3], mesh.positions[v * 3 + 1], mesh.positions[v * 3 + 2])
+      .applyMatrix4(toWorld);
+    world[v * 3] = point.x;
+    world[v * 3 + 1] = point.y;
+    world[v * 3 + 2] = point.z;
+  }
+
+  // Distinct wall directions per vertex. Distinct matters: a cylinder's
+  // vertex has two nearly-parallel facets and must not be mitered between
+  // them, while a box corner has two genuinely different walls and must.
+  const walls: number[][] = Array.from({ length: vertexCount }, () => []);
+  for (let t = 0; t < triangleCount; t++) {
+    const a = mesh.indices[t * 3] * 3;
+    const b = mesh.indices[t * 3 + 1] * 3;
+    const c = mesh.indices[t * 3 + 2] * 3;
+    const ux = world[b] - world[a];
+    const uy = world[b + 1] - world[a + 1];
+    const uz = world[b + 2] - world[a + 2];
+    const vx = world[c] - world[a];
+    const vy = world[c + 1] - world[a + 1];
+    const vz = world[c + 2] - world[a + 2];
+    const nz = ux * vy - uy * vx;
+    const nx = uy * vz - uz * vy;
+    const ny = uz * vx - ux * vz;
+    const horizontal = Math.hypot(nx, ny);
+    const length = Math.hypot(nx, ny, nz);
+    if (length < 1e-12) continue;
+    // Near-horizontal faces have no in-plane direction to offset along.
+    if (horizontal / length < 0.05) continue;
+    const dx = nx / horizontal;
+    const dy = ny / horizontal;
+    for (let k = 0; k < 3; k++) {
+      const list = walls[mesh.indices[t * 3 + k]];
+      let known = false;
+      for (let i = 0; i < list.length; i += 2) {
+        if (list[i] * dx + list[i + 1] * dy > 0.999) {
+          known = true;
+          break;
+        }
+      }
+      if (!known) list.push(dx, dy);
+    }
+  }
+
+  let moved = false;
+  for (let v = 0; v < vertexCount; v++) {
+    const inset = elephantFootInsetAtHeight(calibration, world[v * 3 + 2]);
+    if (inset <= 0) continue;
+    const list = walls[v];
+    if (list.length === 0) continue;
+
+    const px = world[v * 3];
+    const py = world[v * 3 + 1];
+    let targetX: number;
+    let targetY: number;
+
+    if (list.length === 2) {
+      targetX = px - list[0] * inset;
+      targetY = py - list[1] * inset;
+    } else {
+      // The two most divergent walls define the corner; a third would be
+      // over-determined, and the sharpest pair is the one that decides where
+      // the corner actually lands.
+      let bestI = 0;
+      let bestJ = 2;
+      let bestDot = Infinity;
+      for (let i = 0; i < list.length; i += 2) {
+        for (let j = i + 2; j < list.length; j += 2) {
+          const dot = list[i] * list[j] + list[i + 1] * list[j + 1];
+          if (dot < bestDot) {
+            bestDot = dot;
+            bestI = i;
+            bestJ = j;
+          }
+        }
+      }
+      const n1x = list[bestI];
+      const n1y = list[bestI + 1];
+      const n2x = list[bestJ];
+      const n2y = list[bestJ + 1];
+      const det = n1x * n2y - n1y * n2x;
+      if (Math.abs(det) < 0.02) {
+        // Effectively one wall (or a fold sharper than the miter can express).
+        targetX = px - n1x * inset;
+        targetY = py - n1y * inset;
+      } else {
+        const d1 = n1x * px + n1y * py - inset;
+        const d2 = n2x * px + n2y * py - inset;
+        targetX = (d1 * n2y - d2 * n1y) / det;
+        targetY = (n1x * d2 - n2x * d1) / det;
+      }
+    }
+
+    // A very sharp corner sends the miter off to infinity; clamping keeps a
+    // spike from turning the slab inside out.
+    const limit = inset * 4;
+    const dx = targetX - px;
+    const dy = targetY - py;
+    const distance = Math.hypot(dx, dy);
+    if (distance > limit && distance > 1e-12) {
+      targetX = px + (dx / distance) * limit;
+      targetY = py + (dy / distance) * limit;
+    }
+    world[v * 3] = targetX;
+    world[v * 3 + 1] = targetY;
+    moved = true;
+  }
+
+  if (!moved) {
+    const { solid: unchanged, status } = kernel.fromMeshData(mesh);
+    if (status !== "NoError") {
+      unchanged.dispose();
+      return null;
+    }
+    return unchanged;
+  }
+
+  for (let v = 0; v < vertexCount; v++) {
+    point.set(world[v * 3], world[v * 3 + 1], world[v * 3 + 2]).applyMatrix4(toLocal);
+    mesh.positions[v * 3] = point.x;
+    mesh.positions[v * 3 + 1] = point.y;
+    mesh.positions[v * 3 + 2] = point.z;
+  }
+  const { solid: inset, status } = kernel.fromMeshData(mesh);
+  if (status !== "NoError" || inset.isEmpty()) {
+    inset.dispose();
+    return null;
+  }
+  return inset;
+}
+
+/**
+ * Shrink the first layers of a part inward.
+ *
+ * "Elephant foot" is the bulge left when the nozzle squashes the opening
+ * layers against the bed: the part comes out oversized at its base and will
+ * not seat flush in a pocket or against a mating face. Insetting those layers
+ * in the MODEL cancels it, and doing it here — after the part is finished —
+ * means it applies to every part however it was built.
+ *
+ * Three things this has to get right, each of which was wrong in the first
+ * version:
+ *
+ *  1. **Only the affected band is touched.** Refining the whole part so the
+ *     warp has vertices to move took a 12-triangle cube to 65,292 triangles —
+ *     on every debounced rebuild. The part is instead SPLIT at the
+ *     compensation height and only the bottom slab is deformed.
+ *  2. **No refinement is needed at all.** The split guarantees vertices at
+ *     z = 0 and at the compensation height, and the inset fades linearly
+ *     between them, so linear interpolation across the side walls is already
+ *     exact. Refining only added triangles, never accuracy.
+ *  3. **The bed is a WORLD plane.** Reading the world height from the
+ *     matrix's translation alone ignored rotation, so a part stood on its
+ *     side got the correction on a vertical face in its middle — or, when it
+ *     was also lifted, no correction at all. Every vertex is now taken to
+ *     world space, inset there, and brought back.
+ *
+ * Never throws and never consumes `solid` on failure: the caller keeps a live
+ * handle either way.
+ */
+function applyElephantFoot(
+  kernel: GeometryKernel,
+  solid: Solid,
+  document: DesignDocument,
+  worldMatrix: THREE.Matrix4
+): { solid: Solid; failed: boolean } {
+  const calibration = document.calibration;
+  if (!calibration || calibration.elephantFootCompensationMm <= 0) {
+    return { solid, failed: false };
+  }
+  const height = Math.max(0.05, calibration.elephantFootHeightMm);
+
+  const worldBounds = worldBoundsOf(solid, worldMatrix);
+  // Nothing of this part is near the plate, so nothing is squashed.
+  if (worldBounds.min.z >= height) return { solid, failed: false };
+
+  const centreX = (worldBounds.min.x + worldBounds.max.x) / 2;
+  const centreY = (worldBounds.min.y + worldBounds.max.y) / 2;
+  const toWorld = worldMatrix;
+  const toLocal = worldMatrix.clone().invert();
+
+  // Work on a duplicate so a mid-way kernel failure cannot leave the caller
+  // holding a consumed handle — `refine`/`warp`/`split` all consume.
+  const working = solid.duplicate();
+  let bottom: Solid | null = null;
+  let top: Solid | null = null;
+  try {
+    // A world-space slab from below the part up to the compensation height,
+    // expressed in the part's own frame so it can cut the local solid.
+    const size = new THREE.Vector3();
+    worldBounds.getSize(size);
+    const pad = Math.max(size.x, size.y, 10) + 10;
+    const floor = worldBounds.min.z - 1;
+    const span = pad * 2;
+    const slab = kernel
+      .box(span, span, height - floor, false)
+      .translate(centreX - pad, centreY - pad, floor)
+      .transform(matrix4ToManifoldMat4(toLocal));
+    [bottom, top] = working.splitBySolid(slab);
+    if (bottom.isEmpty()) {
+      bottom.dispose();
+      top.dispose();
+      return { solid, failed: false };
+    }
+    const warped = insetSlabWalls(kernel, bottom, calibration, toWorld, toLocal);
+    bottom = null;
+    if (!warped) {
+      top.dispose();
+      return { solid, failed: true };
+    }
+    const merged = top.isEmpty() ? (top.dispose(), warped) : warped.union(top);
+    top = null;
+    if (merged.status() !== "NoError" || merged.isEmpty()) {
+      merged.dispose();
+      return { solid, failed: true };
+    }
+    solid.dispose();
+    return { solid: merged, failed: false };
+  } catch {
+    bottom?.dispose();
+    top?.dispose();
+    return { solid, failed: true };
+  }
 }
 
 function bodyToPart(document: DesignDocument, body: PartBody): PrintablePart {
@@ -216,6 +582,20 @@ export async function buildDocument(
   }
   const built: BuiltShape[] = [];
 
+  // Named parameters are resolved once per build and drive every
+  // expression-bound field.
+  const parameterTable = resolveParameters(document.parameters ?? []);
+  const parameters = parameterTable.values;
+  for (const [name, messageHe] of parameterTable.errors) {
+    issues.push({
+      code: "parameter/invalid",
+      severity: "warning",
+      titleHe: `הפרמטר "${name}" אינו תקין`,
+      detailHe: messageHe,
+      actionHe: "תקנו את הביטוי בלוח הפרמטרים",
+    });
+  }
+
   const visibleLayers = document.layers.filter((l) => l.visible);
   for (const layer of visibleLayers) {
     if (layer.type === "hole") {
@@ -226,8 +606,30 @@ export async function buildDocument(
     if (!isShapeLayer(layer)) continue;
     const effectiveCombine = effectiveCombineMode(document, layer);
     try {
-      const solid = await buildShapeLayerSolid(kernel, layer, effectiveCombine);
-      if (solid) built.push({ layer, solid, effectiveCombine });
+      const solid = await buildShapeLayerSolid(kernel, resolveLayer(layer, parameters), effectiveCombine);
+      if (!solid) continue;
+      // Apply the re-editable modifier stack. Failures are reported as
+      // issues but never abort the build: the document is rebuilt on every
+      // keystroke, and a momentarily invalid parameter should surface a
+      // message rather than blank the viewport.
+      const stack = layer.modifiers ?? [];
+      if (stack.length === 0) {
+        built.push({ layer, solid, effectiveCombine });
+        continue;
+      }
+      const applied = applyModifiers(kernel, solid, stack, {
+        nozzleDiameterMm: documentNozzleDiameterMm(document),
+      });
+      for (const errorHe of applied.errorsHe) {
+        issues.push({
+          code: "modifier/failed",
+          severity: "warning",
+          titleHe: `מודיפייר בשכבה "${layer.name}" נכשל`,
+          detailHe: errorHe,
+          actionHe: "שנו את הפרמטרים של המודיפייר או כבו אותו",
+        });
+      }
+      built.push({ layer, solid: applied.solid, effectiveCombine });
     } catch (err) {
       issues.push(issueForLayerFailure(layer, err));
     }
@@ -338,7 +740,39 @@ export async function buildDocument(
 
   const parts: PrintablePart[] = [];
   for (const body of bodies) {
+    // First-layer compensation is applied to the finished body, so it covers
+    // every part regardless of how it was built.
+    if (document.calibration && document.calibration.elephantFootCompensationMm > 0) {
+      const compensated = applyElephantFoot(
+        kernel,
+        body.solid,
+        document,
+        layerWorldMatrix(document, body.primary)
+      );
+      body.solid = compensated.solid;
+      if (compensated.failed) {
+        issues.push({
+          code: "calibration/elephant-foot-failed",
+          severity: "warning",
+          titleHe: `פיצוי ״רגל פיל״ נכשל בחלק "${body.nameHe}"`,
+          detailHe: "החלק נבנה ללא הפיצוי. נסו ערך פיצוי קטן יותר.",
+        });
+      }
+    }
     const part = bodyToPart(document, body);
+    // Painted regions are recorded against a specific body. Say so here, at
+    // the point the mismatch becomes real, rather than leaving the user to
+    // discover the missing colour when the ZIP comes out single-coloured.
+    if (hasStalePaint(body.primary.facePaint, part.stats.triangleCount)) {
+      issues.push({
+        code: "paint/stale",
+        severity: "warning",
+        titleHe: `הצביעה בשכבה "${body.primary.name}" בוטלה`,
+        detailHe:
+          "הגוף השתנה מאז שנצבע, ולכן סימוני הצבע כבר אינם מתאימים לפאות שלו.",
+        actionHe: "צבעו את האזורים מחדש במצב בחירת פאות",
+      });
+    }
     body.solid.dispose();
     if (part.stats.triangleCount > 0) {
       parts.push(part);
@@ -394,7 +828,7 @@ function applyHoles(
     for (const body of bodies) {
       const bodyWorldInv = layerWorldMatrix(document, body.primary).invert();
       const local = bodyWorldInv.multiply(holeWorld);
-      const cutter = buildHoleCutter(kernel, hole, span * 3).transform(
+      const cutter = buildHoleCutter(kernel, hole, span * 3, document.calibration).transform(
         matrix4ToManifoldMat4(local)
       );
       body.solid = body.solid.subtract(cutter);

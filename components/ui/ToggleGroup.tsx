@@ -21,13 +21,26 @@ export function ToggleGroup<T extends string>({
 }: ToggleGroupProps<T>) {
   return (
     <div className="flex items-center justify-between gap-2 text-sm">
-      <span className="text-slate-600">{label}</span>
-      <div className="flex overflow-hidden rounded-md border border-slate-300">
+      <span className="text-slate-600" id={`toggle-${label}`}>
+        {label}
+      </span>
+      {/*
+        A segmented control is semantically a radio group: exactly one option
+        is active. Rendering it as loose buttons left screen-reader users with
+        no way to tell which one was selected.
+      */}
+      <div
+        role="radiogroup"
+        aria-labelledby={`toggle-${label}`}
+        className="flex overflow-hidden rounded-md border border-slate-300"
+      >
         {options.map((option) => (
           <button
             key={option.value}
             type="button"
-            className={`px-3 py-1 text-sm transition-colors ${
+            role="radio"
+            aria-checked={option.value === value}
+            className={`px-3 py-1 text-sm transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-500 ${
               option.value === value
                 ? "bg-blue-600 text-white"
                 : "bg-white text-slate-600 hover:bg-slate-100"

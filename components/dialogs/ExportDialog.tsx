@@ -58,6 +58,17 @@ export function ExportDialog({
     [issues, parts]
   );
 
+  // Paint only survives the formats that can carry more than one material.
+  // Saying nothing here shipped a single-colour file to someone who had just
+  // watched the viewport show two.
+  const hasPaint = useMemo(
+    () =>
+      document.layers.some((layer) =>
+        (layer.facePaint ?? []).some((p) => p.triangles.length > 0)
+      ),
+    [document.layers]
+  );
+
   const geometryBlocked =
     kind !== "design" && (!buildOk || !allWatertight || criticalIssues.length > 0 || parts.length === 0);
   const needsAck = kind !== "design" && warningIssues.length > 0;
@@ -109,6 +120,12 @@ export function ExportDialog({
 
       <fieldset className="flex flex-col gap-1 text-sm">
         <legend className="mb-1 text-xs font-bold text-slate-500">סוג ייצוא</legend>
+        {hasPaint && kind === "stl" && (
+          <p className="mb-1 rounded-md bg-amber-50 p-2 text-[11px] leading-snug text-amber-800">
+            בעיצוב יש אזורים צבועים. קובץ STL יחיד אינו נושא חומרים, ולכן הם
+            <b> לא יופרדו</b>. בחרו ZIP או 3MF כדי לשמור את הצבעים.
+          </p>
+        )}
         <label className="flex items-center gap-2">
           <input type="radio" checked={kind === "stl"} onChange={() => setKind("stl")} />
           <span>

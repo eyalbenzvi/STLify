@@ -13,15 +13,28 @@
 
 import type {
   BaseMode,
+  CalibrationSettings,
   DesignDocument,
   DesignLayer,
+  FacePaint,
   MaterialSlot,
   PortableDesignFile,
   PortableMesh,
+  PrimitiveKind,
+  SketchEntity,
   StoredContour,
   Transform3D,
 } from "@/types/design";
-import { DESIGN_SCHEMA_VERSION, identityTransform, newId } from "@/types/design";
+import {
+  DESIGN_SCHEMA_VERSION,
+  defaultPrimitive,
+  identityTransform,
+  newId,
+} from "@/types/design";
+import { PRINTER_PROFILES, type PrinterProfile } from "@/types/profiles";
+import type { Modifier, ModifierKind } from "@/lib/geometry/modifiers";
+import { defaultModifier } from "@/lib/geometry/modifiers";
+import type { ParameterDefinition } from "@/lib/geometry/expression";
 import { decodeMeshData, encodeMeshData } from "@/lib/geometry/meshData";
 import { getMesh, storeMesh } from "@/lib/geometry/meshStore";
 
@@ -31,6 +44,9 @@ const APP_VERSION = "3.0.0";
 const MAX_MESH_BYTES = 120 * 1024 * 1024;
 /** Warn when embedded meshes exceed this many triangles in total. */
 const WARN_TOTAL_TRIANGLES = 800_000;
+/** Cap on painted-region bookkeeping in one file. */
+const MAX_PAINT_REGIONS = 16;
+const MAX_PAINT_TRIANGLES = 2_000_000;
 
 export class DesignFileError extends Error {
   constructor(readonly messageHe: string) {
@@ -149,6 +165,192 @@ function sanitizeContours(value: unknown): StoredContour[] {
   return contours;
 }
 
+/** A positive linear dimension, bounded to something a printer could make. */
+function clampSize(value: unknown, fallback: number): number {
+  const n = finiteNumber(value, fallback);
+  return Math.max(0.001, Math.min(n, 5000));
+}
+
+/** Cap on total sketch points, mirroring the contour limit. */
+const MAX_SKETCH_POINTS = 100_000;
+
+function sanitizeSketchPoints(value: unknown): [number, number][] {
+  if (!Array.isArray(value)) return [];
+  const points: [number, number][] = [];
+  for (const raw of value) {
+    if (!Array.isArray(raw) || raw.length < 2) continue;
+    const x = Number(raw[0]);
+    const y = Number(raw[1]);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    points.push([x, y]);
+    if (points.length > MAX_SKETCH_POINTS) break;
+  }
+  return points;
+}
+
+function sanitizeSketchEntities(value: unknown, warningsHe: string[]): SketchEntity[] {
+  if (!Array.isArray(value)) return [];
+  const entities: SketchEntity[] = [];
+  let skipped = 0;
+  for (const raw of value) {
+    if (!isRecord(raw)) {
+      skipped++;
+      continue;
+    }
+    switch (raw.kind) {
+      case "polyline":
+      case "bezier": {
+        const points = sanitizeSketchPoints(raw.points);
+        if (points.length < 2) {
+          skipped++;
+          continue;
+        }
+        entities.push({
+          kind: raw.kind,
+          points,
+          closed: raw.closed === true,
+          strokeWidthMm: Math.max(0.01, Math.min(finiteNumber(raw.strokeWidthMm, 1), 100)),
+        });
+        break;
+      }
+      case "rectangle":
+        entities.push({
+          kind: "rectangle",
+          x: finiteNumber(raw.x, 0),
+          y: finiteNumber(raw.y, 0),
+          widthMm: clampSize(raw.widthMm, 20),
+          heightMm: clampSize(raw.heightMm, 20),
+          cornerRadiusMm: Math.max(0, Math.min(finiteNumber(raw.cornerRadiusMm, 0), 5000)),
+          rotationDeg: finiteNumber(raw.rotationDeg, 0),
+        });
+        break;
+      case "circle":
+        entities.push({
+          kind: "circle",
+          x: finiteNumber(raw.x, 0),
+          y: finiteNumber(raw.y, 0),
+          radiusMm: clampSize(raw.radiusMm, 10),
+        });
+        break;
+      case "ellipse":
+        entities.push({
+          kind: "ellipse",
+          x: finiteNumber(raw.x, 0),
+          y: finiteNumber(raw.y, 0),
+          radiusXMm: clampSize(raw.radiusXMm, 10),
+          radiusYMm: clampSize(raw.radiusYMm, 6),
+          rotationDeg: finiteNumber(raw.rotationDeg, 0),
+        });
+        break;
+      case "polygon":
+        entities.push({
+          kind: "polygon",
+          x: finiteNumber(raw.x, 0),
+          y: finiteNumber(raw.y, 0),
+          radiusMm: clampSize(raw.radiusMm, 10),
+          sides: Math.max(3, Math.min(Math.round(finiteNumber(raw.sides, 6)), 256)),
+          rotationDeg: finiteNumber(raw.rotationDeg, 0),
+        });
+        break;
+      default:
+        skipped++;
+    }
+  }
+  if (skipped > 0) warningsHe.push(`${skipped} ישויות סקיצה לא מוכרות דולגו`);
+  return entities;
+}
+
+function sanitizePivot(value: unknown): { x: number; y: number; z: number } {
+  if (!isRecord(value)) return { x: 0, y: 0, z: 0 };
+  return {
+    x: finiteNumber(value.x, 0),
+    y: finiteNumber(value.y, 0),
+    z: finiteNumber(value.z, 0),
+  };
+}
+
+/** Expressions are plain strings; they are parsed, never executed. */
+function sanitizeBindings(value: unknown): Record<string, string> {
+  if (!isRecord(value)) return {};
+  const out: Record<string, string> = {};
+  let count = 0;
+  for (const [field, expression] of Object.entries(value)) {
+    if (typeof expression !== "string") continue;
+    if (count++ >= 64) break;
+    out[boundedString(field, "", 64)] = boundedString(expression, "", 256);
+  }
+  return out;
+}
+
+const MODIFIER_KINDS = new Set<ModifierKind>([
+  "fillet",
+  "shell",
+  "twist",
+  "taper",
+  "bend",
+  "stretch",
+  "lattice",
+  "remesh",
+  "simplify",
+  "smooth",
+]);
+
+function sanitizeModifiers(value: unknown): Modifier[] {
+  if (!Array.isArray(value)) return [];
+  const out: Modifier[] = [];
+  for (const raw of value) {
+    if (!isRecord(raw)) continue;
+    const kind = String(raw.kind) as ModifierKind;
+    if (!MODIFIER_KINDS.has(kind)) continue;
+    if (out.length >= 32) break;
+    // Start from the defaults, then overwrite with whatever the file
+    // supplied — an unknown or missing field keeps a usable value instead of
+    // producing NaN geometry.
+    const base = defaultModifier(kind, newId("mod")) as Modifier & Record<string, unknown>;
+    base.enabled = raw.enabled !== false;
+    for (const [field, current] of Object.entries(base)) {
+      if (field === "id" || field === "kind" || field === "enabled") continue;
+      const incoming = raw[field];
+      if (typeof current === "number" && typeof incoming === "number") {
+        base[field] = finiteNumber(incoming, current);
+      } else if (typeof current === "string" && typeof incoming === "string") {
+        base[field] = boundedString(incoming, current, 32);
+      }
+    }
+    out.push(base);
+  }
+  return out;
+}
+
+function sanitizeParameters(value: unknown, warningsHe: string[]): ParameterDefinition[] {
+  if (!Array.isArray(value)) return [];
+  const out: ParameterDefinition[] = [];
+  const seen = new Set<string>();
+  let skipped = 0;
+  for (const raw of value) {
+    if (!isRecord(raw) || typeof raw.name !== "string") {
+      skipped++;
+      continue;
+    }
+    const name = boundedString(raw.name, "", 64).trim();
+    // Names must be usable as identifiers in an expression.
+    if (!/^[A-Za-z_\u0590-\u05FF][A-Za-z0-9_\u0590-\u05FF]*$/.test(name) || seen.has(name)) {
+      skipped++;
+      continue;
+    }
+    seen.add(name);
+    out.push({
+      name,
+      value: finiteNumber(raw.value, 0),
+      expression: boundedString(raw.expression, "", 256),
+      noteHe: boundedString(raw.noteHe, "", 200),
+    });
+    if (out.length >= 128) break;
+  }
+  if (skipped > 0) warningsHe.push(`${skipped} פרמטרים לא תקינים דולגו`);
+  return out;
+}
+
 function sanitizeBevel(value: unknown): { enabled: boolean; sizeMm: number; segments: number } {
   if (!isRecord(value)) return { enabled: false, sizeMm: 0.6, segments: 4 };
   return {
@@ -158,7 +360,25 @@ function sanitizeBevel(value: unknown): { enabled: boolean; sizeMm: number; segm
   };
 }
 
-const LAYER_TYPES = new Set(["base", "text", "svg", "imageRelief", "importedMesh", "hole"]);
+const LAYER_TYPES = new Set([
+  "base",
+  "text",
+  "svg",
+  "imageRelief",
+  "importedMesh",
+  "primitive",
+  "sketch",
+  "hole",
+]);
+const PRIMITIVE_KINDS = new Set([
+  "box",
+  "cylinder",
+  "sphere",
+  "cone",
+  "torus",
+  "wedge",
+  "tube",
+]);
 const COMBINE_MODES = new Set(["raised", "engraved", "inlay", "standalone"]);
 const FONT_IDS = new Set(["alef", "davidLibre", "suezOne", "varelaRound"]);
 
@@ -173,12 +393,20 @@ function sanitizeLayer(
   }
   const common = {
     id: newId("layer"),
+    // parentId is remapped after ALL layers are sanitized: ids are freshly
+    // generated here, so the original parent reference is meaningless until
+    // the whole id map exists. sanitizeDocument does the second pass.
+    parentId: typeof raw.parentId === "string" ? raw.parentId : null,
+    pivot: sanitizePivot(raw.pivot),
+    modifiers: sanitizeModifiers(raw.modifiers),
+    bindings: sanitizeBindings(raw.bindings),
     name: boundedString(raw.name, "שכבה", 120),
     visible: raw.visible !== false,
     locked: raw.locked === true,
     materialSlotId: boundedString(raw.materialSlotId, "slot1", 40),
     transform: sanitizeTransform(raw.transform),
     previewOpacity: Math.max(0.05, Math.min(finiteNumber(raw.previewOpacity, 1), 1)),
+    facePaint: sanitizeFacePaint(raw.facePaint),
   };
   const combine = COMBINE_MODES.has(String(raw.combine))
     ? (String(raw.combine) as "raised" | "engraved" | "inlay" | "standalone")
@@ -289,6 +517,33 @@ function sanitizeLayer(
         combine,
       };
     }
+    case "primitive": {
+      const kind = PRIMITIVE_KINDS.has(String(raw.kind))
+        ? (String(raw.kind) as PrimitiveKind)
+        : "box";
+      const defaults = defaultPrimitive(kind);
+      return {
+        ...common,
+        type: "primitive",
+        kind,
+        widthMm: clampSize(raw.widthMm, defaults.widthMm),
+        depthMm: clampSize(raw.depthMm, defaults.depthMm),
+        heightMm: clampSize(raw.heightMm, defaults.heightMm),
+        radiusMm: clampSize(raw.radiusMm, defaults.radiusMm),
+        radius2Mm: Math.max(0, Math.min(finiteNumber(raw.radius2Mm, defaults.radius2Mm), 5000)),
+        segments: Math.max(3, Math.min(Math.round(finiteNumber(raw.segments, defaults.segments)), 256)),
+        combine,
+      };
+    }
+    case "sketch":
+      return {
+        ...common,
+        type: "sketch",
+        entities: sanitizeSketchEntities(raw.entities, warningsHe),
+        extrudeMm: finiteNumber(raw.extrudeMm, 3),
+        combine,
+        bevel: sanitizeBevel(raw.bevel),
+      };
     case "hole":
       return {
         ...common,
@@ -300,6 +555,124 @@ function sanitizeLayer(
     default:
       return null;
   }
+}
+
+/**
+ * Painted regions.
+ *
+ * Every entry carries the triangle count of the body it was painted on, so a
+ * file whose geometry no longer matches simply loses the paint at build time
+ * rather than colouring random faces. Malformed indices are dropped here;
+ * indices that merely point past the body are handled later, by the same
+ * fingerprint check.
+ */
+function sanitizeFacePaint(value: unknown): FacePaint[] | undefined {
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  // One entry per slot, merged: two entries naming the same material would
+  // cut the body twice at export and collide as React keys in the overlay.
+  const bySlot = new Map<string, FacePaint>();
+  let totalIndices = 0;
+  for (const raw of value.slice(0, MAX_PAINT_REGIONS)) {
+    if (!isRecord(raw) || !Array.isArray(raw.triangles)) continue;
+    const meshTriangleCount = Math.max(
+      0,
+      Math.round(finiteNumber(raw.meshTriangleCount, 0))
+    );
+    // Without a fingerprint the indices cannot be checked against anything,
+    // and an absurd one is a way to smuggle in a huge allocation.
+    if (meshTriangleCount === 0 || meshTriangleCount > MAX_PAINT_TRIANGLES) continue;
+    const slotId = boundedString(raw.materialSlotId, "slot1", 40);
+    const entry = bySlot.get(slotId);
+    const seen = new Set<number>(entry?.triangles ?? []);
+    const triangles: number[] = entry ? [...entry.triangles] : [];
+    for (const value of raw.triangles) {
+      const index = typeof value === "number" ? Math.round(value) : NaN;
+      if (!Number.isFinite(index) || index < 0 || index >= meshTriangleCount) continue;
+      if (seen.has(index)) continue;
+      if (++totalIndices > MAX_PAINT_TRIANGLES) {
+        throw new DesignFileError("קובץ העיצוב מכיל כמות חריגה של סימוני צבע");
+      }
+      seen.add(index);
+      triangles.push(index);
+    }
+    if (triangles.length === 0) continue;
+    const depthMm = Math.max(0.05, Math.min(finiteNumber(raw.depthMm, 0.8), 100));
+    bySlot.set(slotId, {
+      materialSlotId: slotId,
+      triangles: triangles.sort((a, b) => a - b),
+      meshTriangleCount,
+      depthMm: entry ? Math.max(entry.depthMm, depthMm) : depthMm,
+    });
+  }
+  return bySlot.size > 0 ? [...bySlot.values()] : undefined;
+}
+
+/** Measured printer behaviour. Absent means "not calibrated", not "zero". */
+function sanitizeCalibration(value: unknown): CalibrationSettings | undefined {
+  if (!isRecord(value)) return undefined;
+  // An empty object must NOT materialise a calibration: doing so silently
+  // switches the feature on at its defaults, and a calibrated document
+  // enlarges every hole cutter. Absence has to survive the round trip.
+  const known = [
+    "measuredClearanceMm",
+    "holeCompensationMm",
+    "elephantFootCompensationMm",
+    "elephantFootHeightMm",
+  ];
+  if (!known.some((key) => typeof value[key] === "number")) return undefined;
+  return {
+    measuredClearanceMm: Math.max(0, Math.min(finiteNumber(value.measuredClearanceMm, 0.2), 5)),
+    holeCompensationMm: Math.max(0, Math.min(finiteNumber(value.holeCompensationMm, 0), 5)),
+    elephantFootCompensationMm: Math.max(
+      0,
+      Math.min(finiteNumber(value.elephantFootCompensationMm, 0), 5)
+    ),
+    elephantFootHeightMm: Math.max(
+      0.05,
+      Math.min(finiteNumber(value.elephantFootHeightMm, 0.6), 20)
+    ),
+  };
+}
+
+/**
+ * User-defined printers. They travel inside the design so a file opened on
+ * another machine still checks against the machine it was made for.
+ */
+function sanitizeCustomPrinters(value: unknown): PrinterProfile[] | undefined {
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  const out: PrinterProfile[] = [];
+  const taken = new Set(PRINTER_PROFILES.map((p) => p.id));
+  for (const raw of value.slice(0, 20)) {
+    if (!isRecord(raw)) continue;
+    const volume = isRecord(raw.buildVolumeMm) ? raw.buildVolumeMm : {};
+    // Custom printers are looked up BEFORE the built-ins, so a file claiming
+    // id "genericFdm220" would quietly redefine a stock profile — including
+    // shrinking its build volume to nothing.
+    let id = boundedString(raw.id, `custom_${out.length + 1}`, 60);
+    while (taken.has(id)) id = `custom_${id}`;
+    taken.add(id);
+    out.push({
+      id,
+      nameHe: boundedString(raw.nameHe, `מדפסת ${out.length + 1}`, 80),
+      technology: raw.technology === "sla" ? "sla" : "fdm",
+      buildVolumeMm: {
+        x: Math.max(1, Math.min(finiteNumber(volume.x, 220), 5000)),
+        y: Math.max(1, Math.min(finiteNumber(volume.y, 220), 5000)),
+        z: Math.max(1, Math.min(finiteNumber(volume.z, 250), 5000)),
+      },
+      // A resin printer has no nozzle, and clamping null to 0.4 made the
+      // lattice check warn about extrusion width on an SLA machine.
+      nozzleDiameterMm:
+        raw.technology === "sla" && raw.nozzleDiameterMm == null
+          ? null
+          : Math.max(0.05, Math.min(finiteNumber(raw.nozzleDiameterMm, 0.4), 5)),
+      defaultLayerHeightMm: Math.max(
+        0.01,
+        Math.min(finiteNumber(raw.defaultLayerHeightMm, 0.2), 2)
+      ),
+    });
+  }
+  return out.length > 0 ? out : undefined;
 }
 
 function sanitizeMaterialSlots(value: unknown): MaterialSlot[] {
@@ -397,9 +770,48 @@ export function importDesignFile(jsonText: string): DesignFileImportResult {
     throw new DesignFileError("קובץ העיצוב מכיל יותר מדי שכבות (מקסימום 200)");
   }
   const layers: DesignLayer[] = [];
+  /** Original file id -> the fresh id we generated for it. */
+  const layerIdMap = new Map<string, string>();
   for (const rawLayer of rawLayers) {
     const layer = sanitizeLayer(rawLayer, meshIdMap, warningsHe);
-    if (layer) layers.push(layer);
+    if (!layer) continue;
+    if (isRecord(rawLayer) && typeof rawLayer.id === "string") {
+      layerIdMap.set(rawLayer.id, layer.id);
+    }
+    layers.push(layer);
+  }
+
+  // Second pass: remap parent references onto the freshly generated ids, and
+  // drop any that dangle or form a cycle. A cycle would make the world-matrix
+  // walk loop, so it is refused here rather than defended against forever.
+  const idsInDocument = new Set(layers.map((l) => l.id));
+  let droppedParents = 0;
+  for (const layer of layers) {
+    if (!layer.parentId) continue;
+    const mapped = layerIdMap.get(layer.parentId);
+    if (!mapped || !idsInDocument.has(mapped) || mapped === layer.id) {
+      layer.parentId = null;
+      droppedParents++;
+      continue;
+    }
+    layer.parentId = mapped;
+  }
+  const byId = new Map(layers.map((l) => [l.id, l]));
+  for (const layer of layers) {
+    const seen = new Set<string>([layer.id]);
+    let cursor = layer.parentId ? byId.get(layer.parentId) : undefined;
+    while (cursor) {
+      if (seen.has(cursor.id)) {
+        layer.parentId = null;
+        droppedParents++;
+        break;
+      }
+      seen.add(cursor.id);
+      cursor = cursor.parentId ? byId.get(cursor.parentId) : undefined;
+    }
+  }
+  if (droppedParents > 0) {
+    warningsHe.push(`${droppedParents} קישורי הורה לא תקינים נותקו`);
   }
 
   const baseMode: BaseMode = rawDoc.baseMode === "withBase" ? "withBase" : "baseless";
@@ -445,6 +857,9 @@ export function importDesignFile(jsonText: string): DesignFileImportResult {
       typeof rawDoc.templateId === "string"
         ? boundedString(rawDoc.templateId, "", 60) || null
         : null,
+    parameters: sanitizeParameters(rawDoc.parameters, warningsHe),
+    calibration: sanitizeCalibration(rawDoc.calibration),
+    customPrinters: sanitizeCustomPrinters(rawDoc.customPrinters),
   };
 
   if (document.layers.length === 0) {

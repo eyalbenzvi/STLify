@@ -26,3 +26,5 @@ next-env.d.ts
 
 # tests
 /coverage
+/test-results
+/playwright-report

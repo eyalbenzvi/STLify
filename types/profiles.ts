@@ -52,6 +52,37 @@ export interface UsageProfile {
   warningsHe: string[];
 }
 
+/**
+ * Build a user-defined printer profile.
+ *
+ * The four built-ins covered common machines and nothing else, so anyone with
+ * a different build volume had to pick the nearest wrong one and mentally
+ * correct every fit-to-volume check.
+ */
+export function makeCustomPrinter(input: {
+  id: string;
+  nameHe: string;
+  technology?: "fdm" | "sla";
+  buildVolumeMm: { x: number; y: number; z: number };
+  nozzleDiameterMm?: number | null;
+  defaultLayerHeightMm?: number;
+}): PrinterProfile {
+  const technology = input.technology ?? "fdm";
+  return {
+    id: input.id,
+    nameHe: input.nameHe,
+    technology,
+    buildVolumeMm: {
+      x: Math.max(1, input.buildVolumeMm.x),
+      y: Math.max(1, input.buildVolumeMm.y),
+      z: Math.max(1, input.buildVolumeMm.z),
+    },
+    nozzleDiameterMm:
+      technology === "sla" ? null : Math.max(0.05, input.nozzleDiameterMm ?? 0.4),
+    defaultLayerHeightMm: Math.max(0.01, input.defaultLayerHeightMm ?? (technology === "sla" ? 0.05 : 0.2)),
+  };
+}
+
 export const PRINTER_PROFILES: PrinterProfile[] = [
   {
     id: "genericFdm220",
@@ -239,8 +270,21 @@ export const USAGE_PROFILES: UsageProfile[] = [
   },
 ];
 
-export function getPrinterProfile(id: string): PrinterProfile {
-  return PRINTER_PROFILES.find((p) => p.id === id) ?? PRINTER_PROFILES[0];
+/**
+ * Resolve a printer id, checking the document's own machines first.
+ *
+ * A design carries the printer it was made for, so a shared file opens with
+ * the right build volume even on a machine that has never seen that profile.
+ */
+export function getPrinterProfile(
+  id: string,
+  customPrinters: readonly PrinterProfile[] = []
+): PrinterProfile {
+  return (
+    customPrinters.find((p) => p.id === id) ??
+    PRINTER_PROFILES.find((p) => p.id === id) ??
+    PRINTER_PROFILES[0]
+  );
 }
 
 export function getPrintabilityProfile(id: string): PrintabilityProfile {

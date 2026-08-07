@@ -30,14 +30,19 @@ import type {
   SmoothSettings,
   Transform3D,
 } from "@/types/design";
-import { isShapeLayer, newId } from "@/types/design";
-import { getPrintabilityProfile, getPrinterProfile, MATERIAL_PROFILES, USAGE_PROFILES } from "@/types/profiles";
+import { defaultPrimitive, isShapeLayer, newId, type PrimitiveKind } from "@/types/design";
+import {
+  getPrintabilityProfile,
+  getPrinterProfile,
+  MATERIAL_PROFILES,
+  USAGE_PROFILES,
+  type PrinterProfile,
+} from "@/types/profiles";
 import { useDocumentBuilder, type BuiltPart } from "@/hooks/useDocumentBuilder";
 import { createTemplateDocument, makeBaseLayer, makeHoleLayer, makeTextLayer, PRODUCT_TEMPLATES } from "@/lib/geometry/documentTemplates";
 import { getGeometryKernel } from "@/lib/geometry/kernel";
-import { meshDataBounds, transformMeshData } from "@/lib/geometry/meshData";
+import { meshDataBounds } from "@/lib/geometry/meshData";
 import { getMesh, storeMesh } from "@/lib/geometry/meshStore";
-import { matrix4ToTransform, transformToMatrix4 } from "@/lib/geometry/transform";
 import { performBoolean } from "@/lib/geometry/operations/booleans";
 import { performPlaneCut, splitDisconnectedParts } from "@/lib/geometry/operations/cut";
 import { addConnectors } from "@/lib/geometry/operations/connectors";
@@ -57,40 +62,60 @@ import {
   snapToObjectCenter,
   snapToObjectEdge,
 } from "@/lib/geometry/operations/placement";
+import type { OrientationCandidate } from "@/lib/geometry/analysis";
+import type { DetailedEstimateResult } from "@/lib/geometry/analysis/estimateDetailed";
 import { attemptMeshRepair } from "@/lib/geometry/repair/repair";
+import { StlImportError } from "@/lib/import/stl";
+import { SvgImportError } from "@/lib/import/svg";
+import { IMAGE_INPUT_ACCEPT, ImageImportError } from "@/lib/import/image";
+import type {
+  MeshDiagnosis,
+  MeshRepairReport,
+  RepairOptions,
+} from "@/lib/geometry/repair/diagnose";
 import {
-  analyzeBuildVolume,
-  analyzeContact,
-  analyzeFloatingParts,
-  analyzeOverhangs,
-  analyzeThickness,
-  overhangToVertexColors,
-  suggestOrientations,
-  thicknessToVertexColors,
-  type OrientationCandidate,
-} from "@/lib/geometry/analysis";
-import { estimateDetailed, type DetailedEstimateResult } from "@/lib/geometry/analysis/estimateDetailed";
-import { parseStl, StlImportError, summarizeStlMesh } from "@/lib/import/stl";
-import { parseSvgToContours, SvgImportError } from "@/lib/import/svg";
-import { sanitizeSvg } from "@/lib/import/svgSanitize";
+  applyDeform,
+  applyEmboss,
+  applyRevolve,
+  generatorToLayer,
+  layerToWorldMesh,
+  meshToResultLayer,
+  type DeformRequest,
+  type EmbossRequest,
+  type RevolveSettings,
+} from "@/lib/geometry/operations/advancedOps";
+import { useGeometryJobs } from "@/hooks/useGeometryJobs";
+import { useImportHandlers } from "@/hooks/useImportHandlers";
+import { useAnalysisRunner } from "@/hooks/useAnalysisRunner";
+import { JobProgressOverlay } from "@/components/editor/JobProgressOverlay";
+import type { FilletSettings, ShellSettings } from "@/lib/geometry/operations/fillet";
+import type { LatticeSettings } from "@/lib/geometry/operations/lattice";
+import { buildPattern, PatternError, type PatternSettings } from "@/lib/geometry/operations/pattern";
 import {
-  decodeImageToGrid,
-  gridToSilhouetteContours,
-  heightFieldToClosedMesh,
-  IMAGE_INPUT_ACCEPT,
-  ImageImportError,
-  smoothGrid,
-  stripImageExtension,
-  validateImageFile,
-} from "@/lib/import/image";
+  arrangeOnPlate,
+  detectInterference,
+  type InterferenceReport,
+} from "@/lib/geometry/analysis/collision";
+import {
+  buildEnclosure,
+  buildGear,
+  buildLivingHinge,
+  buildSnapFit,
+  buildThread,
+  type ThreadFitClass,
+  buildToleranceTest,
+  GeneratorError,
+} from "@/lib/geometry/generators";
 import { downloadBlob } from "@/lib/export/stl";
 import { meshDataToBinaryStl } from "@/lib/export/stlData";
+import type { PrintablePart } from "@/lib/geometry/buildDocument";
 import { buildMultiPartZip } from "@/lib/export/package";
 import { buildThreeMf } from "@/lib/export/threeMF";
-import { DESIGN_FILE_EXTENSION, DesignFileError, importDesignFile, serializeDesignFile } from "@/lib/serialization/designFile";
+import { DESIGN_FILE_EXTENSION, DesignFileError, serializeDesignFile } from "@/lib/serialization/designFile";
 import { decodeShareHash, encodeShareHash, SHARE_HASH_PREFIX, shareLinkEligibility } from "@/lib/serialization/shareLink";
 import type { ModelIssue } from "@/types/design";
 import { Section } from "@/components/ui/Section";
+import { ErrorBoundary } from "@/components/ui/ErrorBoundary";
 import { EditorProvider, useEditor } from "@/components/editor/store";
 import { LayerListPanel } from "@/components/editor/LayerListPanel";
 import { PropertiesPanel } from "@/components/editor/PropertiesPanel";
@@ -113,11 +138,85 @@ import {
   ImageImportDialog,
   StlImportDialog,
   SvgImportDialog,
-  type ImageImportOptionsValue,
   type StlImportPreview,
-  type SvgImportOptionsValue,
 } from "@/components/dialogs/ImportDialogs";
 import { ExportDialog, type ExportKind } from "@/components/dialogs/ExportDialog";
+import { CreatePanel, type GeneratorKind } from "@/components/editor/CreatePanel";
+import {
+  SubObjectPanel,
+  type PaintInfo,
+  type RegionInfo,
+} from "@/components/editor/SubObjectPanel";
+import {
+  activePaints,
+  DEFAULT_PAINT_DEPTH_MM,
+  hasStalePaint,
+  paintedTriangleSlots,
+  paintTriangles,
+  splitPartsByPaint,
+  unpaintTriangles,
+} from "@/lib/geometry/painting";
+import { CalibrationPanel, CustomPrinterPanel } from "@/components/editor/CalibrationPanel";
+import {
+  clearanceForFit,
+  documentNozzleDiameterMm,
+  type CalibrationSettings,
+} from "@/lib/geometry/calibration";
+import {
+  analyzeBridging,
+  buildSupports,
+  DEFAULT_SUPPORT_SETTINGS,
+} from "@/lib/geometry/analysis/supports";
+import {
+  buildAdjacency,
+  growSelection,
+  selectionArea,
+} from "@/lib/geometry/selection/meshAdjacency";
+import {
+  deleteRegion,
+  isSelectionPlanarForUi,
+  pushPullRegion,
+  smoothRegion,
+  splitByRegion,
+} from "@/lib/geometry/selection/regionOps";
+import {
+  HistoryPanel,
+  MemoryPanel,
+  ModifierStackPanel,
+  ParametersPanel,
+} from "@/components/editor/HistoryPanel";
+import {
+  defaultModifier,
+  type Modifier,
+  type ModifierKind,
+} from "@/lib/geometry/modifiers";
+import { resolveParameters, type ParameterDefinition } from "@/lib/geometry/expression";
+import { garbageCollect, meshStoreStats, type MeshStoreStats } from "@/lib/geometry/meshStore";
+import { referencedMeshIds } from "@/lib/history/history";
+import {
+  clearSnapshot,
+  describeSnapshotAge,
+  peekSnapshot,
+  restoreSnapshot,
+  saveSnapshot,
+  setRecoveryDisabled,
+  type RecoverySnapshot,
+} from "@/lib/serialization/crashRecovery";
+import {
+  DeformDialog,
+  EmbossDialog,
+  FilletDialog,
+  ModifierEditDialog,
+  RecoveryDialog,
+  RevolveDialog,
+  GeneratorDialog,
+  InterferenceDialog,
+  LatticeDialog,
+  MeshInspectorDialog,
+  PatternDialog,
+  ShellDialog,
+  type GeneratorParams,
+} from "@/components/dialogs/AdvancedDialogs";
 import { BaseModeSwitchDialog, OrientationDialog } from "@/components/dialogs/MiscDialogs";
 import type { SurfacePick } from "@/components/viewer/SceneView";
 
@@ -143,15 +242,12 @@ export function Editor() {
 }
 
 /** Read a File as ArrayBuffer. */
-function readFileBuffer(file: File): Promise<ArrayBuffer> {
-  return file.arrayBuffer();
-}
-
 function EditorInner() {
   const { state, dispatch, document: doc, selection, selectedLayers, canUndo, canRedo } =
     useEditor();
   const build = useDocumentBuilder(doc);
-  const printer = getPrinterProfile(doc.printerProfileId);
+  const jobs = useGeometryJobs();
+  const printer = getPrinterProfile(doc.printerProfileId, doc.customPrinters ?? []);
 
   // ---- dialog state ----------------------------------------------------
   const [message, setMessage] = useState<OpMessage | null>(null);
@@ -181,6 +277,26 @@ function EditorInner() {
   const [overlayColors, setOverlayColors] = useState<Map<string, Float32Array>>(new Map());
   const [estimate, setEstimate] = useState<DetailedEstimateResult | null>(null);
   const [analysisBusy, setAnalysisBusy] = useState(false);
+  const [filletOpen, setFilletOpen] = useState(false);
+  const [shellOpen, setShellOpen] = useState(false);
+  const [deformOpen, setDeformOpen] = useState(false);
+  const [latticeOpen, setLatticeOpen] = useState(false);
+  const [patternOpen, setPatternOpen] = useState(false);
+  const [generatorKind, setGeneratorKind] = useState<GeneratorKind | null>(null);
+  const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [diagnosis, setDiagnosis] = useState<MeshDiagnosis | null>(null);
+  const [repairReport, setRepairReport] = useState<MeshRepairReport | null>(null);
+  const [interference, setInterference] = useState<InterferenceReport | null>(null);
+  const [focusTarget, setFocusTarget] = useState<{ x: number; y: number; z: number } | null>(null);
+  /** Bumped by the GC handler, which changes the store without changing doc. */
+  const [memoryVersion, setMemoryVersion] = useState(0);
+  const [recovery, setRecovery] = useState<RecoverySnapshot | null>(null);
+  const [editingModifierId, setEditingModifierId] = useState<string | null>(null);
+  const [pushPullMm, setPushPullMm] = useState(2);
+  const [paintSlotId, setPaintSlotId] = useState<string | null>(null);
+  const [paintDepthMm, setPaintDepthMm] = useState(DEFAULT_PAINT_DEPTH_MM);
+  const [revolveOpen, setRevolveOpen] = useState(false);
+  const [embossOpen, setEmbossOpen] = useState(false);
 
   const stlInputRef = useRef<HTMLInputElement>(null);
   const svgInputRef = useRef<HTMLInputElement>(null);
@@ -210,7 +326,9 @@ function EditorInner() {
       err instanceof StlImportError ||
       err instanceof SvgImportError ||
       err instanceof ImageImportError ||
-      err instanceof DesignFileError
+      err instanceof DesignFileError ||
+      err instanceof GeneratorError ||
+      err instanceof PatternError
     ) {
       setMessage({ titleHe, bodyHe: err.messageHe, kind: "error" });
     } else {
@@ -679,411 +797,1019 @@ function EditorInner() {
     });
   }, [selectedMeshLayers, runOp, updateLayer]);
 
-  // ---- analysis ------------------------------------------------------------
+  // ---- V4: creation ---------------------------------------------------------
 
-  const runAnalysis = useCallback(() => {
-    if (build.parts.length === 0) return;
-    setAnalysisBusy(true);
-    // Yield to paint the busy state before the synchronous analysis work.
-    setTimeout(async () => {
-      try {
-        const kernel = await getGeometryKernel();
-        const profile = getPrintabilityProfile(doc.printabilityProfileId);
-        const custom = doc.customPrintability;
-        const minWall = custom?.minWallMm ?? profile.minWallMm;
-        const minFeature = custom?.minFeatureMm ?? profile.minFeatureMm;
-        const maxOverhang = custom?.maxOverhangDeg ?? profile.maxOverhangDeg;
-
-        const issues: ModelIssue[] = [];
-        const colors = new Map<string, Float32Array>();
-        let totalVolume = 0;
-        let maxHeight = 0;
-
-        for (const part of build.parts) {
-          const mesh = part.worldMesh;
-          totalVolume += part.stats.volumeMm3;
-          maxHeight = Math.max(maxHeight, part.stats.bounds.max.z);
-
-          const overhang = analyzeOverhangs(mesh, maxOverhang);
-          const contact = analyzeContact(mesh);
-          const floating = analyzeFloatingParts(mesh);
-          const volume = analyzeBuildVolume(part.stats.bounds, printer);
-
-          const { solid, status } = kernel.fromMeshData(mesh);
-          let thicknessIssues: ModelIssue[] = [];
-          if (status === "NoError") {
-            const thickness = analyzeThickness(solid, mesh, {
-              minWallMm: minWall,
-              minFeatureMm: minFeature,
-            });
-            thicknessIssues = thickness.issues;
-            colors.set(
-              part.primaryLayerId,
-              state.ui.overlay === "overhang"
-                ? overhangToVertexColors(mesh, overhang.triangleFlags)
-                : thicknessToVertexColors(mesh, thickness, minWall)
-            );
-          }
-          solid.dispose();
-
-          const prefix = build.parts.length > 1 ? `${part.nameHe}: ` : "";
-          for (const issue of [
-            ...overhang.issues,
-            ...contact.issues,
-            ...floating.issues,
-            ...volume.issues,
-            ...thicknessIssues,
-          ]) {
-            issues.push({ ...issue, titleHe: `${prefix}${issue.titleHe}` });
-          }
-        }
-
-        setModelIssues(issues);
-        setOverlayColors(colors);
-
-        const usage = USAGE_PROFILES.find((u) => u.id === doc.usageProfileId);
-        const material =
-          MATERIAL_PROFILES.find((m) => m.id === usage?.suggestedMaterialId) ??
-          MATERIAL_PROFILES[0];
-        const layerHeight = custom?.layerHeightMm ?? profile.layerHeightMm;
-        let bounds = { x: 0, y: 0, z: maxHeight };
-        for (const part of build.parts) {
-          bounds = {
-            x: Math.max(bounds.x, part.stats.dimensionsMm.x),
-            y: Math.max(bounds.y, part.stats.dimensionsMm.y),
-            z: bounds.z,
-          };
-        }
-        setEstimate(
-          estimateDetailed({
-            modelVolumeMm3: totalVolume,
-            boundsMm: bounds,
-            technology: profile.technology,
-            layerHeightMm: layerHeight,
-            nozzleDiameterMm: custom?.nozzleDiameterMm ?? profile.nozzleDiameterMm,
-            infillPercent: usage?.suggestedInfillPct ?? 20,
-            densityGCm3: material.densityGCm3,
-            pricePerKgIls: material.pricePerKgIls,
-          })
-        );
-      } catch (err) {
-        showError(err, "ניתוח המודל נכשל");
-      } finally {
-        setAnalysisBusy(false);
-      }
-    }, 30);
-  }, [build.parts, doc, printer, state.ui.overlay, showError]);
-
-  // Invalidate analysis results when the geometry changes (state adjustment
-  // derived from the build id, done during render — no effect cascade).
-  const [lastBuildId, setLastBuildId] = useState(0);
-  if (build.buildId !== lastBuildId) {
-    setLastBuildId(build.buildId);
-    setModelIssues([]);
-    setOverlayColors(new Map());
-    setEstimate(null);
-  }
-
-  const handleSuggestOrientation = useCallback(() => {
-    const part = selectedParts[0] ?? build.parts[0];
-    if (!part) return;
-    setAnalysisBusy(true);
-    setTimeout(() => {
-      try {
-        const profile = getPrintabilityProfile(doc.printabilityProfileId);
-        const maxOverhang = doc.customPrintability?.maxOverhangDeg ?? profile.maxOverhangDeg;
-        setOrientationCandidates(suggestOrientations(part.worldMesh, maxOverhang));
-      } catch (err) {
-        showError(err, "הצעת תנוחה נכשלה");
-      } finally {
-        setAnalysisBusy(false);
-      }
-    }, 30);
-  }, [selectedParts, build.parts, doc, showError]);
-
-  const handleApplyOrientation = useCallback(
-    (candidate: OrientationCandidate) => {
-      setOrientationCandidates(null);
-      const part = selectedParts[0] ?? build.parts[0];
-      if (!part) return;
-      const layer = doc.layers.find((l) => l.id === part.primaryLayerId);
-      if (!layer || layer.locked) return;
-      const rotation = new THREE.Matrix4().makeRotationFromEuler(
-        new THREE.Euler(
-          (candidate.rotation.xDeg * Math.PI) / 180,
-          (candidate.rotation.yDeg * Math.PI) / 180,
-          (candidate.rotation.zDeg * Math.PI) / 180,
-          "XYZ"
-        )
-      );
-      const current = transformToMatrix4(layer.transform);
-      const next = matrix4ToTransform(rotation.multiply(current));
-      // Drop the rotated body onto the plate.
-      const rotated = transformMeshData(part.localMesh, transformToMatrix4(next));
-      const bounds = meshDataBounds(rotated);
-      next.z -= bounds.min.z;
-      commitTransform(layer.id, next);
+  const addLayer = useCallback(
+    (layer: DesignLayer, labelHe: string) => {
+      applyDocument({ ...doc, layers: [...doc.layers, layer] }, labelHe);
+      dispatch({ type: "ui/select", selection: [layer.id] });
     },
-    [selectedParts, build.parts, doc.layers, commitTransform]
+    [doc, applyDocument, dispatch]
   );
 
-  // ---- imports --------------------------------------------------------------
-
-  const handleStlFile = useCallback(
-    async (file: File) => {
-      await runOp("ייבוא STL", async () => {
-        const buffer = await readFileBuffer(file);
-        const parsed = parseStl(buffer);
-        // Rebase: centre XY, rest on Z=0.
-        const bounds = meshDataBounds(parsed.mesh);
-        const cx = (bounds.min.x + bounds.max.x) / 2;
-        const cy = (bounds.min.y + bounds.max.y) / 2;
-        const rebased = transformMeshData(
-          parsed.mesh,
-          new THREE.Matrix4().makeTranslation(-cx, -cy, -bounds.min.z)
-        );
-        const kernel = await getGeometryKernel();
-        const { solid, status } = kernel.fromMeshData(rebased);
-        solid.dispose();
-        let manifold = status === "NoError";
-        let repairMessageHe: string | null = null;
-        let finalMesh = rebased;
-        if (!manifold) {
-          const repair = await attemptMeshRepair(rebased);
-          if (repair.succeeded && repair.mesh) {
-            finalMesh = repair.mesh;
-            manifold = true;
-            repairMessageHe = repair.messageHe;
-          } else {
-            repairMessageHe = repair.messageHe;
-          }
-        }
-        const meshId = storeMesh(finalMesh);
-        pendingStlRef.current = { meshId, fileName: file.name };
-        setStlPreview({
-          fileName: file.name,
-          summary: summarizeStlMesh(finalMesh),
-          manifold,
-          repairMessageHe,
-        });
-      });
-    },
-    [runOp]
-  );
-
-  const confirmStlImport = useCallback(() => {
-    const pending = pendingStlRef.current;
-    setStlPreview(null);
-    pendingStlRef.current = null;
-    if (!pending) return;
-    const layer: ImportedMeshLayer = {
-      id: newId("layer"),
-      type: "importedMesh",
-      name: pending.fileName.replace(/\.stl$/i, ""),
-      visible: true,
-      locked: false,
-      materialSlotId: doc.materialSlots[0]?.id ?? "slot1",
-      transform: {
-        x: 0, y: 0, z: 0,
-        rotationX: 0, rotationY: 0, rotationZ: 0,
-        scaleX: 1, scaleY: 1, scaleZ: 1,
-      },
-      previewOpacity: 1,
-      meshId: pending.meshId,
-      provenance: { kind: "stlImport", fileName: pending.fileName },
-      originalMeshId: pending.meshId,
-      combine: "standalone",
-    };
-    applyDocument({ ...doc, layers: [...doc.layers, layer] }, "ייבוא STL");
-    dispatch({ type: "ui/select", selection: [layer.id] });
-  }, [doc, applyDocument, dispatch]);
-
-  const handleSvgConfirm = useCallback(
-    (options: SvgImportOptionsValue) => {
-      const pending = svgPending;
-      setSvgPending(null);
-      if (!pending) return;
-      void runOp("ייבוא SVG", async () => {
-        // Security first: strip scripts/external refs, collect Hebrew warnings.
-        const sanitized = sanitizeSvg(pending.text);
-        if (!sanitized.ok) {
-          throw new SvgImportError(sanitized.error ?? "קובץ ה-SVG אינו תקין");
-        }
-        const result = parseSvgToContours(sanitized.svgText, {
-          targetWidthMm: options.targetWidthMm,
-        });
-        result.warningsHe.push(...sanitized.warnings);
-        const layer: DesignLayer = {
+  const handleAddPrimitive = useCallback(
+    (kind: PrimitiveKind) => {
+      const namesHe: Record<PrimitiveKind, string> = {
+        box: "תיבה",
+        cylinder: "גליל",
+        sphere: "כדור",
+        cone: "חרוט",
+        torus: "טבעת",
+        wedge: "טריז",
+        tube: "צינור",
+      };
+      addLayer(
+        {
           id: newId("layer"),
-          type: "svg",
-          name: pending.fileName.replace(/\.svg$/i, ""),
+          type: "primitive",
+          name: namesHe[kind],
           visible: true,
           locked: false,
           materialSlotId: doc.materialSlots[0]?.id ?? "slot1",
-          transform: {
-            x: 0, y: 0, z: 0,
-            rotationX: 0, rotationY: 0, rotationZ: 0,
-            scaleX: 1, scaleY: 1, scaleZ: 1,
-          },
+          transform: { x: 0, y: 0, z: 0, rotationX: 0, rotationY: 0, rotationZ: 0, scaleX: 1, scaleY: 1, scaleZ: 1 },
           previewOpacity: 1,
-          sourceName: pending.fileName,
-          contours: result.contours,
-          extrudeMm: options.extrudeMm,
-          combine: doc.baseMode === "withBase" ? "raised" : "standalone",
-          bevel: { enabled: false, sizeMm: 0.6, segments: 4 },
-        };
-        applyDocument({ ...doc, layers: [...doc.layers, layer] }, "ייבוא SVG");
-        dispatch({ type: "ui/select", selection: [layer.id] });
-        if (result.warningsHe.length > 0) {
-          setMessage({
-            titleHe: "ייבוא SVG — הערות",
-            bodyHe: result.warningsHe.join("\n"),
-            kind: "info",
-          });
+          ...defaultPrimitive(kind),
+        },
+        `הוספת ${namesHe[kind]}`
+      );
+    },
+    [addLayer, doc.materialSlots]
+  );
+
+  const handleAddSketch = useCallback(() => {
+    addLayer(
+      {
+        id: newId("layer"),
+        type: "sketch",
+        name: "סקיצה",
+        visible: true,
+        locked: false,
+        materialSlotId: doc.materialSlots[0]?.id ?? "slot1",
+        transform: { x: 0, y: 0, z: 0, rotationX: 0, rotationY: 0, rotationZ: 0, scaleX: 1, scaleY: 1, scaleZ: 1 },
+        previewOpacity: 1,
+        // Seeded with one rectangle so the layer produces geometry
+        // immediately; the properties panel edits the entity list.
+        entities: [
+          { kind: "rectangle", x: 0, y: 0, widthMm: 30, heightMm: 20, cornerRadiusMm: 2, rotationDeg: 0 },
+        ],
+        extrudeMm: 3,
+        combine: "standalone",
+        bevel: { enabled: false, sizeMm: 0.6, segments: 4 },
+      },
+      "הוספת סקיצה"
+    );
+  }, [addLayer, doc.materialSlots]);
+
+  const handleGeneratorConfirm = useCallback(
+    (kind: GeneratorKind, params: GeneratorParams) => {
+      setGeneratorKind(null);
+      const num = (key: string, fallback: number): number =>
+        typeof params[key] === "number" ? (params[key] as number) : fallback;
+      const bool = (key: string, fallback: boolean): boolean =>
+        typeof params[key] === "boolean" ? (params[key] as boolean) : fallback;
+      const slot = doc.materialSlots[0]?.id ?? "slot1";
+
+      void runOp("יצירת חלק פרמטרי", async () => {
+        const kernel = await getGeometryKernel();
+        const layers: DesignLayer[] = [];
+        switch (kind) {
+          case "thread": {
+            const internal = bool("internal", false);
+            const rawFit = params.fitClass;
+            const fitClass: ThreadFitClass =
+              rawFit === "tight" || rawFit === "loose" ? rawFit : "normal";
+            const solid = buildThread(kernel, {
+              diameterMm: num("diameterMm", 8),
+              pitchMm: num("pitchMm", 1.25),
+              lengthMm: num("lengthMm", 20),
+              internal,
+              // A calibrated machine knows its own clearance; the dialog's
+              // default is only a guess for a machine nobody measured.
+              clearanceMm: doc.calibration
+                ? clearanceForFit(doc.calibration, "sliding")
+                : num("clearanceMm", 0.4),
+              fitClass,
+              chamferMm: num("chamferMm", 0.6),
+              segments: 48,
+            });
+            layers.push(
+              generatorToLayer(
+                solid,
+                internal ? "כלי חיתוך להברגה פנימית" : "הברגה",
+                slot,
+                `הברגה M${num("diameterMm", 8)}×${num("pitchMm", 1.25)}`
+              )
+            );
+            break;
+          }
+          case "gear": {
+            const solid = buildGear(kernel, {
+              teeth: num("teeth", 20),
+              moduleMm: num("moduleMm", 2),
+              thicknessMm: num("thicknessMm", 6),
+              pressureAngleDeg: 20,
+              boreDiameterMm: num("boreDiameterMm", 6),
+              backlashMm: num("backlashMm", 0.1),
+            });
+            layers.push(
+              generatorToLayer(
+                solid,
+                `גלגל שיניים ${num("teeth", 20)}Z`,
+                slot,
+                `מודול ${num("moduleMm", 2)}, ${num("teeth", 20)} שיניים`
+              )
+            );
+            break;
+          }
+          case "enclosure": {
+            const { box, lid } = buildEnclosure(kernel, {
+              innerWidthMm: num("innerWidthMm", 60),
+              innerDepthMm: num("innerDepthMm", 40),
+              innerHeightMm: num("innerHeightMm", 25),
+              wallMm: num("wallMm", 2),
+              floorMm: num("floorMm", 2),
+              cornerRadiusMm: num("cornerRadiusMm", 3),
+              lipHeightMm: num("lipHeightMm", 4),
+              // The calibration panel promises enclosures derive from the
+              // measured value; until now they took the dialog's guess.
+              clearanceMm: doc.calibration
+                ? clearanceForFit(doc.calibration, "sliding")
+                : num("clearanceMm", 0.2),
+            });
+            layers.push(generatorToLayer(box, "מארז — קופסה", slot, "גוף המארז"));
+            const lidLayer = generatorToLayer(lid, "מארז — מכסה", slot, "מכסה המארז");
+            // Park the lid beside the box so both are visible and printable.
+            lidLayer.transform.x += num("innerWidthMm", 60) + num("wallMm", 2) * 2 + 10;
+            layers.push(lidLayer);
+            break;
+          }
+          case "livingHinge": {
+            const solid = buildLivingHinge(kernel, {
+              widthMm: num("widthMm", 40),
+              lengthMm: num("lengthMm", 30),
+              thicknessMm: num("thicknessMm", 2),
+              hingeThicknessMm: num("hingeThicknessMm", 0.5),
+              grooveCount: num("grooveCount", 3),
+              grooveWidthMm: num("grooveWidthMm", 1),
+            });
+            layers.push(generatorToLayer(solid, "ציר חי", slot, "פאנל מתקפל"));
+            break;
+          }
+          case "snapFit": {
+            const solid = buildSnapFit(kernel, {
+              lengthMm: num("lengthMm", 15),
+              widthMm: num("widthMm", 6),
+              thicknessMm: num("thicknessMm", 1.5),
+              hookDepthMm: num("hookDepthMm", 1),
+              insertionAngleDeg: num("insertionAngleDeg", 30),
+              retentionAngleDeg: num("retentionAngleDeg", 75),
+            });
+            layers.push(generatorToLayer(solid, "תפס", slot, "וו הצמדה גמיש"));
+            break;
+          }
+          case "toleranceTest": {
+            const { plate, pin, clearancesMm } = buildToleranceTest(kernel, {
+              pinDiameterMm: num("pinDiameterMm", 5),
+              clearancesMm: [0.1, 0.2, 0.3, 0.4, 0.5],
+              thicknessMm: num("thicknessMm", 4),
+              spacingMm: num("spacingMm", 12),
+            });
+            layers.push(
+              generatorToLayer(
+                plate,
+                "מבחן סבולות — לוחית",
+                slot,
+                `מרווחים: ${clearancesMm.join(" / ")} מ״מ`
+              )
+            );
+            const pinLayer = generatorToLayer(pin, "מבחן סבולות — פין", slot, "פין בדיקה");
+            pinLayer.transform.y += num("spacingMm", 12);
+            layers.push(pinLayer);
+            break;
+          }
+        }
+        applyDocument({ ...doc, layers: [...doc.layers, ...layers] }, "יצירת חלק פרמטרי");
+        dispatch({ type: "ui/select", selection: layers.map((l) => l.id) });
+      });
+    },
+    [doc, runOp, applyDocument, dispatch]
+  );
+
+  // ---- V4: body operations ---------------------------------------------------
+
+  const handleFilletConfirm = useCallback(
+    (settings: FilletSettings) => {
+      setFilletOpen(false);
+      const layer = singleSelectedShape;
+      if (!layer) return;
+      const styleHe = settings.style === "fillet" ? "עיגול" : "שיפוע";
+      void runOp("עיגול קצוות", async () => {
+        // Minkowski is the slowest operation in the app; route it through the
+        // worker so the viewport keeps responding and the user can cancel.
+        const mesh = await layerToWorldMesh(doc, layer);
+        const result = await jobs.run("fillet", { mesh, settings }, "עיגול קצוות");
+        if (!result) return; // cancelled
+        const resultLayer = await meshToResultLayer(result.mesh, {
+          nameHe: `${layer.name} — ${styleHe} ${settings.sizeMm} מ״מ`,
+          descriptionHe: `${styleHe} קצוות ברדיוס ${settings.sizeMm} מ״מ`,
+          materialSlotId: layer.materialSlotId,
+          sourceLayerId: layer.id,
+        });
+        applyOpResult("עיגול קצוות", [resultLayer], [layer.id], "hide", result.warningsHe);
+      });
+    },
+    [singleSelectedShape, doc, runOp, applyOpResult, jobs]
+  );
+
+  const handleShellConfirm = useCallback(
+    (settings: ShellSettings) => {
+      setShellOpen(false);
+      const layer = singleSelectedShape;
+      if (!layer) return;
+      void runOp("קליפה עם פתח", async () => {
+        const mesh = await layerToWorldMesh(doc, layer);
+        const result = await jobs.run("shell", { mesh, settings }, "קליפה עם פתח");
+        if (!result) return;
+        const resultLayer = await meshToResultLayer(result.mesh, {
+          nameHe: `${layer.name} — קליפה ${settings.wallThicknessMm} מ״מ`,
+          descriptionHe: `קליפה בעובי ${settings.wallThicknessMm} מ״מ`,
+          materialSlotId: layer.materialSlotId,
+          sourceLayerId: layer.id,
+          kind: "hollowResult",
+        });
+        applyOpResult("קליפה עם פתח", [resultLayer], [layer.id], "hide", result.warningsHe);
+      });
+    },
+    [singleSelectedShape, doc, runOp, applyOpResult, jobs]
+  );
+
+  const handleDeformConfirm = useCallback(
+    (request: DeformRequest) => {
+      setDeformOpen(false);
+      const layer = singleSelectedShape;
+      if (!layer) return;
+      void runOp("עיוות גוף", async () => {
+        const outcome = await applyDeform(doc, layer, request);
+        applyOpResult("עיוות גוף", [outcome.layer], [layer.id], "hide", outcome.warningsHe);
+      });
+    },
+    [singleSelectedShape, doc, runOp, applyOpResult]
+  );
+
+  const handleLatticeConfirm = useCallback(
+    (settings: LatticeSettings) => {
+      setLatticeOpen(false);
+      const layer = singleSelectedShape;
+      if (!layer) return;
+      void runOp("מילוי סריג", async () => {
+        const mesh = await layerToWorldMesh(doc, layer);
+        // The printability check is only real if the nozzle reaches it; the
+        // dialog cannot know which printer the document targets.
+        const result = await jobs.run(
+          "latticeFill",
+          {
+            mesh,
+            settings: { ...settings, nozzleDiameterMm: documentNozzleDiameterMm(doc) },
+          },
+          "מילוי סריג"
+        );
+        if (!result) return;
+        const resultLayer = await meshToResultLayer(result.mesh, {
+          nameHe: `${layer.name} — סריג`,
+          descriptionHe: `מילוי סריג, תא ${settings.cellSizeMm} מ״מ`,
+          materialSlotId: layer.materialSlotId,
+          sourceLayerId: layer.id,
+          kind: "hollowResult",
+        });
+        applyOpResult("מילוי סריג", [resultLayer], [layer.id], "hide", [
+          `חיסכון בחומר: ${(result.savedFraction * 100).toFixed(0)}%`,
+          ...result.warningsHe,
+        ]);
+      });
+    },
+    [singleSelectedShape, doc, runOp, applyOpResult, jobs]
+  );
+
+  const handlePatternConfirm = useCallback(
+    (settings: PatternSettings) => {
+      setPatternOpen(false);
+      const source = selectedLayers[0];
+      if (!source) return;
+      try {
+        const { layers, labelHe } = buildPattern(source, settings);
+        applyDocument({ ...doc, layers: [...doc.layers, ...layers] }, labelHe);
+        dispatch({ type: "ui/select", selection: layers.map((l) => l.id) });
+      } catch (err) {
+        if (err instanceof PatternError) {
+          setMessage({ titleHe: "מערך עותקים", bodyHe: err.messageHe, kind: "error" });
+        } else {
+          showError(err, "מערך עותקים");
+        }
+      }
+    },
+    [selectedLayers, doc, applyDocument, dispatch, showError]
+  );
+
+  // ---- V4: inspection --------------------------------------------------------
+
+  const handleOpenInspector = useCallback(() => {
+    const layer = selectedMeshLayers[0];
+    if (!layer) return;
+    setRepairReport(null);
+    setDiagnosis(null);
+    setInspectorOpen(true);
+    void runOp("בדיקת רשת", async () => {
+      const mesh = getMesh(layer.meshId);
+      if (!mesh) throw new OpError("נתוני הרשת חסרים");
+      const result = await jobs.run("diagnoseMesh", { mesh }, "בדיקת רשת");
+      if (result) setDiagnosis(result);
+    });
+  }, [selectedMeshLayers, runOp, jobs]);
+
+  const handleAdvancedRepair = useCallback(
+    (options: RepairOptions) => {
+      const layer = selectedMeshLayers[0];
+      if (!layer) return;
+      void runOp("תיקון רשת", async () => {
+        const mesh = getMesh(layer.meshId);
+        if (!mesh) throw new OpError("נתוני הרשת חסרים");
+        // The voxel rebuild stage can take tens of seconds on a dense mesh.
+        const report = await jobs.run("repairMesh", { mesh, options }, "תיקון רשת");
+        if (!report) return;
+        setRepairReport(report);
+        if (report.succeeded && report.mesh) {
+          const repairedId = storeMesh(report.mesh);
+          updateLayer(
+            layer.id,
+            { meshId: repairedId, originalMeshId: layer.originalMeshId ?? layer.meshId },
+            "תיקון רשת"
+          );
+          const rediagnosed = await jobs.run(
+            "diagnoseMesh",
+            { mesh: report.mesh },
+            "בדיקה חוזרת"
+          );
+          if (rediagnosed) setDiagnosis(rediagnosed);
         }
       });
     },
-    [svgPending, doc, applyDocument, dispatch, runOp]
+    [selectedMeshLayers, runOp, updateLayer, jobs]
   );
 
   /**
-   * The image input accepts `image/*` so mobile pickers expose every source
-   * on the device, which means an unsuitable file can reach us — check it
-   * here instead of relying on the picker's filter.
+   * Point the camera at a reported problem. A fresh object identity is
+   * always stored so clicking the same issue twice re-centres the view.
    */
-  const handleImageFile = useCallback((file: File) => {
-    const error = validateImageFile({ name: file.name, type: file.type, size: file.size });
-    if (error) {
-      setMessage({ titleHe: "ייבוא תמונה", bodyHe: error, kind: "error" });
-      return;
-    }
-    setImagePending({ file, fileName: file.name });
+  const handleNavigateTo = useCallback((location: { x: number; y: number; z: number }) => {
+    setFocusTarget({ ...location });
   }, []);
 
-  const handleImageConfirm = useCallback(
-    (options: ImageImportOptionsValue) => {
-      const pending = imagePending;
-      setImagePending(null);
-      if (!pending) return;
-      void runOp("ייבוא תמונה", async () => {
-        const decoded = await decodeImageToGrid(pending.file, options.resolution, {
-          removeBackgroundTolerance: options.removeBackground ? options.bgToleranceMm : null,
-          brightness: options.brightness,
-          contrast: options.contrast,
-        });
-        if (options.removeBackground && decoded.backgroundRemovedFraction < 0.01) {
-          setMessage({
-            titleHe: "הסרת רקע",
-            bodyHe: "כמעט שלא זוהה רקע להסרה — נסו להגדיל את סבילות הצבע",
-            kind: "info",
-          });
-        }
-        const grid = smoothGrid(decoded.grid, options.smoothingLevel);
-        const pixelSizeMm = options.targetWidthMm / grid.width;
-        let layer: DesignLayer;
-        if (options.mode === "silhouette") {
-          const contours = gridToSilhouetteContours(grid, {
-            threshold: options.threshold,
-            invert: options.invert,
-            pixelSizeMm,
-          });
-          if (contours.length === 0) {
-            throw new ImageImportError(
-              "לא נמצאה צורה בתמונה — נסו לשנות את סף הבהירות או להפעיל היפוך"
-            );
-          }
-          layer = {
-            id: newId("layer"),
-            type: "imageRelief",
-            name: stripImageExtension(pending.fileName),
-            visible: true,
-            locked: false,
-            materialSlotId: doc.materialSlots[0]?.id ?? "slot1",
-            transform: { x: 0, y: 0, z: 0, rotationX: 0, rotationY: 0, rotationZ: 0, scaleX: 1, scaleY: 1, scaleZ: 1 },
-            previewOpacity: 1,
-            sourceName: pending.fileName,
-            mode: "silhouette",
-            contours,
-            meshId: null,
-            settings: {
-              targetWidthMm: options.targetWidthMm,
-              threshold: options.threshold,
-              invert: options.invert,
-              reliefHeightMm: options.reliefHeightMm,
-              minThicknessMm: options.minThicknessMm,
-              resolution: options.resolution,
-              smoothingLevel: options.smoothingLevel,
-            },
-            extrudeMm: options.extrudeMm,
-            combine: doc.baseMode === "withBase" ? "raised" : "standalone",
-            bevel: { enabled: false, sizeMm: 0.6, segments: 4 },
-          };
-        } else {
-          const mesh = heightFieldToClosedMesh(grid, {
-            pixelSizeMm,
-            minThicknessMm: options.minThicknessMm,
-            reliefHeightMm: options.reliefHeightMm,
-            invert: options.invert,
-          });
-          const kernel = await getGeometryKernel();
-          const { solid, status } = kernel.fromMeshData(mesh);
-          solid.dispose();
-          if (status !== "NoError") {
-            throw new ImageImportError("יצירת גוף התבליט נכשלה — נסו רזולוציה אחרת");
-          }
-          const meshId = storeMesh(mesh);
-          layer = {
-            id: newId("layer"),
-            type: "imageRelief",
-            name: stripImageExtension(pending.fileName),
-            visible: true,
-            locked: false,
-            materialSlotId: doc.materialSlots[0]?.id ?? "slot1",
-            transform: { x: 0, y: 0, z: 0, rotationX: 0, rotationY: 0, rotationZ: 0, scaleX: 1, scaleY: 1, scaleZ: 1 },
-            previewOpacity: 1,
-            sourceName: pending.fileName,
-            mode: "relief",
-            contours: [],
-            meshId,
-            settings: {
-              targetWidthMm: options.targetWidthMm,
-              threshold: options.threshold,
-              invert: options.invert,
-              reliefHeightMm: options.reliefHeightMm,
-              minThicknessMm: options.minThicknessMm,
-              resolution: options.resolution,
-              smoothingLevel: options.smoothingLevel,
-            },
-            extrudeMm: options.extrudeMm,
-            combine: "standalone",
-            bevel: { enabled: false, sizeMm: 0.6, segments: 4 },
-          };
-        }
-        applyDocument({ ...doc, layers: [...doc.layers, layer] }, "ייבוא תמונה");
-        dispatch({ type: "ui/select", selection: [layer.id] });
+  const handleCheckInterference = useCallback(() => {
+    void runOp("בדיקת חדירה", async () => {
+      setInterference(await detectInterference(build.parts));
+    });
+  }, [build.parts, runOp]);
+
+  const handleArrangePlate = useCallback(() => {
+    const items = build.parts.map((part) => ({
+      layerId: part.primaryLayerId,
+      widthMm: part.stats.dimensionsMm.x,
+      depthMm: part.stats.dimensionsMm.y,
+      currentX: (part.stats.bounds.min.x + part.stats.bounds.max.x) / 2,
+      currentY: (part.stats.bounds.min.y + part.stats.bounds.max.y) / 2,
+    }));
+    if (items.length === 0) return;
+    const result = arrangeOnPlate(items, {
+      plateWidthMm: printer.buildVolumeMm.x,
+      plateDepthMm: printer.buildVolumeMm.y,
+      spacingMm: 5,
+    });
+    const byLayer = new Map(result.placements.map((p) => [p.layerId, p]));
+    const layers = doc.layers.map((layer) => {
+      const placement = byLayer.get(layer.id);
+      if (!placement) return layer;
+      const item = items.find((i) => i.layerId === layer.id);
+      if (!item) return layer;
+      // Placements are absolute plate positions; shift the layer transform by
+      // the delta so any local offset baked into the mesh is preserved.
+      return {
+        ...layer,
+        transform: {
+          ...layer.transform,
+          x: layer.transform.x + (placement.x - item.currentX),
+          y: layer.transform.y + (placement.y - item.currentY),
+        },
+      } as DesignLayer;
+    });
+    applyDocument({ ...doc, layers }, "סידור אוטומטי על המשטח");
+    setMessage({
+      titleHe: "סידור אוטומטי",
+      bodyHe: result.summaryHe,
+      kind: result.unplaced.length > 0 ? "info" : "success",
+    });
+  }, [build.parts, doc, printer, applyDocument]);
+
+  // ---- V5: revolve, emboss, hierarchy ----------------------------------------
+
+  const handleRevolveConfirm = useCallback(
+    (settings: RevolveSettings) => {
+      setRevolveOpen(false);
+      const layer = singleSelectedShape;
+      if (!layer) return;
+      void runOp("סיבוב פרופיל", async () => {
+        const outcome = await applyRevolve(doc, layer, settings);
+        applyOpResult("סיבוב פרופיל", [outcome.layer], [layer.id], "hide", outcome.warningsHe);
       });
     },
-    [imagePending, doc, applyDocument, dispatch, runOp]
+    [singleSelectedShape, doc, runOp, applyOpResult]
   );
 
-  const handleDesignFile = useCallback(
-    async (file: File) => {
-      await runOp("טעינת קובץ עיצוב", async () => {
-        const text = await file.text();
-        const { document: imported, warningsHe } = importDesignFile(text);
-        applyDocument(imported, "טעינת קובץ עיצוב");
-        dispatch({ type: "ui/select", selection: [] });
-        if (warningsHe.length > 0) {
-          setMessage({
-            titleHe: "קובץ העיצוב נטען עם הערות",
-            bodyHe: warningsHe.join("\n"),
-            kind: "info",
-          });
-        }
+  /** Bodies that can receive an emboss (everything but the artwork itself). */
+  const embossTargets = useMemo(
+    () =>
+      doc.layers
+        .filter(
+          (l) => isShapeLayer(l) && l.id !== singleSelectedShape?.id && partByLayer.has(l.id)
+        )
+        .map((l) => ({ id: l.id, nameHe: l.name })),
+    [doc.layers, singleSelectedShape, partByLayer]
+  );
+
+  const handleEmbossConfirm = useCallback(
+    (targetLayerId: string, request: EmbossRequest) => {
+      setEmbossOpen(false);
+      const artwork = singleSelectedShape;
+      const target = doc.layers.find((l) => l.id === targetLayerId);
+      if (!artwork || !target || !isShapeLayer(target)) return;
+      void runOp("הטבעה על משטח", async () => {
+        const outcome = await applyEmboss(doc, artwork, target, request);
+        // The artwork is consumed into the target, so both sources are hidden.
+        applyOpResult(
+          "הטבעה על משטח",
+          [outcome.layer],
+          [target.id, artwork.id],
+          "hide",
+          outcome.warningsHe
+        );
       });
     },
-    [runOp, applyDocument, dispatch]
+    [singleSelectedShape, doc, runOp, applyOpResult]
   );
+
+  /**
+   * Emergency save. Used by the error boundary, so it must not depend on the
+   * export dialog or any other UI that might be the thing that crashed.
+   */
+  const handleDownloadDesign = useCallback(() => {
+    try {
+      const json = serializeDesignFile(doc);
+      downloadBlob(
+        new Blob([json], { type: "application/json" }),
+        `printcraft-recovery${DESIGN_FILE_EXTENSION}`
+      );
+    } catch (err) {
+      showError(err, "שמירת קובץ העיצוב נכשלה");
+    }
+  }, [doc, showError]);
+
+  // ---- Wave C: calibration, supports, bridging --------------------------------
+
+  const handleCalibrationChange = useCallback(
+    (calibration: CalibrationSettings) => {
+      applyDocument({ ...doc, calibration }, "כיול מדפסת");
+    },
+    [doc, applyDocument]
+  );
+
+  const handleCustomPrintersChange = useCallback(
+    (customPrinters: PrinterProfile[]) => {
+      applyDocument({ ...doc, customPrinters }, "מדפסות מותאמות");
+    },
+    [doc, applyDocument]
+  );
+
+  /**
+   * Supports for every part on the plate, or just the selected ones.
+   *
+   * Taking `parts[0]` and calling it done left the other four parts of a
+   * plate unsupported with nothing said about them — the report read as a
+   * verdict on the whole print.
+   */
+  const handleGenerateSupports = useCallback(() => {
+    const targets = selectedParts.length > 0 ? selectedParts : build.parts;
+    if (targets.length === 0) return;
+    void runOp("יצירת תמיכות", async () => {
+      const kernel = await getGeometryKernel();
+      const profile = getPrintabilityProfile(doc.printabilityProfileId);
+      const maxOverhangDeg =
+        doc.customPrintability?.maxOverhangDeg ?? profile.maxOverhangDeg;
+
+      const layers: DesignLayer[] = [];
+      const lines: string[] = [];
+      for (const part of targets) {
+        const { solid, result } = buildSupports(kernel, part.worldMesh, {
+          ...DEFAULT_SUPPORT_SETTINGS,
+          maxOverhangDeg,
+        });
+        lines.push(`${part.nameHe}: ${result.summaryHe}`);
+        if (!solid) continue;
+        layers.push(
+          generatorToLayer(
+            solid,
+            `${part.nameHe} — תמיכות`,
+            doc.materialSlots[0]?.id ?? "slot1",
+            result.summaryHe
+          )
+        );
+      }
+      if (layers.length === 0) {
+        setMessage({ titleHe: "תמיכות", bodyHe: lines.join("\n"), kind: "info" });
+        return;
+      }
+      applyDocument({ ...doc, layers: [...doc.layers, ...layers] }, "יצירת תמיכות");
+      dispatch({ type: "ui/select", selection: layers.map((l) => l.id) });
+      setMessage({ titleHe: "תמיכות נוצרו", bodyHe: lines.join("\n"), kind: "success" });
+    });
+  }, [selectedParts, build.parts, doc, runOp, applyDocument, dispatch]);
+
+  const handleCheckBridging = useCallback(() => {
+    const targets = selectedParts.length > 0 ? selectedParts : build.parts;
+    if (targets.length === 0) return;
+    void runOp("בדיקת גישורים", async () => {
+      // Every part, named. A verdict computed from one body out of five read
+      // as a verdict on the print.
+      const reports = targets.map((part) => ({
+        part,
+        report: analyzeBridging(part.worldMesh),
+      }));
+      const worst = reports.reduce((a, b) =>
+        b.report.longestMm > a.report.longestMm ? b : a
+      );
+      const lines = reports.map((r) => `${r.part.nameHe}: ${r.report.summaryHe}`);
+      setMessage({
+        titleHe: "בדיקת גישורים",
+        bodyHe:
+          worst.report.spans.length === 0
+            ? lines.join("\n")
+            : `${lines.join("\n")}\n\nגישור נדרש כאשר יש חומר ללא תמיכה מתחתיו. עד 5 מ״מ המדפסת מגשרת ללא בעיה; מעל 20 מ״מ סביר שהחוט יישבר.`,
+        kind: worst.report.longestMm > 20 ? "error" : "info",
+      });
+      if (worst.report.spans[0]) setFocusTarget({ ...worst.report.spans[0].center });
+    });
+  }, [selectedParts, build.parts, runOp]);
+
+  const handleReparent = useCallback(
+    (childId: string, parentId: string | null) => {
+      if (childId === parentId) return;
+      // Refuse a cycle: walking up from the proposed parent must not reach
+      // the child. The build defends against cycles too, but rejecting here
+      // means the document never holds an invalid state at all.
+      const byId = new Map(doc.layers.map((l) => [l.id, l]));
+      let cursor = parentId ? byId.get(parentId) : undefined;
+      const seen = new Set<string>();
+      while (cursor) {
+        if (cursor.id === childId) {
+          setMessage({
+            titleHe: "קישור הורה נדחה",
+            bodyHe: "לא ניתן להפוך שכבה לבן של אחד מצאצאיה — ייווצר מעגל.",
+            kind: "error",
+          });
+          return;
+        }
+        if (seen.has(cursor.id)) break;
+        seen.add(cursor.id);
+        cursor = cursor.parentId ? byId.get(cursor.parentId) : undefined;
+      }
+      updateLayer(childId, { parentId } as Partial<DesignLayer>, "שינוי היררכיה");
+    },
+    [doc.layers, updateLayer]
+  );
+
+  // ---- V5: sub-object selection ----------------------------------------------
+
+  const faceSelection = state.ui.faceSelection;
+
+  /** The part whose faces are currently selected. */
+  const faceSelectionPart = useMemo(
+    () => (faceSelection ? partByLayer.get(faceSelection.layerId) ?? null : null),
+    [faceSelection, partByLayer]
+  );
+
+  const regionInfo: RegionInfo | null = useMemo(() => {
+    if (!faceSelection || !faceSelectionPart || faceSelection.triangles.length === 0) {
+      return null;
+    }
+    const mesh = faceSelectionPart.worldMesh;
+    const adjacency = buildAdjacency(mesh);
+    const set = new Set(faceSelection.triangles);
+    return {
+      triangleCount: set.size,
+      areaMm2: selectionArea(adjacency, set),
+      planar: isSelectionPlanarForUi(mesh, adjacency, set),
+    };
+  }, [faceSelection, faceSelectionPart]);
+
+  const handleFacePick = useCallback(
+    (primaryLayerId: string, triangleIndex: number, additive: boolean) => {
+      const part = partByLayer.get(primaryLayerId);
+      if (!part) return;
+      const adjacency = buildAdjacency(part.worldMesh);
+      const grown = growSelection(adjacency, triangleIndex, {
+        mode: state.ui.faceGrowMode,
+        angleToleranceDeg: state.ui.faceGrowAngleDeg,
+      });
+      // Additive picking only merges within the SAME body; picking on a
+      // different body replaces, because triangle indices do not transfer.
+      const merged =
+        additive && faceSelection && faceSelection.layerId === primaryLayerId
+          ? new Set([...faceSelection.triangles, ...grown])
+          : grown;
+      dispatch({
+        type: "ui/setFaceSelection",
+        selection: { layerId: primaryLayerId, triangles: [...merged] },
+      });
+      // Keep the body selected too, so the properties panel stays in context.
+      if (!selection.includes(primaryLayerId)) {
+        dispatch({ type: "ui/select", selection: [primaryLayerId] });
+        dispatch({
+          type: "ui/setFaceSelection",
+          selection: { layerId: primaryLayerId, triangles: [...merged] },
+        });
+      }
+    },
+    [partByLayer, state.ui.faceGrowMode, state.ui.faceGrowAngleDeg, faceSelection, dispatch, selection]
+  );
+
+  const handleSelectAllFaces = useCallback(() => {
+    const part = selectedParts[0];
+    if (!part) return;
+    const count = part.worldMesh.indices.length / 3;
+    dispatch({
+      type: "ui/setFaceSelection",
+      selection: {
+        layerId: part.primaryLayerId,
+        triangles: Array.from({ length: count }, (_, i) => i),
+      },
+    });
+  }, [selectedParts, dispatch]);
+
+  /** Shared plumbing: run a region operation and replace the source layer. */
+  const runRegionOp = useCallback(
+    (
+      labelHe: string,
+      fn: (
+        mesh: import("@/lib/geometry/meshData").MeshData,
+        triangles: Set<number>
+      ) => Promise<{ layers: DesignLayer[]; warningsHe: string[] }>
+    ) => {
+      const sel = state.ui.faceSelection;
+      if (!sel || sel.triangles.length === 0) return;
+      const part = partByLayer.get(sel.layerId);
+      const layer = doc.layers.find((l) => l.id === sel.layerId);
+      if (!part || !layer || layer.locked) return;
+      void runOp(labelHe, async () => {
+        const { layers, warningsHe } = await fn(part.worldMesh, new Set(sel.triangles));
+        dispatch({ type: "ui/setFaceSelection", selection: null });
+        applyOpResult(labelHe, layers, [layer.id], "hide", warningsHe);
+      });
+    },
+    [state.ui.faceSelection, partByLayer, doc.layers, runOp, applyOpResult, dispatch]
+  );
+
+  const handlePushPull = useCallback(() => {
+    const sel = state.ui.faceSelection;
+    const layer = sel ? doc.layers.find((l) => l.id === sel.layerId) : null;
+    if (!layer || !isShapeLayer(layer)) return;
+    runRegionOp("הזזת פאה", async (mesh, triangles) => {
+      const kernel = await getGeometryKernel();
+      const { solid, status } = kernel.fromMeshData(mesh);
+      if (status !== "NoError") {
+        solid.dispose();
+        throw new OpError(`הגוף אינו תקין (${status}) — הפעילו ״תיקון רשת״ תחילה`);
+      }
+      const result = pushPullRegion(kernel, solid, mesh, triangles, {
+        distanceMm: pushPullMm,
+      });
+      const resultMesh = result.toMeshData();
+      result.dispose();
+      const resultLayer = await meshToResultLayer(resultMesh, {
+        nameHe: `${layer.name} — הזזת פאה`,
+        descriptionHe: `הזזת פאה ב-${pushPullMm} מ״מ`,
+        materialSlotId: layer.materialSlotId,
+        sourceLayerId: layer.id,
+      });
+      return { layers: [resultLayer], warningsHe: [] };
+    });
+  }, [state.ui.faceSelection, doc.layers, runRegionOp, pushPullMm]);
+
+  const handleRegionSmooth = useCallback(() => {
+    const sel = state.ui.faceSelection;
+    const layer = sel ? doc.layers.find((l) => l.id === sel.layerId) : null;
+    if (!layer) return;
+    runRegionOp("החלקה מקומית", async (mesh, triangles) => {
+      const smoothed = smoothRegion(mesh, triangles, { iterations: 6, strength: 0.6 });
+      const resultLayer = await meshToResultLayer(smoothed, {
+        nameHe: `${layer.name} — החלקה מקומית`,
+        descriptionHe: "החלקה של אזור נבחר",
+        materialSlotId: layer.materialSlotId,
+        sourceLayerId: layer.id,
+      });
+      return { layers: [resultLayer], warningsHe: [] };
+    });
+  }, [state.ui.faceSelection, doc.layers, runRegionOp]);
+
+  const handleRegionDelete = useCallback(() => {
+    const sel = state.ui.faceSelection;
+    const layer = sel ? doc.layers.find((l) => l.id === sel.layerId) : null;
+    if (!layer) return;
+    runRegionOp("מחיקת אזור", async (mesh, triangles) => {
+      const result = deleteRegion(mesh, triangles, { cap: true });
+      const resultLayer = await meshToResultLayer(result.mesh, {
+        nameHe: `${layer.name} — אזור הוסר`,
+        descriptionHe: `הוסרו ${result.trianglesRemoved} משולשים`,
+        materialSlotId: layer.materialSlotId,
+        sourceLayerId: layer.id,
+      });
+      return {
+        layers: [resultLayer],
+        warningsHe: result.capped ? [] : ["החור שנוצר לא נאטם — הפעילו ״תיקון רשת״"],
+      };
+    });
+  }, [state.ui.faceSelection, doc.layers, runRegionOp]);
+
+  const handleRegionSplit = useCallback(() => {
+    const sel = state.ui.faceSelection;
+    const layer = sel ? doc.layers.find((l) => l.id === sel.layerId) : null;
+    if (!layer) return;
+    runRegionOp("הפרדת אזור", async (mesh, triangles) => {
+      const { regionMesh, remainderMesh } = splitByRegion(mesh, triangles);
+      const regionLayer = await meshToResultLayer(regionMesh, {
+        nameHe: `${layer.name} — אזור`,
+        descriptionHe: "אזור שהופרד",
+        materialSlotId: layer.materialSlotId,
+        sourceLayerId: layer.id,
+        kind: "splitPart",
+      });
+      const remainderLayer = await meshToResultLayer(remainderMesh, {
+        nameHe: `${layer.name} — שארית`,
+        descriptionHe: "שארית אחרי הפרדה",
+        materialSlotId: layer.materialSlotId,
+        sourceLayerId: layer.id,
+        kind: "splitPart",
+      });
+      return { layers: [regionLayer, remainderLayer], warningsHe: [] };
+    });
+  }, [state.ui.faceSelection, doc.layers, runRegionOp]);
+
+  // ---- V5: per-face material painting ---------------------------------------
+
+  /**
+   * Painting is metadata, not geometry: it records which material each
+   * triangle belongs to and leaves the body alone. The separation into
+   * per-colour printable parts happens in the export handler.
+   */
+  const paintTargetLayer = useMemo(
+    () => (faceSelection ? doc.layers.find((l) => l.id === faceSelection.layerId) ?? null : null),
+    [faceSelection, doc.layers]
+  );
+
+  const paintTriangleCount = faceSelectionPart
+    ? faceSelectionPart.localMesh.indices.length / 3
+    : 0;
+
+  // Default to the SECOND slot: painting with the body's own colour is a
+  // no-op, and the whole point of the tool is contrast.
+  const resolvedPaintSlotId =
+    paintSlotId && doc.materialSlots.some((s) => s.id === paintSlotId)
+      ? paintSlotId
+      : (doc.materialSlots[1]?.id ?? doc.materialSlots[0]?.id ?? "slot1");
+
+  const paintInfo: PaintInfo | null = useMemo(() => {
+    if (!paintTargetLayer || !faceSelectionPart) return null;
+    const active = activePaints(paintTargetLayer.facePaint, paintTriangleCount);
+    const owners = paintedTriangleSlots(active);
+    const selected = faceSelection?.triangles ?? [];
+    return {
+      countBySlot: active.map((p) => ({
+        slotId: p.materialSlotId,
+        triangles: p.triangles.length,
+      })),
+      stale: hasStalePaint(paintTargetLayer.facePaint, paintTriangleCount),
+      selectionPainted: selected.length > 0 && selected.some((t) => owners.has(t)),
+    };
+  }, [paintTargetLayer, faceSelectionPart, paintTriangleCount, faceSelection]);
+
+  const handlePaintRegion = useCallback(() => {
+    const sel = state.ui.faceSelection;
+    if (!sel || sel.triangles.length === 0 || !paintTargetLayer) return;
+    if (paintTargetLayer.locked) return;
+    updateLayer(
+      paintTargetLayer.id,
+      {
+        facePaint: paintTriangles(
+          paintTargetLayer.facePaint,
+          resolvedPaintSlotId,
+          sel.triangles,
+          paintTriangleCount,
+          paintDepthMm
+        ),
+      },
+      "צביעת אזור"
+    );
+  }, [
+    state.ui.faceSelection,
+    paintTargetLayer,
+    resolvedPaintSlotId,
+    paintTriangleCount,
+    paintDepthMm,
+    updateLayer,
+  ]);
+
+  const handleUnpaintRegion = useCallback(() => {
+    const sel = state.ui.faceSelection;
+    if (!sel || !paintTargetLayer || paintTargetLayer.locked) return;
+    updateLayer(
+      paintTargetLayer.id,
+      {
+        facePaint: unpaintTriangles(
+          paintTargetLayer.facePaint,
+          sel.triangles,
+          paintTriangleCount
+        ),
+      },
+      "הסרת צבע מאזור"
+    );
+  }, [state.ui.faceSelection, paintTargetLayer, paintTriangleCount, updateLayer]);
+
+  const handleClearPaint = useCallback(() => {
+    if (!paintTargetLayer || paintTargetLayer.locked) return;
+    updateLayer(paintTargetLayer.id, { facePaint: [] }, "ניקוי צביעה");
+  }, [paintTargetLayer, updateLayer]);
+
+  // ---- V4: parameters, modifiers, history, memory, recovery ------------------
+
+  const parameterTable = useMemo(
+    () => resolveParameters(doc.parameters ?? []),
+    [doc.parameters]
+  );
+
+  const handleParametersChange = useCallback(
+    (parameters: ParameterDefinition[]) => {
+      applyDocument({ ...doc, parameters }, "עדכון פרמטרים");
+    },
+    [doc, applyDocument]
+  );
+
+  const singleSelectedLayerForModifiers = selectedLayers.length === 1 ? selectedLayers[0] : null;
+
+  const handleModifiersChange = useCallback(
+    (modifiers: Modifier[]) => {
+      const layer = singleSelectedLayerForModifiers;
+      if (!layer) return;
+      updateLayer(layer.id, { modifiers } as Partial<DesignLayer>, "עדכון מודיפיירים");
+    },
+    [singleSelectedLayerForModifiers, updateLayer]
+  );
+
+  const handleAddModifier = useCallback(
+    (kind: ModifierKind) => {
+      const layer = singleSelectedLayerForModifiers;
+      if (!layer) return;
+      const next = [...(layer.modifiers ?? []), defaultModifier(kind, newId("mod"))];
+      updateLayer(layer.id, { modifiers: next } as Partial<DesignLayer>, "הוספת מודיפייר");
+    },
+    [singleSelectedLayerForModifiers, updateLayer]
+  );
+
+  const handleEditModifier = useCallback((id: string) => {
+    // Editing opens the same dialog the one-shot operation uses; the dialog
+    // writes back into the stack entry rather than baking a new mesh.
+    setEditingModifierId(id);
+  }, []);
+
+  // The mesh store is an external mutable source, but it only ever changes
+  // alongside the document (or when the GC handler runs), so deriving the
+  // readout is correct and avoids a setState-in-effect cascade.
+  const memoryStats: MeshStoreStats = useMemo(() => {
+    void doc;
+    void memoryVersion;
+    return meshStoreStats();
+  }, [doc, memoryVersion]);
+
+  const handleCollectGarbage = useCallback(() => {
+    // Sweep against the union of every state in the history: a mesh that only
+    // a past state references must survive, or undo would produce an empty
+    // layer.
+    const result = garbageCollect(referencedMeshIds(state.history));
+    setMemoryVersion((v) => v + 1);
+    setMessage({
+      titleHe: "פינוי זיכרון",
+      bodyHe:
+        result.removed === 0
+          ? "לא נמצאו גופים מיותרים בזיכרון"
+          : `שוחררו ${result.removed} גופים (${(result.freedBytes / 1048576).toFixed(1)} מ״ב). נותרו ${result.remaining}.`,
+      kind: "success",
+    });
+  }, [state.history]);
+
+  const handleHistoryJump = useCallback(
+    (delta: number) => {
+      if (delta !== 0) dispatch({ type: "history/jump", delta });
+    },
+    [dispatch]
+  );
+
+  // Offer crash recovery once, on startup.
+  useEffect(() => {
+    let cancelled = false;
+    void peekSnapshot().then((snapshot) => {
+      if (!cancelled && snapshot) setRecovery(snapshot);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Autosave the single recovery slot, debounced so typing does not thrash
+  // IndexedDB. Failures are silent by design — this is a safety net, not a
+  // save button.
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      void saveSnapshot(doc);
+    }, 4000);
+    return () => clearTimeout(timer);
+  }, [doc]);
+
+  const handleAcceptRecovery = useCallback(() => {
+    const snapshot = recovery;
+    if (!snapshot) return;
+    setRecovery(null);
+    try {
+      const result = restoreSnapshot(snapshot);
+      applyDocument(result.document, "שחזור עבודה");
+      if (result.warningsHe.length > 0) {
+        setMessage({
+          titleHe: "העבודה שוחזרה עם הערות",
+          bodyHe: result.warningsHe.join("\n"),
+          kind: "info",
+        });
+      }
+    } catch (err) {
+      showError(err, "שחזור העבודה נכשל");
+    }
+  }, [recovery, applyDocument, showError]);
+
+  const handleDismissRecovery = useCallback((disableFuture: boolean) => {
+    setRecovery(null);
+    if (disableFuture) setRecoveryDisabled(true);
+    void clearSnapshot();
+  }, []);
+
+  // ---- analysis ------------------------------------------------------------
+
+  // Extracted to hooks/useAnalysisRunner.ts.
+  const { runAnalysis, handleSuggestOrientation, handleApplyOrientation } =
+    useAnalysisRunner({
+      doc,
+      build,
+      printer,
+      overlay: state.ui.overlay,
+      selectedParts,
+      showError,
+      commitTransform,
+      setAnalysisBusy,
+      setModelIssues,
+      setOverlayColors,
+      setEstimate,
+      setOrientationCandidates,
+    });
+
+  // ---- imports --------------------------------------------------------------
+
+  // Extracted to hooks/useImportHandlers.ts: STL, SVG, image and design-file
+  // loading is a self-contained domain, and Editor.tsx had grown past 2,800
+  // lines holding every concern at once.
+  const {
+    handleStlFile,
+    confirmStlImport,
+    handleSvgConfirm,
+    handleImageFile,
+    handleImageConfirm,
+    handleDesignFile,
+  } = useImportHandlers({
+    doc,
+    dispatch,
+    runOp,
+    applyDocument,
+    setMessage,
+    setStlPreview,
+    pendingStlRef,
+    svgPending,
+    setSvgPending,
+    imagePending,
+    setImagePending,
+  });
+
 
   // ---- export ---------------------------------------------------------------
 
@@ -1100,13 +1826,31 @@ function EditorInner() {
           return;
         }
         if (build.parts.length === 0) throw new OpError("אין חלקים לייצוא");
+
+        // Painted regions become their own printable bodies — but only in the
+        // formats that can carry more than one material. A single merged STL
+        // has nowhere to put the second colour, so splitting it there would
+        // just add seams to a file nobody can print in two colours anyway.
+        let parts: PrintablePart[] = build.parts;
+        if (kind !== "stl") {
+          const split = await splitPartsByPaint(doc, build.parts);
+          parts = split.parts;
+          if (split.warningsHe.length > 0) {
+            setMessage({
+              titleHe: "הפרדת אזורים צבועים",
+              bodyHe: split.warningsHe.join("\n"),
+              kind: "info",
+            });
+          }
+        }
+
         if (kind === "threemf") {
           const usage = USAGE_PROFILES.find((u) => u.id === doc.usageProfileId);
           const material =
             MATERIAL_PROFILES.find((m) => m.id === usage?.suggestedMaterialId) ??
             MATERIAL_PROFILES[0];
           const blob = buildThreeMf(
-            build.parts.map((part) => {
+            parts.map((part) => {
               const slot = doc.materialSlots.find((s) => s.id === part.materialSlotId);
               return {
                 name: part.nameHe,
@@ -1146,7 +1890,7 @@ function EditorInner() {
         }
         // ZIP of separate parts.
         const zip = await buildMultiPartZip(
-          build.parts.map((part, index) => ({
+          parts.map((part, index) => ({
             fileBaseName: `${fileName}-${index + 1}-${part.nameHe}`,
             nameHe: part.nameHe,
             mesh: part.worldMesh,
@@ -1167,7 +1911,7 @@ function EditorInner() {
         downloadBlob(zip, `${fileName}.zip`);
       });
     },
-    [doc, build.parts, runOp]
+    [doc, build.parts, runOp, setMessage]
   );
 
   // ---- layers / mode -----------------------------------------------------------
@@ -1496,6 +2240,15 @@ function EditorInner() {
       <main className="flex min-h-0 flex-1 flex-col-reverse lg:flex-row">
         {/* Panels (start side = right in RTL) */}
         <aside className="max-h-[55dvh] w-full overflow-y-auto border-t border-slate-200 bg-white lg:max-h-none lg:w-[420px] lg:border-e lg:border-t-0">
+          <Section title="יצירה">
+            <CreatePanel
+              busy={busy}
+              onAddPrimitive={handleAddPrimitive}
+              onAddSketch={handleAddSketch}
+              onOpenGenerator={setGeneratorKind}
+            />
+          </Section>
+
           <Section title="שכבות">
             <div className="mb-1 flex gap-1">
               <button type="button" className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50" onClick={addTextLayer}>
@@ -1530,6 +2283,7 @@ function EditorInner() {
               onDeleteLayer={handleDeleteLayer}
               onDuplicateLayer={handleDuplicateLayer}
               onMoveLayer={handleMoveLayer}
+              onReparent={handleReparent}
             />
           </Section>
 
@@ -1589,6 +2343,101 @@ function EditorInner() {
               onSmooth={() => setSmoothOpen(true)}
               onSimplify={() => setSimplifyOpen(true)}
               onRepair={handleRepair}
+              onFillet={() => setFilletOpen(true)}
+              onShell={() => setShellOpen(true)}
+              onDeform={() => setDeformOpen(true)}
+              onLattice={() => setLatticeOpen(true)}
+              onPattern={() => setPatternOpen(true)}
+              onInspectMesh={handleOpenInspector}
+              onCheckInterference={handleCheckInterference}
+              onArrangePlate={handleArrangePlate}
+              onGenerateSupports={handleGenerateSupports}
+              onCheckBridging={handleCheckBridging}
+              onRevolve={() => setRevolveOpen(true)}
+              onEmboss={() => setEmbossOpen(true)}
+              canRevolve={
+                singleSelectedShape !== null &&
+                ["sketch", "svg", "text", "imageRelief"].includes(singleSelectedShape.type)
+              }
+              partCount={build.parts.length}
+            />
+          </Section>
+
+          {singleSelectedLayerForModifiers && (
+            <Section title={`מודיפיירים — ${singleSelectedLayerForModifiers.name}`}>
+              <ModifierStackPanel
+                modifiers={singleSelectedLayerForModifiers.modifiers ?? []}
+                disabled={busy || singleSelectedLayerForModifiers.locked}
+                onChange={handleModifiersChange}
+                onAdd={handleAddModifier}
+                onEdit={handleEditModifier}
+              />
+            </Section>
+          )}
+
+          <Section title="כיול מדפסת">
+            <CalibrationPanel
+              calibration={doc.calibration}
+              onChange={handleCalibrationChange}
+              onGenerateCoupon={() => setGeneratorKind("toleranceTest")}
+            />
+            <div className="mt-2 border-t border-slate-200 pt-2">
+              <p className="mb-1.5 text-xs font-bold text-slate-500">מדפסות מותאמות</p>
+              <CustomPrinterPanel
+                printers={doc.customPrinters ?? []}
+                onChange={handleCustomPrintersChange}
+              />
+            </div>
+          </Section>
+
+          <Section title="פרמטרים">
+            <ParametersPanel
+              parameters={doc.parameters ?? []}
+              resolved={parameterTable.values}
+              errors={parameterTable.errors}
+              onChange={handleParametersChange}
+            />
+          </Section>
+
+          <Section title="היסטוריה">
+            <HistoryPanel history={state.history} onJump={handleHistoryJump} />
+            <div className="mt-2 border-t border-slate-200 pt-2">
+              <MemoryPanel stats={memoryStats} onCollect={handleCollectGarbage} />
+            </div>
+          </Section>
+
+          <Section title="עריכת פאות (תת־אובייקט)">
+            <SubObjectPanel
+              active={state.ui.tool === "faceSelect"}
+              growMode={state.ui.faceGrowMode}
+              growAngleDeg={state.ui.faceGrowAngleDeg}
+              region={regionInfo}
+              busy={busy}
+              pushPullMm={pushPullMm}
+              onToggleActive={() =>
+                dispatch({
+                  type: "ui/setTool",
+                  tool: state.ui.tool === "faceSelect" ? "select" : "faceSelect",
+                })
+              }
+              onSetGrowMode={(mode) => dispatch({ type: "ui/setFaceGrowMode", mode })}
+              onSetGrowAngle={(degrees) => dispatch({ type: "ui/setFaceGrowAngle", degrees })}
+              onSetPushPull={setPushPullMm}
+              onPushPull={handlePushPull}
+              onSmooth={handleRegionSmooth}
+              onDelete={handleRegionDelete}
+              onSplit={handleRegionSplit}
+              onSelectAll={handleSelectAllFaces}
+              onClear={() => dispatch({ type: "ui/setFaceSelection", selection: null })}
+              materialSlots={doc.materialSlots}
+              paintSlotId={resolvedPaintSlotId}
+              paintDepthMm={paintDepthMm}
+              paint={paintInfo}
+              onSetPaintSlot={setPaintSlotId}
+              onSetPaintDepth={setPaintDepthMm}
+              onPaint={handlePaintRegion}
+              onUnpaint={handleUnpaintRegion}
+              onClearPaint={handleClearPaint}
             />
           </Section>
 
@@ -1635,6 +2484,11 @@ function EditorInner() {
 
         {/* 3D viewport */}
         <section className="relative min-h-[45dvh] flex-1">
+          <JobProgressOverlay progress={jobs.progress} onCancel={jobs.cancel} />
+          <ErrorBoundary
+            areaHe="תצוגה התלת־ממדית"
+            action={{ labelHe: "הורד קובץ עיצוב", onClick: handleDownloadDesign }}
+          >
           <SceneView
             document={doc}
             parts={build.parts}
@@ -1659,10 +2513,18 @@ function EditorInner() {
             onCommitTransform={commitTransform}
             onSurfacePick={handleSurfacePick}
             onAddMeasurement={handleAddMeasurement}
+            focusTarget={focusTarget}
+            faceSelection={faceSelection}
+            onFacePick={handleFacePick}
             onRemoveMeasurement={(id) => dispatch({ type: "ui/removeMeasurement", id })}
           />
+          </ErrorBoundary>
           {totalDims && (
             <div
+              // Stable hook for the UI regression suite: this readout is
+              // driven by the real geometry pipeline, so watching it is how
+              // the tests prove an operation actually ran.
+              data-testid="viewport-dimensions"
               className="pointer-events-none absolute bottom-3 start-3 rounded-md bg-white/85 px-3 py-1.5 font-mono text-xs text-slate-700 shadow-sm"
               dir="ltr"
             >
@@ -1783,6 +2645,84 @@ function EditorInner() {
         hasBaseLayer={doc.layers.some((l) => l.type === "base")}
         onConfirm={confirmModeSwitch}
         onClose={() => setModeSwitchTarget(null)}
+      />
+      <FilletDialog
+        open={filletOpen}
+        onConfirm={handleFilletConfirm}
+        onClose={() => setFilletOpen(false)}
+      />
+      <ShellDialog
+        open={shellOpen}
+        onConfirm={handleShellConfirm}
+        onClose={() => setShellOpen(false)}
+      />
+      <DeformDialog
+        open={deformOpen}
+        onConfirm={handleDeformConfirm}
+        onClose={() => setDeformOpen(false)}
+      />
+      <LatticeDialog
+        open={latticeOpen}
+        onConfirm={handleLatticeConfirm}
+        onClose={() => setLatticeOpen(false)}
+      />
+      <PatternDialog
+        open={patternOpen}
+        onConfirm={handlePatternConfirm}
+        onClose={() => setPatternOpen(false)}
+      />
+      <GeneratorDialog
+        kind={generatorKind}
+        onConfirm={handleGeneratorConfirm}
+        onClose={() => setGeneratorKind(null)}
+      />
+      <MeshInspectorDialog
+        open={inspectorOpen}
+        diagnosis={diagnosis}
+        report={repairReport}
+        busy={busy}
+        onNavigate={handleNavigateTo}
+        onRepair={handleAdvancedRepair}
+        onClose={() => setInspectorOpen(false)}
+      />
+      <ModifierEditDialog
+        modifier={
+          (singleSelectedLayerForModifiers?.modifiers ?? []).find(
+            (m) => m.id === editingModifierId
+          ) ?? null
+        }
+        onClose={() => setEditingModifierId(null)}
+        onChange={(next) =>
+          handleModifiersChange(
+            (singleSelectedLayerForModifiers?.modifiers ?? []).map((m) =>
+              m.id === next.id ? next : m
+            )
+          )
+        }
+      />
+      <RevolveDialog
+        open={revolveOpen}
+        onConfirm={handleRevolveConfirm}
+        onClose={() => setRevolveOpen(false)}
+      />
+      <EmbossDialog
+        open={embossOpen}
+        artworkName={singleSelectedShape?.name ?? ""}
+        targetOptions={embossTargets}
+        onConfirm={handleEmbossConfirm}
+        onClose={() => setEmbossOpen(false)}
+      />
+      <RecoveryDialog
+        snapshot={recovery}
+        ageHe={recovery ? describeSnapshotAge(recovery) : ""}
+        onRestore={handleAcceptRecovery}
+        onDismiss={handleDismissRecovery}
+      />
+      <InterferenceDialog
+        open={interference !== null}
+        report={interference}
+        onNavigate={handleNavigateTo}
+        onClose={() => setInterference(null)}
       />
     </div>
   );

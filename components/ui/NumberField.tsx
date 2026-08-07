@@ -69,6 +69,11 @@ export function NumberField({
         <input
           type="number"
           dir="ltr"
+          // The wrapping label also contains the unit, so its computed
+          // accessible name would be "radius mm". An explicit label keeps
+          // the control's name exactly what the caller asked for.
+          aria-label={label}
+          aria-invalid={isInvalid || undefined}
           className={`w-24 rounded-md border px-2 py-1 text-end text-sm outline-none transition-colors focus:border-blue-500 ${
             isInvalid && focused
               ? "border-red-400 bg-red-50"

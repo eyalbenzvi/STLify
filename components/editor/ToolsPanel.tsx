@@ -46,6 +46,22 @@ export interface ToolsPanelProps {
   onSmooth: () => void;
   onSimplify: () => void;
   onRepair: () => void;
+  onFillet: () => void;
+  onShell: () => void;
+  onDeform: () => void;
+  onLattice: () => void;
+  onPattern: () => void;
+  onInspectMesh: () => void;
+  onCheckInterference: () => void;
+  onArrangePlate: () => void;
+  onRevolve: () => void;
+  onEmboss: () => void;
+  onGenerateSupports: () => void;
+  onCheckBridging: () => void;
+  /** True when the selection is a profile that can be revolved. */
+  canRevolve: boolean;
+  /** Number of printable parts currently in the document. */
+  partCount: number;
 }
 
 function ToolButton({
@@ -91,6 +107,8 @@ export function ToolsPanel(props: ToolsPanelProps) {
     selectedMeshCount,
     selectedPartCount,
     busy,
+    partCount,
+    canRevolve,
   } = props;
   const single = selectedPartCount === 1;
   const singleShape = selectedShapeCount === 1;
@@ -276,6 +294,99 @@ export function ToolsPanel(props: ToolsPanelProps) {
           <ToolButton label="החלקה" disabled={!singleShape || busy} onClick={props.onSmooth} />
           <ToolButton label="פישוט" disabled={!singleShape || busy} onClick={props.onSimplify} />
           <ToolButton label="תיקון רשת" disabled={selectedMeshCount !== 1 || busy} onClick={props.onRepair} />
+        </div>
+      </div>
+
+      {/* Advanced shaping */}
+      <div>
+        <p className="mb-1.5 text-xs font-bold text-slate-500">עיצוב מתקדם (שכבה אחת)</p>
+        <div className="flex flex-wrap gap-1">
+          <ToolButton
+            label="עיגול/שיפוע קצוות"
+            title="מעגל את כל הקצוות מהסוג שנבחר — לא קצוות בודדים"
+            disabled={!singleShape || busy}
+            onClick={props.onFillet}
+          />
+          <ToolButton
+            label="קליפה עם פתח"
+            title="חלול עם פתח בפאה נבחרת — קופסה, מגש או כוס"
+            disabled={!singleShape || busy}
+            onClick={props.onShell}
+          />
+          <ToolButton
+            label="עיוות"
+            title="כיפוף, פיתול, התחדדות או מתיחה"
+            disabled={!singleShape || busy}
+            onClick={props.onDeform}
+          />
+          <ToolButton
+            label="סריג פנימי"
+            title="מילוי ג׳ירואיד / חלת דבש — חוסך חומר ושומר על קשיחות"
+            disabled={!singleShape || busy}
+            onClick={props.onLattice}
+          />
+          <ToolButton
+            label="סיבוב פרופיל"
+            title="הופך סקיצה או SVG לגוף סיבובי — כוס, אגרטל, כפתור"
+            disabled={!canRevolve || busy}
+            onClick={props.onRevolve}
+          />
+          <ToolButton
+            label="הטבעה על משטח"
+            title="עוטף או מקרין טקסט/SVG על גוף מעוקל"
+            disabled={!singleShape || busy || partCount < 2}
+            onClick={props.onEmboss}
+          />
+        </div>
+      </div>
+
+      {/* Duplication */}
+      <div>
+        <p className="mb-1.5 text-xs font-bold text-slate-500">שכפול ובדיקה</p>
+        <div className="flex flex-wrap gap-1">
+          <ToolButton
+            label="מערך עותקים"
+            title="מערך קווי, רשת, מעגלי או שיקוף"
+            disabled={selectedCount !== 1 || busy}
+            onClick={props.onPattern}
+          />
+          <ToolButton
+            label="בדיקת רשת"
+            title="אבחון תקלות ותיקון מדורג"
+            disabled={selectedMeshCount !== 1 || busy}
+            onClick={props.onInspectMesh}
+          />
+          <ToolButton
+            label="בדיקת חדירה"
+            title="מאתר חלקים שחודרים זה לזה"
+            disabled={partCount < 2 || busy}
+            onClick={props.onCheckInterference}
+          />
+          <ToolButton
+            label="סידור על המשטח"
+            title="פורס את כל החלקים על משטח ההדפסה ללא חפיפה"
+            disabled={partCount < 2 || busy}
+            onClick={props.onArrangePlate}
+          />
+        </div>
+      </div>
+
+      {/* Print preparation */}
+      <div>
+        <p className="mb-1.5 text-xs font-bold text-slate-500">הכנה להדפסה</p>
+        <div className="flex flex-wrap gap-1">
+          <ToolButton
+            label="צור תמיכות"
+            title="עמודים חרוטיים מתחת למשטחים תלויים — בסיס רחב, קצה דק להסרה קלה"
+            disabled={partCount === 0 || busy}
+            onClick={props.onGenerateSupports}
+          />
+          <ToolButton
+            label="בדיקת גישורים"
+            title="מאתר מקטעים אופקיים ללא תמיכה מתחתם"
+            disabled={partCount === 0 || busy}
+            onClick={props.onCheckBridging}
+          />
         </div>
       </div>
     </div>
