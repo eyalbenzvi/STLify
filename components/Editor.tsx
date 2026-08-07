@@ -152,8 +152,33 @@ import {
 import { ExportDialog, type ExportKind } from "@/components/dialogs/ExportDialog";
 import { CreatePanel, type GeneratorKind } from "@/components/editor/CreatePanel";
 import {
+  HistoryPanel,
+  MemoryPanel,
+  ModifierStackPanel,
+  ParametersPanel,
+} from "@/components/editor/HistoryPanel";
+import {
+  defaultModifier,
+  type Modifier,
+  type ModifierKind,
+} from "@/lib/geometry/modifiers";
+import { resolveParameters, type ParameterDefinition } from "@/lib/geometry/expression";
+import { garbageCollect, meshStoreStats, type MeshStoreStats } from "@/lib/geometry/meshStore";
+import { referencedMeshIds } from "@/lib/history/history";
+import {
+  clearSnapshot,
+  describeSnapshotAge,
+  peekSnapshot,
+  restoreSnapshot,
+  saveSnapshot,
+  setRecoveryDisabled,
+  type RecoverySnapshot,
+} from "@/lib/serialization/crashRecovery";
+import {
   DeformDialog,
   FilletDialog,
+  ModifierEditDialog,
+  RecoveryDialog,
   GeneratorDialog,
   InterferenceDialog,
   LatticeDialog,
@@ -236,6 +261,10 @@ function EditorInner() {
   const [repairReport, setRepairReport] = useState<MeshRepairReport | null>(null);
   const [interference, setInterference] = useState<InterferenceReport | null>(null);
   const [focusTarget, setFocusTarget] = useState<{ x: number; y: number; z: number } | null>(null);
+  /** Bumped by the GC handler, which changes the store without changing doc. */
+  const [memoryVersion, setMemoryVersion] = useState(0);
+  const [recovery, setRecovery] = useState<RecoverySnapshot | null>(null);
+  const [editingModifierId, setEditingModifierId] = useState<string | null>(null);
 
   const stlInputRef = useRef<HTMLInputElement>(null);
   const svgInputRef = useRef<HTMLInputElement>(null);
@@ -1094,6 +1123,125 @@ function EditorInner() {
       kind: result.unplaced.length > 0 ? "info" : "success",
     });
   }, [build.parts, doc, printer, applyDocument]);
+
+  // ---- V4: parameters, modifiers, history, memory, recovery ------------------
+
+  const parameterTable = useMemo(
+    () => resolveParameters(doc.parameters ?? []),
+    [doc.parameters]
+  );
+
+  const handleParametersChange = useCallback(
+    (parameters: ParameterDefinition[]) => {
+      applyDocument({ ...doc, parameters }, "עדכון פרמטרים");
+    },
+    [doc, applyDocument]
+  );
+
+  const singleSelectedLayerForModifiers = selectedLayers.length === 1 ? selectedLayers[0] : null;
+
+  const handleModifiersChange = useCallback(
+    (modifiers: Modifier[]) => {
+      const layer = singleSelectedLayerForModifiers;
+      if (!layer) return;
+      updateLayer(layer.id, { modifiers } as Partial<DesignLayer>, "עדכון מודיפיירים");
+    },
+    [singleSelectedLayerForModifiers, updateLayer]
+  );
+
+  const handleAddModifier = useCallback(
+    (kind: ModifierKind) => {
+      const layer = singleSelectedLayerForModifiers;
+      if (!layer) return;
+      const next = [...(layer.modifiers ?? []), defaultModifier(kind, newId("mod"))];
+      updateLayer(layer.id, { modifiers: next } as Partial<DesignLayer>, "הוספת מודיפייר");
+    },
+    [singleSelectedLayerForModifiers, updateLayer]
+  );
+
+  const handleEditModifier = useCallback((id: string) => {
+    // Editing opens the same dialog the one-shot operation uses; the dialog
+    // writes back into the stack entry rather than baking a new mesh.
+    setEditingModifierId(id);
+  }, []);
+
+  // The mesh store is an external mutable source, but it only ever changes
+  // alongside the document (or when the GC handler runs), so deriving the
+  // readout is correct and avoids a setState-in-effect cascade.
+  const memoryStats: MeshStoreStats = useMemo(() => {
+    void doc;
+    void memoryVersion;
+    return meshStoreStats();
+  }, [doc, memoryVersion]);
+
+  const handleCollectGarbage = useCallback(() => {
+    // Sweep against the union of every state in the history: a mesh that only
+    // a past state references must survive, or undo would produce an empty
+    // layer.
+    const result = garbageCollect(referencedMeshIds(state.history));
+    setMemoryVersion((v) => v + 1);
+    setMessage({
+      titleHe: "פינוי זיכרון",
+      bodyHe:
+        result.removed === 0
+          ? "לא נמצאו גופים מיותרים בזיכרון"
+          : `שוחררו ${result.removed} גופים (${(result.freedBytes / 1048576).toFixed(1)} מ״ב). נותרו ${result.remaining}.`,
+      kind: "success",
+    });
+  }, [state.history]);
+
+  const handleHistoryJump = useCallback(
+    (delta: number) => {
+      if (delta !== 0) dispatch({ type: "history/jump", delta });
+    },
+    [dispatch]
+  );
+
+  // Offer crash recovery once, on startup.
+  useEffect(() => {
+    let cancelled = false;
+    void peekSnapshot().then((snapshot) => {
+      if (!cancelled && snapshot) setRecovery(snapshot);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Autosave the single recovery slot, debounced so typing does not thrash
+  // IndexedDB. Failures are silent by design — this is a safety net, not a
+  // save button.
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      void saveSnapshot(doc);
+    }, 4000);
+    return () => clearTimeout(timer);
+  }, [doc]);
+
+  const handleAcceptRecovery = useCallback(() => {
+    const snapshot = recovery;
+    if (!snapshot) return;
+    setRecovery(null);
+    try {
+      const result = restoreSnapshot(snapshot);
+      applyDocument(result.document, "שחזור עבודה");
+      if (result.warningsHe.length > 0) {
+        setMessage({
+          titleHe: "העבודה שוחזרה עם הערות",
+          bodyHe: result.warningsHe.join("\n"),
+          kind: "info",
+        });
+      }
+    } catch (err) {
+      showError(err, "שחזור העבודה נכשל");
+    }
+  }, [recovery, applyDocument, showError]);
+
+  const handleDismissRecovery = useCallback((disableFuture: boolean) => {
+    setRecovery(null);
+    if (disableFuture) setRecoveryDisabled(true);
+    void clearSnapshot();
+  }, []);
 
   // ---- analysis ------------------------------------------------------------
 
@@ -2026,6 +2174,34 @@ function EditorInner() {
             />
           </Section>
 
+          {singleSelectedLayerForModifiers && (
+            <Section title={`מודיפיירים — ${singleSelectedLayerForModifiers.name}`}>
+              <ModifierStackPanel
+                modifiers={singleSelectedLayerForModifiers.modifiers ?? []}
+                disabled={busy || singleSelectedLayerForModifiers.locked}
+                onChange={handleModifiersChange}
+                onAdd={handleAddModifier}
+                onEdit={handleEditModifier}
+              />
+            </Section>
+          )}
+
+          <Section title="פרמטרים">
+            <ParametersPanel
+              parameters={doc.parameters ?? []}
+              resolved={parameterTable.values}
+              errors={parameterTable.errors}
+              onChange={handleParametersChange}
+            />
+          </Section>
+
+          <Section title="היסטוריה">
+            <HistoryPanel history={state.history} onJump={handleHistoryJump} />
+            <div className="mt-2 border-t border-slate-200 pt-2">
+              <MemoryPanel stats={memoryStats} onCollect={handleCollectGarbage} />
+            </div>
+          </Section>
+
           <Section title="בדיקת הדפסה וניתוח חזותי">
             <AnalysisPanel
               document={doc}
@@ -2257,6 +2433,27 @@ function EditorInner() {
         onNavigate={handleNavigateTo}
         onRepair={handleAdvancedRepair}
         onClose={() => setInspectorOpen(false)}
+      />
+      <ModifierEditDialog
+        modifier={
+          (singleSelectedLayerForModifiers?.modifiers ?? []).find(
+            (m) => m.id === editingModifierId
+          ) ?? null
+        }
+        onClose={() => setEditingModifierId(null)}
+        onChange={(next) =>
+          handleModifiersChange(
+            (singleSelectedLayerForModifiers?.modifiers ?? []).map((m) =>
+              m.id === next.id ? next : m
+            )
+          )
+        }
+      />
+      <RecoveryDialog
+        snapshot={recovery}
+        ageHe={recovery ? describeSnapshotAge(recovery) : ""}
+        onRestore={handleAcceptRecovery}
+        onDismiss={handleDismissRecovery}
       />
       <InterferenceDialog
         open={interference !== null}

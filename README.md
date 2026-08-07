@@ -27,6 +27,39 @@ Open http://localhost:3000. A sample name-plate design is preloaded.
 
 ## V4 features
 
+- **Sub-object selection**: face / edge / vertex picking with region growth
+  by coplanarity, connectivity or normal similarity — a triangle mesh has no
+  CAD notion of a "face", so logical faces are reconstructed by growing
+  coplanar regions.
+- **Direct editing**: push/pull a planar face along its normal, local
+  smoothing with the region boundary pinned, delete a region (sealed by the
+  hole filler), and split a painted region into its own closed body.
+- **Curved-surface emboss**: cylindrical wrap (analytic, for mugs, rings and
+  bottles) and ray-cast surface projection (for domes and scans), embossing
+  or engraving through the normal boolean path.
+- **Isotropic remesh**: incremental split / collapse / tangential relaxation
+  with feature edges pinned, so triangle QUALITY improves rather than just
+  triangle count.
+- **Modifier stack**: fillet, shell, bend, twist, taper, stretch, lattice,
+  remesh, simplify and smooth as re-editable records rather than baked
+  meshes. Reorder, disable or retune any of them at any time; the result is
+  re-derived from the source, never stacked on the previous result.
+- **Named parameters**: a real expression parser (not `eval`) with
+  arithmetic, functions and Hebrew identifiers. Bind any numeric field to an
+  expression and one document becomes a product family.
+- **Hierarchy and pivots**: parent-child layers so a group moves together,
+  and a per-layer pivot so a lid rotates about its hinge.
+- **Geometry snapping and measurements**: snap to vertices, edge midpoints,
+  points along an edge and face centres; measure dihedral angle, radius from
+  three points, and wall thickness at a point.
+- **Off-thread geometry**: a job registry and Web Worker with progress and
+  cancellation, plus an in-process fallback so a job always runs.
+- **Session memory**: mesh-store byte accounting and a sweep against the full
+  undo history.
+- **Local crash recovery**: one IndexedDB slot on this device, restored
+  through the normal import path. No accounts, no server, no sync — and it
+  can be switched off.
+
 - **Create from nothing**: parametric primitives (box, cylinder, sphere,
   cone, torus, wedge, tube) and a 2D sketch layer (polyline, rectangle,
   circle, ellipse, regular polygon, quadratic Bezier) that extrudes down the
@@ -136,6 +169,11 @@ Open http://localhost:3000. A sample name-plate design is preloaded.
 | Spatial index | `lib/geometry/bvh.ts` | Triangle BVH: closest point, ray crossings, overlap pairs |
 | Sketch | `lib/geometry/sketch.ts` | 2D sketch entities compiled to contours |
 | Generators | `lib/geometry/generators/*` | Threads, gears, enclosures, hinges, clips, tolerance coupons |
+| Sub-object | `lib/geometry/selection/*` | Adjacency, region growth, push/pull, local ops, split by paint |
+| Parametric | `lib/geometry/expression.ts`, `modifiers.ts` | Expression parser, named parameters, re-editable modifier stack |
+| Snapping | `lib/geometry/snapping.ts` | Vertex/edge/face snapping, angle, radius and thickness measurement |
+| Jobs | `lib/geometry/jobs/*` | Named geometry jobs, Web Worker, in-process fallback |
+| Recovery | `lib/serialization/crashRecovery.ts` | Single-slot local snapshot |
 | UI | `components/**`, `hooks/useDocumentBuilder.ts` | RTL Hebrew editor, R3F viewer, dialogs |
 
 ### Why Manifold (manifold-3d)
@@ -191,20 +229,16 @@ interfaces so it can be swapped without touching the pipeline.
 - No 3MF export (no tested implementation existed); dovetail connectors
   assemble by sliding sideways (the UI explains this).
 
-### Not yet implemented (planned)
+### Remaining V4 caveats
 
-These were scoped for V4 but are not in this release:
+All thirty planned features are implemented. Two carry honest limits worth
+repeating:
 
-- Sub-object (face / edge / vertex) selection, and the direct-editing tools
-  that depend on it: push/pull, per-edge fillet, local smoothing, split by
-  paint.
-- Projecting or wrapping text and SVG onto curved surfaces.
-- A non-destructive modifier stack and named parameters with expressions —
-  operations still bake to meshes.
-- Layer grouping / parent-child hierarchy and pivot editing.
-- Isotropic remeshing (the kernel exposes refinement and smoothing, but
-  there is no edge-split/collapse/flip remesher).
-- Moving geometry off the main thread into a Web Worker, mesh-store
-  reference counting, and local crash recovery.
-- Viewport snapping to vertices/edges/faces, angle and radius measurements,
-  and an undo-history panel.
+- **Fillet remains global, not per-edge.** Sub-object selection now exists,
+  but Manifold still has no edge-select fillet operator, so rounding is
+  morphological and affects every edge of the chosen kind. Per-edge filleting
+  would need a different kernel.
+- **Booleans, cuts and connectors stay destructive.** The modifier stack
+  covers unary operations on one body. Multi-body operations produce a
+  different SET of layers rather than a different shape for one layer, so
+  they are not expressible as a modifier.

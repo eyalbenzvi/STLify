@@ -89,6 +89,8 @@ export type EditorAction =
   | { type: "layer/setTransform"; layerId: string; transform: Transform3D; labelHe: string; record?: boolean }
   | { type: "history/undo" }
   | { type: "history/redo" }
+  /** Jump N steps back (negative) or forward (positive) in one action. */
+  | { type: "history/jump"; delta: number }
   | { type: "ui/select"; selection: string[] }
   | { type: "ui/setTool"; tool: EditorTool }
   | { type: "ui/setTransformSpace"; space: "world" | "local" }
@@ -176,6 +178,26 @@ function reducer(state: EditorState, action: EditorAction): EditorState {
         ui: { ...state.ui, selection: state.ui.selection.filter((id) => ids.has(id)) },
       };
     }
+    case "history/jump": {
+      // Repeated undo/redo rather than index surgery: `undo` and `redo`
+      // already maintain the past/present/future invariants, and a jump is
+      // just several of them. Clamped by canUndo/canRedo so an out-of-range
+      // delta lands on the nearest reachable state instead of throwing.
+      let history = state.history;
+      let remaining = Math.abs(action.delta);
+      const step = action.delta < 0 ? undo : redo;
+      const canStep = action.delta < 0 ? canUndo : canRedo;
+      while (remaining > 0 && canStep(history)) {
+        history = step(history);
+        remaining--;
+      }
+      const ids = new Set(history.present.document.layers.map((l) => l.id));
+      return {
+        history,
+        ui: { ...state.ui, selection: state.ui.selection.filter((id) => ids.has(id)) },
+      };
+    }
+
     case "history/redo": {
       const history = redo(state.history);
       const ids = new Set(history.present.document.layers.map((l) => l.id));

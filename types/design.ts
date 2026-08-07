@@ -10,6 +10,12 @@
  */
 
 import type { FontId, TextAlign } from "@/lib/geometry/types";
+import type { Modifier } from "@/lib/geometry/modifiers";
+import type { ParameterDefinition } from "@/lib/geometry/expression";
+
+// Re-exported so UI code can import the domain model from one place.
+export type { Modifier } from "@/lib/geometry/modifiers";
+export type { ParameterDefinition } from "@/lib/geometry/expression";
 
 /** Schema version written into portable design files. */
 export const DESIGN_SCHEMA_VERSION = 3;
@@ -85,6 +91,29 @@ export interface BevelSettings {
 export interface LayerCommon {
   /** Stable unique id (never re-used within a document). */
   id: string;
+  /**
+   * Parent layer id, or null for a top-level layer. A child's transform is
+   * relative to its parent, so moving a group moves everything under it.
+   * Cycles are rejected by validation and broken defensively at build time.
+   */
+  parentId?: string | null;
+  /**
+   * Local-space point the layer rotates and scales around. Defaults to the
+   * layer's own origin. Without this, rotating a lid always spun it around
+   * the world origin rather than its hinge.
+   */
+  pivot?: { x: number; y: number; z: number };
+  /**
+   * Re-editable operations applied to this layer's body on every rebuild.
+   * See lib/geometry/modifiers.ts.
+   */
+  modifiers?: Modifier[];
+  /**
+   * Expressions bound to this layer's numeric fields, keyed by field name
+   * (e.g. `{ extrudeMm: "wall * 2" }`). An empty or invalid expression
+   * leaves the stored literal in place.
+   */
+  bindings?: Record<string, string>;
   type: LayerType;
   /** User-facing layer name (free text, usually Hebrew). */
   name: string;
@@ -368,6 +397,11 @@ export interface DesignDocument {
   usageProfileId: string | null;
   /** Template that seeded the document (display only). */
   templateId: string | null;
+  /**
+   * Named parameters driving expression-bound layer fields. Turns one
+   * document into a product family.
+   */
+  parameters?: ParameterDefinition[];
 }
 
 /** User-editable overrides on top of a printability profile. */
@@ -462,15 +496,39 @@ export interface SimplifySettings {
 // Measurements (editor-only, never exported into geometry)
 // ---------------------------------------------------------------------------
 
-export type MeasurementKind = "distance" | "distanceX" | "distanceY" | "distanceZ";
+export type MeasurementKind =
+  | "distance"
+  | "distanceX"
+  | "distanceY"
+  | "distanceZ"
+  /** Dihedral angle between the faces under two picked points. */
+  | "angle"
+  /** Radius of the circle through three picked points. */
+  | "radius"
+  /** Material thickness measured inward from one picked point. */
+  | "thickness";
 
 export interface Measurement {
   id: string;
   kind: MeasurementKind;
   a: { x: number; y: number; z: number };
   b: { x: number; y: number; z: number };
-  /** Computed value in mm. */
+  /** Third pick, used by "radius" only. */
+  c?: { x: number; y: number; z: number };
+  /** Computed value: mm for lengths, degrees for "angle". */
   valueMm: number;
+}
+
+/** How many points the user must pick for each measurement kind. */
+export function measurementPointCount(kind: MeasurementKind): number {
+  if (kind === "thickness") return 1;
+  if (kind === "radius") return 3;
+  return 2;
+}
+
+/** Unit suffix shown next to a measurement's value. */
+export function measurementUnit(kind: MeasurementKind): string {
+  return kind === "angle" ? "°" : "מ״מ";
 }
 
 // ---------------------------------------------------------------------------

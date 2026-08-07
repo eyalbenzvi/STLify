@@ -39,6 +39,8 @@ import {
   type MeshData,
 } from "./meshData";
 import { matrix4ToManifoldMat4, transformToMatrix4 } from "./transform";
+import { resolveParameters, resolveBinding } from "./expression";
+import { applyModifiers } from "./modifiers";
 import {
   buildHoleCutter,
   buildInlayPocketCutter,
@@ -103,18 +105,68 @@ function isAnchoredToBase(document: DesignDocument, layer: DesignLayer): boolean
   return layer.combine !== "standalone";
 }
 
-/** World matrix of a layer, honouring base anchoring in withBase mode. */
+/**
+ * A layer's own transform, applied about its pivot.
+ *
+ * Without a pivot, rotation and scale always happen about the layer's
+ * origin — so rotating a lid spins it around the wrong point. Conjugating
+ * the transform by a translation to the pivot moves the centre of rotation
+ * without changing where the unrotated layer sits.
+ */
+function localMatrix(layer: DesignLayer): THREE.Matrix4 {
+  const pivot = layer.pivot;
+  if (!pivot || (pivot.x === 0 && pivot.y === 0 && pivot.z === 0)) {
+    return transformToMatrix4(layer.transform);
+  }
+  // The pivot must wrap the ROTATION AND SCALE only:
+  //   M = T · T(pivot) · R · S · T(-pivot)
+  // Putting both pivot translations after the fully composed T·R·S makes
+  // them cancel out, silently doing nothing.
+  const { x, y, z } = layer.transform;
+  const rotationScale = transformToMatrix4({ ...layer.transform, x: 0, y: 0, z: 0 });
+  const translation = new THREE.Matrix4().makeTranslation(x, y, z);
+  const toPivot = new THREE.Matrix4().makeTranslation(pivot.x, pivot.y, pivot.z);
+  const fromPivot = new THREE.Matrix4().makeTranslation(-pivot.x, -pivot.y, -pivot.z);
+  return translation.multiply(toPivot).multiply(rotationScale).multiply(fromPivot);
+}
+
+/**
+ * World matrix of a layer: its parent chain, then base anchoring, then its
+ * own pivot-aware transform.
+ *
+ * The parent walk is defensive about cycles. Validation rejects them, but a
+ * hand-edited or hostile design file could still contain one, and the build
+ * must not hang: the walk stops as soon as it revisits a layer.
+ */
 export function layerWorldMatrix(
   document: DesignDocument,
   layer: DesignLayer
 ): THREE.Matrix4 {
-  const own = transformToMatrix4(layer.transform);
-  if (!isAnchoredToBase(document, layer)) return own;
+  const own = localMatrix(layer);
+
+  let matrix = own;
+  if (layer.parentId) {
+    const byId = new Map(document.layers.map((l) => [l.id, l]));
+    const seen = new Set<string>([layer.id]);
+    const chain: DesignLayer[] = [];
+    let cursor = byId.get(layer.parentId);
+    while (cursor && !seen.has(cursor.id)) {
+      seen.add(cursor.id);
+      chain.push(cursor);
+      cursor = cursor.parentId ? byId.get(cursor.parentId) : undefined;
+    }
+    // Outermost ancestor first, so each multiplication nests inward.
+    for (let i = chain.length - 1; i >= 0; i--) {
+      matrix = localMatrix(chain[i]).multiply(matrix);
+    }
+  }
+
+  if (!isAnchoredToBase(document, layer)) return matrix;
   const base = findBaseLayer(document)!;
   const baseM = transformToMatrix4(base.transform);
   const anchorZ = layer.type === "hole" ? 0 : base.thicknessMm;
   const anchor = new THREE.Matrix4().makeTranslation(0, 0, anchorZ);
-  return baseM.multiply(anchor).multiply(own);
+  return baseM.multiply(anchor).multiply(matrix);
 }
 
 /** Effective combine mode of a shape layer under the document's base mode. */
@@ -150,6 +202,31 @@ function issueForLayerFailure(layer: DesignLayer, err: unknown): ModelIssue {
     detailHe: detail,
     actionHe: "בדקו את הפרמטרים של השכבה או הסתירו אותה זמנית",
   };
+}
+
+/**
+ * Apply a layer's expression bindings to its numeric fields.
+ *
+ * Bindings live in a side table keyed by field name, so any numeric field
+ * can be driven by a parameter without every layer type growing a parallel
+ * "expression" property. A binding that does not evaluate leaves the stored
+ * literal alone — the document keeps building and the parameters panel shows
+ * the error.
+ */
+function resolveLayer<T extends ShapeLayer>(layer: T, parameters: ReadonlyMap<string, number>): T {
+  const bindings = layer.bindings;
+  if (!bindings) return layer;
+  const entries = Object.entries(bindings).filter(([, expr]) => expr && expr.trim());
+  if (entries.length === 0) return layer;
+
+  const patched = { ...layer } as T & Record<string, unknown>;
+  for (const [field, expression] of entries) {
+    const current = patched[field];
+    if (typeof current !== "number") continue;
+    const { value } = resolveBinding(expression, parameters, current);
+    patched[field] = value;
+  }
+  return patched as T;
 }
 
 interface PartBody {
@@ -216,6 +293,20 @@ export async function buildDocument(
   }
   const built: BuiltShape[] = [];
 
+  // Named parameters are resolved once per build and drive every
+  // expression-bound field.
+  const parameterTable = resolveParameters(document.parameters ?? []);
+  const parameters = parameterTable.values;
+  for (const [name, messageHe] of parameterTable.errors) {
+    issues.push({
+      code: "parameter/invalid",
+      severity: "warning",
+      titleHe: `הפרמטר "${name}" אינו תקין`,
+      detailHe: messageHe,
+      actionHe: "תקנו את הביטוי בלוח הפרמטרים",
+    });
+  }
+
   const visibleLayers = document.layers.filter((l) => l.visible);
   for (const layer of visibleLayers) {
     if (layer.type === "hole") {
@@ -226,8 +317,28 @@ export async function buildDocument(
     if (!isShapeLayer(layer)) continue;
     const effectiveCombine = effectiveCombineMode(document, layer);
     try {
-      const solid = await buildShapeLayerSolid(kernel, layer, effectiveCombine);
-      if (solid) built.push({ layer, solid, effectiveCombine });
+      const solid = await buildShapeLayerSolid(kernel, resolveLayer(layer, parameters), effectiveCombine);
+      if (!solid) continue;
+      // Apply the re-editable modifier stack. Failures are reported as
+      // issues but never abort the build: the document is rebuilt on every
+      // keystroke, and a momentarily invalid parameter should surface a
+      // message rather than blank the viewport.
+      const stack = layer.modifiers ?? [];
+      if (stack.length === 0) {
+        built.push({ layer, solid, effectiveCombine });
+        continue;
+      }
+      const applied = applyModifiers(kernel, solid, stack);
+      for (const errorHe of applied.errorsHe) {
+        issues.push({
+          code: "modifier/failed",
+          severity: "warning",
+          titleHe: `מודיפייר בשכבה "${layer.name}" נכשל`,
+          detailHe: errorHe,
+          actionHe: "שנו את הפרמטרים של המודיפייר או כבו אותו",
+        });
+      }
+      built.push({ layer, solid: applied.solid, effectiveCombine });
     } catch (err) {
       issues.push(issueForLayerFailure(layer, err));
     }

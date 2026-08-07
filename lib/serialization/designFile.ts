@@ -29,6 +29,9 @@ import {
   identityTransform,
   newId,
 } from "@/types/design";
+import type { Modifier, ModifierKind } from "@/lib/geometry/modifiers";
+import { defaultModifier } from "@/lib/geometry/modifiers";
+import type { ParameterDefinition } from "@/lib/geometry/expression";
 import { decodeMeshData, encodeMeshData } from "@/lib/geometry/meshData";
 import { getMesh, storeMesh } from "@/lib/geometry/meshStore";
 
@@ -251,6 +254,97 @@ function sanitizeSketchEntities(value: unknown, warningsHe: string[]): SketchEnt
   return entities;
 }
 
+function sanitizePivot(value: unknown): { x: number; y: number; z: number } {
+  if (!isRecord(value)) return { x: 0, y: 0, z: 0 };
+  return {
+    x: finiteNumber(value.x, 0),
+    y: finiteNumber(value.y, 0),
+    z: finiteNumber(value.z, 0),
+  };
+}
+
+/** Expressions are plain strings; they are parsed, never executed. */
+function sanitizeBindings(value: unknown): Record<string, string> {
+  if (!isRecord(value)) return {};
+  const out: Record<string, string> = {};
+  let count = 0;
+  for (const [field, expression] of Object.entries(value)) {
+    if (typeof expression !== "string") continue;
+    if (count++ >= 64) break;
+    out[boundedString(field, "", 64)] = boundedString(expression, "", 256);
+  }
+  return out;
+}
+
+const MODIFIER_KINDS = new Set<ModifierKind>([
+  "fillet",
+  "shell",
+  "twist",
+  "taper",
+  "bend",
+  "stretch",
+  "lattice",
+  "remesh",
+  "simplify",
+  "smooth",
+]);
+
+function sanitizeModifiers(value: unknown): Modifier[] {
+  if (!Array.isArray(value)) return [];
+  const out: Modifier[] = [];
+  for (const raw of value) {
+    if (!isRecord(raw)) continue;
+    const kind = String(raw.kind) as ModifierKind;
+    if (!MODIFIER_KINDS.has(kind)) continue;
+    if (out.length >= 32) break;
+    // Start from the defaults, then overwrite with whatever the file
+    // supplied — an unknown or missing field keeps a usable value instead of
+    // producing NaN geometry.
+    const base = defaultModifier(kind, newId("mod")) as Modifier & Record<string, unknown>;
+    base.enabled = raw.enabled !== false;
+    for (const [field, current] of Object.entries(base)) {
+      if (field === "id" || field === "kind" || field === "enabled") continue;
+      const incoming = raw[field];
+      if (typeof current === "number" && typeof incoming === "number") {
+        base[field] = finiteNumber(incoming, current);
+      } else if (typeof current === "string" && typeof incoming === "string") {
+        base[field] = boundedString(incoming, current, 32);
+      }
+    }
+    out.push(base);
+  }
+  return out;
+}
+
+function sanitizeParameters(value: unknown, warningsHe: string[]): ParameterDefinition[] {
+  if (!Array.isArray(value)) return [];
+  const out: ParameterDefinition[] = [];
+  const seen = new Set<string>();
+  let skipped = 0;
+  for (const raw of value) {
+    if (!isRecord(raw) || typeof raw.name !== "string") {
+      skipped++;
+      continue;
+    }
+    const name = boundedString(raw.name, "", 64).trim();
+    // Names must be usable as identifiers in an expression.
+    if (!/^[A-Za-z_\u0590-\u05FF][A-Za-z0-9_\u0590-\u05FF]*$/.test(name) || seen.has(name)) {
+      skipped++;
+      continue;
+    }
+    seen.add(name);
+    out.push({
+      name,
+      value: finiteNumber(raw.value, 0),
+      expression: boundedString(raw.expression, "", 256),
+      noteHe: boundedString(raw.noteHe, "", 200),
+    });
+    if (out.length >= 128) break;
+  }
+  if (skipped > 0) warningsHe.push(`${skipped} פרמטרים לא תקינים דולגו`);
+  return out;
+}
+
 function sanitizeBevel(value: unknown): { enabled: boolean; sizeMm: number; segments: number } {
   if (!isRecord(value)) return { enabled: false, sizeMm: 0.6, segments: 4 };
   return {
@@ -293,6 +387,13 @@ function sanitizeLayer(
   }
   const common = {
     id: newId("layer"),
+    // parentId is remapped after ALL layers are sanitized: ids are freshly
+    // generated here, so the original parent reference is meaningless until
+    // the whole id map exists. sanitizeDocument does the second pass.
+    parentId: typeof raw.parentId === "string" ? raw.parentId : null,
+    pivot: sanitizePivot(raw.pivot),
+    modifiers: sanitizeModifiers(raw.modifiers),
+    bindings: sanitizeBindings(raw.bindings),
     name: boundedString(raw.name, "שכבה", 120),
     visible: raw.visible !== false,
     locked: raw.locked === true,
@@ -544,9 +645,48 @@ export function importDesignFile(jsonText: string): DesignFileImportResult {
     throw new DesignFileError("קובץ העיצוב מכיל יותר מדי שכבות (מקסימום 200)");
   }
   const layers: DesignLayer[] = [];
+  /** Original file id -> the fresh id we generated for it. */
+  const layerIdMap = new Map<string, string>();
   for (const rawLayer of rawLayers) {
     const layer = sanitizeLayer(rawLayer, meshIdMap, warningsHe);
-    if (layer) layers.push(layer);
+    if (!layer) continue;
+    if (isRecord(rawLayer) && typeof rawLayer.id === "string") {
+      layerIdMap.set(rawLayer.id, layer.id);
+    }
+    layers.push(layer);
+  }
+
+  // Second pass: remap parent references onto the freshly generated ids, and
+  // drop any that dangle or form a cycle. A cycle would make the world-matrix
+  // walk loop, so it is refused here rather than defended against forever.
+  const idsInDocument = new Set(layers.map((l) => l.id));
+  let droppedParents = 0;
+  for (const layer of layers) {
+    if (!layer.parentId) continue;
+    const mapped = layerIdMap.get(layer.parentId);
+    if (!mapped || !idsInDocument.has(mapped) || mapped === layer.id) {
+      layer.parentId = null;
+      droppedParents++;
+      continue;
+    }
+    layer.parentId = mapped;
+  }
+  const byId = new Map(layers.map((l) => [l.id, l]));
+  for (const layer of layers) {
+    const seen = new Set<string>([layer.id]);
+    let cursor = layer.parentId ? byId.get(layer.parentId) : undefined;
+    while (cursor) {
+      if (seen.has(cursor.id)) {
+        layer.parentId = null;
+        droppedParents++;
+        break;
+      }
+      seen.add(cursor.id);
+      cursor = cursor.parentId ? byId.get(cursor.parentId) : undefined;
+    }
+  }
+  if (droppedParents > 0) {
+    warningsHe.push(`${droppedParents} קישורי הורה לא תקינים נותקו`);
   }
 
   const baseMode: BaseMode = rawDoc.baseMode === "withBase" ? "withBase" : "baseless";
@@ -592,6 +732,7 @@ export function importDesignFile(jsonText: string): DesignFileImportResult {
       typeof rawDoc.templateId === "string"
         ? boundedString(rawDoc.templateId, "", 60) || null
         : null,
+    parameters: sanitizeParameters(rawDoc.parameters, warningsHe),
   };
 
   if (document.layers.length === 0) {
