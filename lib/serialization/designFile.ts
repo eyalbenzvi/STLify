@@ -28,9 +28,11 @@ import type {
 import {
   DESIGN_SCHEMA_VERSION,
   defaultPrimitive,
+  FALLBACK_MATERIAL_SLOT_ID,
   identityTransform,
   newId,
 } from "@/types/design";
+import { DEFAULT_MATERIAL_SLOTS } from "@/lib/geometry/documentTemplates";
 import { PRINTER_PROFILES, type PrinterProfile } from "@/types/profiles";
 import type { Modifier, ModifierKind } from "@/lib/geometry/modifiers";
 import { defaultModifier } from "@/lib/geometry/modifiers";
@@ -403,7 +405,7 @@ function sanitizeLayer(
     name: boundedString(raw.name, "שכבה", 120),
     visible: raw.visible !== false,
     locked: raw.locked === true,
-    materialSlotId: boundedString(raw.materialSlotId, "slot1", 40),
+    materialSlotId: boundedString(raw.materialSlotId, FALLBACK_MATERIAL_SLOT_ID, 40),
     transform: sanitizeTransform(raw.transform),
     previewOpacity: Math.max(0.05, Math.min(finiteNumber(raw.previewOpacity, 1), 1)),
     facePaint: sanitizeFacePaint(raw.facePaint),
@@ -591,7 +593,7 @@ function sanitizeFacePaint(value: unknown): FacePaint[] | undefined {
     // Without a fingerprint the indices cannot be checked against anything,
     // and an absurd one is a way to smuggle in a huge allocation.
     if (meshTriangleCount === 0 || meshTriangleCount > MAX_PAINT_TRIANGLES) continue;
-    const slotId = boundedString(raw.materialSlotId, "slot1", 40);
+    const slotId = boundedString(raw.materialSlotId, FALLBACK_MATERIAL_SLOT_ID, 40);
     const entry = bySlot.get(slotId);
     const seen = new Set<number>(entry?.triangles ?? []);
     const triangles: number[] = entry ? [...entry.triangles] : [];
@@ -703,12 +705,9 @@ function sanitizeCustomPrinters(value: unknown): PrinterProfile[] | undefined {
 }
 
 function sanitizeMaterialSlots(value: unknown): MaterialSlot[] {
-  const fallback: MaterialSlot[] = [
-    { id: "slot1", nameHe: "צבע ראשי", colorHex: "#2f6feb" },
-    { id: "slot2", nameHe: "צבע משני", colorHex: "#f0f4fa" },
-    { id: "slot3", nameHe: "צבע שלישי", colorHex: "#e0483e" },
-  ];
-  if (!Array.isArray(value) || value.length === 0) return fallback;
+  if (!Array.isArray(value) || value.length === 0) {
+    return structuredClone(DEFAULT_MATERIAL_SLOTS);
+  }
   const slots: MaterialSlot[] = [];
   for (const raw of value.slice(0, 8)) {
     if (!isRecord(raw)) continue;
@@ -719,7 +718,7 @@ function sanitizeMaterialSlots(value: unknown): MaterialSlot[] {
       colorHex: /^#[0-9a-fA-F]{3,8}$/.test(colorHex) ? colorHex : "#2f6feb",
     });
   }
-  return slots.length > 0 ? slots : fallback;
+  return slots.length > 0 ? slots : structuredClone(DEFAULT_MATERIAL_SLOTS);
 }
 
 /** Hook for future schema migrations (v3 is the first portable schema). */

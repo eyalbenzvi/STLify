@@ -310,6 +310,17 @@ export type PrimitiveKind =
   | "wedge"
   | "tube";
 
+/** Display name per primitive kind — the create menu and the layer name. */
+export const PRIMITIVE_NAMES_HE: Record<PrimitiveKind, string> = {
+  box: "תיבה",
+  cylinder: "גליל",
+  sphere: "כדור",
+  cone: "חרוט",
+  torus: "טבעת",
+  wedge: "טריז",
+  tube: "צינור",
+};
+
 /**
  * A parametric primitive solid. Every kind is built from the same parameter
  * set so the properties panel and the design-file validator stay simple; each
@@ -431,6 +442,13 @@ export interface MaterialSlot {
   nameHe: string;
   colorHex: string;
 }
+
+/**
+ * The id every document's first material slot carries. Also the last-resort
+ * value when a layer names a slot that no longer exists — a design file
+ * written by an older version, or a slot the user deleted.
+ */
+export const FALLBACK_MATERIAL_SLOT_ID = "slot1";
 
 export interface DesignDocument {
   schemaVersion: typeof DESIGN_SCHEMA_VERSION;
@@ -654,6 +672,11 @@ export function newId(prefix: string): string {
 
 export function isShapeLayer(layer: DesignLayer): layer is ShapeLayer {
   return layer.type !== "hole";
+}
+
+/** The slot a newly created layer is assigned to: the document's first. */
+export function primaryMaterialSlotId(document: DesignDocument): string {
+  return document.materialSlots[0]?.id ?? FALLBACK_MATERIAL_SLOT_ID;
 }
 
 /** Layers that are live 2D-contour extrusions (support bevel + combine). */

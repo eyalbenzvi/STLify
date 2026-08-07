@@ -9,7 +9,7 @@
  * modelling from nothing.
  */
 
-import type { PrimitiveKind } from "@/types/design";
+import { PRIMITIVE_NAMES_HE, type PrimitiveKind } from "@/types/design";
 
 export type GeneratorKind =
   | "thread"
@@ -19,15 +19,22 @@ export type GeneratorKind =
   | "snapFit"
   | "toleranceTest";
 
-const PRIMITIVES: { kind: PrimitiveKind; labelHe: string; icon: string }[] = [
-  { kind: "box", labelHe: "תיבה", icon: "▬" },
-  { kind: "cylinder", labelHe: "גליל", icon: "▮" },
-  { kind: "sphere", labelHe: "כדור", icon: "●" },
-  { kind: "cone", labelHe: "חרוט", icon: "▲" },
-  { kind: "torus", labelHe: "טבעת", icon: "◎" },
-  { kind: "wedge", labelHe: "טריז", icon: "◺" },
-  { kind: "tube", labelHe: "צינור", icon: "⬭" },
-];
+/** Names come from the shared table so the menu and the layer agree. */
+const PRIMITIVE_ICONS: Record<PrimitiveKind, string> = {
+  box: "▬",
+  cylinder: "▮",
+  sphere: "●",
+  cone: "▲",
+  torus: "◎",
+  wedge: "◺",
+  tube: "⬭",
+};
+
+const PRIMITIVES = (Object.keys(PRIMITIVE_ICONS) as PrimitiveKind[]).map((kind) => ({
+  kind,
+  labelHe: PRIMITIVE_NAMES_HE[kind],
+  icon: PRIMITIVE_ICONS[kind],
+}));
 
 const GENERATORS: { kind: GeneratorKind; labelHe: string; hintHe: string }[] = [
   { kind: "thread", labelHe: "הברגה", hintHe: "בורג או אום בתקן ISO" },

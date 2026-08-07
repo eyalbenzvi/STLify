@@ -24,11 +24,17 @@ import { buildThread, THREAD_FIT_MULTIPLIER } from "../generators";
 import { latticeFill } from "../operations/lattice";
 import { buildDocument } from "../buildDocument";
 import {
-  defaultPrimitive,
   identityTransform,
   type DesignDocument,
   type DesignLayer,
+  type PrimitiveLayer,
 } from "@/types/design";
+import {
+  testBoxLayer,
+  testDocument,
+  testDocumentWith,
+  testHoleLayer,
+} from "@/lib/testing/fixtures";
 
 describe("calibration", () => {
   const calibration: CalibrationSettings = {
@@ -348,53 +354,12 @@ describe("lattice nozzle check", () => {
 });
 
 describe("calibration in the build pipeline", () => {
-  function baseDoc(calibration?: CalibrationSettings): DesignDocument {
-    return {
-      schemaVersion: 3,
-      baseMode: "baseless",
-      layers: [],
-      materialSlots: [{ id: "slot1", nameHe: "חומר", colorHex: "#888888" }],
-      printerProfileId: "genericFdm220",
-      printabilityProfileId: "fdmPla",
-      customPrintability: null,
-      usageProfileId: null,
-      templateId: null,
-      calibration,
-    };
-  }
+  const baseDoc = (calibration?: CalibrationSettings): DesignDocument =>
+    testDocument({ calibration });
 
-  function boxLayer(): DesignLayer {
-    return {
-      id: "box",
-      type: "primitive",
-      name: "תיבה",
-      visible: true,
-      locked: false,
-      materialSlotId: "slot1",
-      transform: identityTransform(),
-      previewOpacity: 1,
-      ...defaultPrimitive("box"),
-      widthMm: 20,
-      depthMm: 20,
-      heightMm: 20,
-    } as DesignLayer;
-  }
+  const boxLayer = (): DesignLayer => testBoxLayer();
 
-  function holeLayer(diameterMm: number): DesignLayer {
-    return {
-      id: "hole",
-      type: "hole",
-      name: "חור",
-      visible: true,
-      locked: false,
-      materialSlotId: "slot1",
-      transform: identityTransform(),
-      previewOpacity: 1,
-      diameterMm,
-      depthMode: "through",
-      depthMm: 30,
-    } as DesignLayer;
-  }
+  const holeLayer = (diameterMm: number): DesignLayer => testHoleLayer({ diameterMm });
 
   it("enlarges a modelled hole so the printed one matches nominal", async () => {
     const uncompensated = await buildDocument({
@@ -468,35 +433,10 @@ describe("calibration in the build pipeline", () => {
  */
 describe("elephant foot regressions", () => {
   function doc(
-    overrides: Partial<DesignLayer> = {},
+    overrides: Partial<PrimitiveLayer> = {},
     compensationMm = 0.2
   ): DesignDocument {
-    return {
-      schemaVersion: 3,
-      baseMode: "baseless",
-      layers: [
-        {
-          id: "box",
-          type: "primitive",
-          name: "תיבה",
-          visible: true,
-          locked: false,
-          materialSlotId: "slot1",
-          transform: identityTransform(),
-          previewOpacity: 1,
-          ...defaultPrimitive("box"),
-          widthMm: 20,
-          depthMm: 20,
-          heightMm: 20,
-          ...overrides,
-        } as DesignLayer,
-      ],
-      materialSlots: [{ id: "slot1", nameHe: "חומר", colorHex: "#888888" }],
-      printerProfileId: "genericFdm220",
-      printabilityProfileId: "fdmPla",
-      customPrintability: null,
-      usageProfileId: null,
-      templateId: null,
+    return testDocumentWith([testBoxLayer(overrides)], {
       calibration:
         compensationMm > 0
           ? {
@@ -506,7 +446,7 @@ describe("elephant foot regressions", () => {
               elephantFootHeightMm: 0.6,
             }
           : undefined,
-    } as DesignDocument;
+    });
   }
 
   it("does not multiply the triangle count of the part", async () => {
@@ -608,50 +548,15 @@ describe("elephant foot moves each wall, not everything towards the centre", () 
   };
 
   function doc(layers: DesignLayer[], compensate: boolean): DesignDocument {
-    return {
-      schemaVersion: 3,
-      baseMode: "baseless",
-      layers,
-      materialSlots: [{ id: "slot1", nameHe: "חומר", colorHex: "#888888" }],
-      printerProfileId: "genericFdm220",
-      printabilityProfileId: "fdmPla",
-      customPrintability: null,
-      usageProfileId: null,
-      templateId: null,
+    return testDocumentWith(layers, {
       calibration: compensate ? calibration : undefined,
-    } as DesignDocument;
+    });
   }
 
   const box = (): DesignLayer =>
-    ({
-      id: "box",
-      type: "primitive",
-      name: "תיבה",
-      visible: true,
-      locked: false,
-      materialSlotId: "slot1",
-      transform: identityTransform(),
-      previewOpacity: 1,
-      ...defaultPrimitive("box"),
-      widthMm: 40,
-      depthMm: 40,
-      heightMm: 20,
-    }) as DesignLayer;
+    testBoxLayer({ widthMm: 40, depthMm: 40, heightMm: 20 });
 
-  const bore = (): DesignLayer =>
-    ({
-      id: "hole",
-      type: "hole",
-      name: "חור",
-      visible: true,
-      locked: false,
-      materialSlotId: "slot1",
-      transform: identityTransform(),
-      previewOpacity: 1,
-      diameterMm: 6,
-      depthMode: "through",
-      depthMm: 40,
-    }) as DesignLayer;
+  const bore = (): DesignLayer => testHoleLayer({ diameterMm: 6, depthMm: 40 });
 
   /** Outer half-width and bore radius on the plane z = height. */
   function measureAt(mesh: MeshData, height: number) {

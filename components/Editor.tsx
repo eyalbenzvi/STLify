@@ -30,7 +30,15 @@ import type {
   SmoothSettings,
   Transform3D,
 } from "@/types/design";
-import { defaultPrimitive, isShapeLayer, newId, type PrimitiveKind } from "@/types/design";
+import {
+  defaultPrimitive,
+  identityTransform,
+  isShapeLayer,
+  newId,
+  PRIMITIVE_NAMES_HE,
+  primaryMaterialSlotId,
+  type PrimitiveKind,
+} from "@/types/design";
 import {
   getPrintabilityProfile,
   getPrinterProfile,
@@ -42,6 +50,7 @@ import { useDocumentBuilder, type BuiltPart } from "@/hooks/useDocumentBuilder";
 import { createTemplateDocument, makeBaseLayer, makeHoleLayer, makeTextLayer, PRODUCT_TEMPLATES } from "@/lib/geometry/documentTemplates";
 import { getGeometryKernel } from "@/lib/geometry/kernel";
 import { meshDataBounds } from "@/lib/geometry/meshData";
+import { boundsCenter, boundsRadius, boundsSize, unionBounds } from "@/lib/geometry/bounds";
 import { getMesh, storeMesh } from "@/lib/geometry/meshStore";
 import { performPlaneCut, splitDisconnectedParts } from "@/lib/geometry/operations/cut";
 import { addConnectors } from "@/lib/geometry/operations/connectors";
@@ -901,31 +910,23 @@ function EditorInner() {
 
   const handleAddPrimitive = useCallback(
     (kind: PrimitiveKind) => {
-      const namesHe: Record<PrimitiveKind, string> = {
-        box: "תיבה",
-        cylinder: "גליל",
-        sphere: "כדור",
-        cone: "חרוט",
-        torus: "טבעת",
-        wedge: "טריז",
-        tube: "צינור",
-      };
+      const nameHe = PRIMITIVE_NAMES_HE[kind];
       addLayer(
         {
           id: newId("layer"),
           type: "primitive",
-          name: namesHe[kind],
+          name: nameHe,
           visible: true,
           locked: false,
-          materialSlotId: doc.materialSlots[0]?.id ?? "slot1",
-          transform: { x: 0, y: 0, z: 0, rotationX: 0, rotationY: 0, rotationZ: 0, scaleX: 1, scaleY: 1, scaleZ: 1 },
+          materialSlotId: primaryMaterialSlotId(doc),
+          transform: identityTransform(),
           previewOpacity: 1,
           ...defaultPrimitive(kind),
         },
-        `הוספת ${namesHe[kind]}`
+        `הוספת ${nameHe}`
       );
     },
-    [addLayer, doc.materialSlots]
+    [addLayer, doc]
   );
 
   const handleAddSketch = useCallback(() => {
@@ -936,8 +937,8 @@ function EditorInner() {
         name: "סקיצה",
         visible: true,
         locked: false,
-        materialSlotId: doc.materialSlots[0]?.id ?? "slot1",
-        transform: { x: 0, y: 0, z: 0, rotationX: 0, rotationY: 0, rotationZ: 0, scaleX: 1, scaleY: 1, scaleZ: 1 },
+        materialSlotId: primaryMaterialSlotId(doc),
+        transform: identityTransform(),
         previewOpacity: 1,
         // Seeded with one rectangle so the layer produces geometry
         // immediately; the properties panel edits the entity list.
@@ -950,7 +951,7 @@ function EditorInner() {
       },
       "הוספת סקיצה"
     );
-  }, [addLayer, doc.materialSlots]);
+  }, [addLayer, doc]);
 
   const handleGeneratorConfirm = useCallback(
     (kind: GeneratorKind, params: GeneratorParams) => {
@@ -959,7 +960,7 @@ function EditorInner() {
         typeof params[key] === "number" ? (params[key] as number) : fallback;
       const bool = (key: string, fallback: boolean): boolean =>
         typeof params[key] === "boolean" ? (params[key] as boolean) : fallback;
-      const slot = doc.materialSlots[0]?.id ?? "slot1";
+      const slot = primaryMaterialSlotId(doc);
 
       void runOp("יצירת חלק פרמטרי", async () => {
         const kernel = await getGeometryKernel();
@@ -1461,7 +1462,7 @@ function EditorInner() {
           generatorToLayer(
             solid,
             `${part.nameHe} — תמיכות`,
-            doc.materialSlots[0]?.id ?? "slot1",
+            primaryMaterialSlotId(doc),
             jobResult.result.summaryHe,
             "supportResult"
           )
@@ -1537,7 +1538,7 @@ function EditorInner() {
           generatorToLayer(
             outcome.solid,
             `${part.nameHe} — Brim`,
-            doc.materialSlots[0]?.id ?? "slot1",
+            primaryMaterialSlotId(doc),
             outcome.summaryHe,
             "brimResult"
           )
@@ -1565,7 +1566,7 @@ function EditorInner() {
         const raftLayer = generatorToLayer(
           outcome.solid,
           `${part.nameHe} — Raft`,
-          doc.materialSlots[0]?.id ?? "slot1",
+          primaryMaterialSlotId(doc),
           outcome.summaryHe,
           "raftResult"
         );
@@ -1836,7 +1837,7 @@ function EditorInner() {
   const resolvedPaintSlotId =
     paintSlotId && doc.materialSlots.some((s) => s.id === paintSlotId)
       ? paintSlotId
-      : (doc.materialSlots[1]?.id ?? doc.materialSlots[0]?.id ?? "slot1");
+      : (doc.materialSlots[1]?.id ?? primaryMaterialSlotId(doc));
 
   const paintInfo: PaintInfo | null = useMemo(() => {
     if (!paintTargetLayer || !faceSelectionPart) return null;
@@ -2403,25 +2404,9 @@ function EditorInner() {
   /** Bounds of the selection (fallback: all parts) for framing and views. */
   const selectionFrame = useCallback(() => {
     const parts = selectedParts.length > 0 ? selectedParts : build.parts;
-    if (parts.length === 0) return null;
-    const min = { x: Infinity, y: Infinity, z: Infinity };
-    const max = { x: -Infinity, y: -Infinity, z: -Infinity };
-    for (const part of parts) {
-      min.x = Math.min(min.x, part.stats.bounds.min.x);
-      min.y = Math.min(min.y, part.stats.bounds.min.y);
-      min.z = Math.min(min.z, part.stats.bounds.min.z);
-      max.x = Math.max(max.x, part.stats.bounds.max.x);
-      max.y = Math.max(max.y, part.stats.bounds.max.y);
-      max.z = Math.max(max.z, part.stats.bounds.max.z);
-    }
-    const center = {
-      x: (min.x + max.x) / 2,
-      y: (min.y + max.y) / 2,
-      z: (min.z + max.z) / 2,
-    };
-    const radius =
-      Math.hypot(max.x - min.x, max.y - min.y, max.z - min.z) / 2 || 10;
-    return { center, radius };
+    const bounds = unionBounds(parts.map((part) => part.stats.bounds));
+    if (!bounds) return null;
+    return { center: boundsCenter(bounds), radius: boundsRadius(bounds) };
   }, [selectedParts, build.parts]);
 
   const handleFrameSelection = useCallback(() => {
@@ -2557,18 +2542,8 @@ function EditorInner() {
     : null;
 
   const totalDims = useMemo(() => {
-    if (build.parts.length === 0) return null;
-    const min = { x: Infinity, y: Infinity, z: Infinity };
-    const max = { x: -Infinity, y: -Infinity, z: -Infinity };
-    for (const p of build.parts) {
-      min.x = Math.min(min.x, p.stats.bounds.min.x);
-      min.y = Math.min(min.y, p.stats.bounds.min.y);
-      min.z = Math.min(min.z, p.stats.bounds.min.z);
-      max.x = Math.max(max.x, p.stats.bounds.max.x);
-      max.y = Math.max(max.y, p.stats.bounds.max.y);
-      max.z = Math.max(max.z, p.stats.bounds.max.z);
-    }
-    return { x: max.x - min.x, y: max.y - min.y, z: max.z - min.z };
+    const bounds = unionBounds(build.parts.map((p) => p.stats.bounds));
+    return bounds ? boundsSize(bounds) : null;
   }, [build.parts]);
 
   return (

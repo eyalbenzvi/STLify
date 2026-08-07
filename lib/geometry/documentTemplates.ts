@@ -12,11 +12,17 @@ import type {
   ProductTemplate,
   TextLayer,
 } from "@/types/design";
-import { defaultBevel, DESIGN_SCHEMA_VERSION, identityTransform, newId } from "@/types/design";
+import {
+  defaultBevel,
+  DESIGN_SCHEMA_VERSION,
+  FALLBACK_MATERIAL_SLOT_ID,
+  identityTransform,
+  newId,
+} from "@/types/design";
 import type { FontId, TextAlign, TextMode } from "./types";
 
 export const DEFAULT_MATERIAL_SLOTS: MaterialSlot[] = [
-  { id: "slot1", nameHe: "צבע ראשי", colorHex: "#2f6feb" },
+  { id: FALLBACK_MATERIAL_SLOT_ID, nameHe: "צבע ראשי", colorHex: "#2f6feb" },
   { id: "slot2", nameHe: "צבע משני", colorHex: "#f0f4fa" },
   { id: "slot3", nameHe: "צבע שלישי", colorHex: "#e0483e" },
 ];
@@ -42,7 +48,7 @@ export function makeBaseLayer(patch: Partial<BaseLayer> = {}): BaseLayer {
     name: "בסיס",
     visible: true,
     locked: false,
-    materialSlotId: "slot1",
+    materialSlotId: FALLBACK_MATERIAL_SLOT_ID,
     transform: identityTransform(),
     previewOpacity: 1,
     shape: "roundedRectangle",
@@ -64,7 +70,7 @@ export function makeTextLayer(patch: Partial<TextLayer> = {}): TextLayer {
     name: "טקסט",
     visible: true,
     locked: false,
-    materialSlotId: "slot1",
+    materialSlotId: FALLBACK_MATERIAL_SLOT_ID,
     transform: identityTransform(),
     previewOpacity: 1,
     content: "שלום",
@@ -91,7 +97,7 @@ export function makeHoleLayer(patch: Partial<HoleLayer> = {}): HoleLayer {
     name: "חור",
     visible: true,
     locked: false,
-    materialSlotId: "slot1",
+    materialSlotId: FALLBACK_MATERIAL_SLOT_ID,
     transform: identityTransform(),
     previewOpacity: 1,
     diameterMm: 4,
@@ -222,7 +228,7 @@ function classicToDocument(spec: ClassicTemplateSpec): DesignDocument {
     lineSpacing: spec.text.lineSpacing,
     extrudeMm: spec.text.depthMm,
     combine: spec.text.mode,
-    materialSlotId: "slot1",
+    materialSlotId: FALLBACK_MATERIAL_SLOT_ID,
     transform: {
       ...identityTransform(),
       x: spec.text.offsetXMm,

@@ -28,7 +28,15 @@ import {
   type DesignDocument,
   type DesignLayer,
   type FacePaint,
+  type MaterialSlot,
 } from "@/types/design";
+import { testBoxLayer, testDocumentWith } from "@/lib/testing/fixtures";
+
+/** Two slots: painting with the body's own colour would be a no-op. */
+const PAINT_SLOTS: MaterialSlot[] = [
+  { id: "slot1", nameHe: "גוף", colorHex: "#2f6feb" },
+  { id: "slot2", nameHe: "כיתוב", colorHex: "#e0483e" },
+];
 
 function paint(
   materialSlotId: string,
@@ -171,40 +179,11 @@ describe("painted region → solid", () => {
 });
 
 describe("export split", () => {
-  function baseDoc(layers: DesignLayer[]): DesignDocument {
-    return {
-      schemaVersion: 3,
-      baseMode: "baseless",
-      layers,
-      materialSlots: [
-        { id: "slot1", nameHe: "גוף", colorHex: "#2f6feb" },
-        { id: "slot2", nameHe: "כיתוב", colorHex: "#e0483e" },
-      ],
-      printerProfileId: "genericFdm220",
-      printabilityProfileId: "fdmPla",
-      customPrintability: null,
-      usageProfileId: null,
-      templateId: null,
-    } as DesignDocument;
-  }
+  const baseDoc = (layers: DesignLayer[]): DesignDocument =>
+    testDocumentWith(layers, { materialSlots: PAINT_SLOTS });
 
-  function boxLayer(facePaint?: FacePaint[]): DesignLayer {
-    return {
-      id: "box",
-      type: "primitive",
-      name: "תיבה",
-      visible: true,
-      locked: false,
-      materialSlotId: "slot1",
-      transform: identityTransform(),
-      previewOpacity: 1,
-      facePaint,
-      ...defaultPrimitive("box"),
-      widthMm: 20,
-      depthMm: 20,
-      heightMm: 20,
-    } as DesignLayer;
-  }
+  const boxLayer = (facePaint?: FacePaint[]): DesignLayer =>
+    testBoxLayer({ facePaint });
 
   it("leaves an unpainted part alone while splitting a painted one", async () => {
     // `toEqual(build.parts)` on an all-unpainted document compared the array
@@ -371,40 +350,18 @@ describe("paint regressions", () => {
 });
 
 describe("export split regressions", () => {
-  function doc(layers: DesignLayer[]): DesignDocument {
-    return {
-      schemaVersion: 3,
-      baseMode: "baseless",
-      layers,
-      materialSlots: [
-        { id: "slot1", nameHe: "גוף", colorHex: "#2f6feb" },
-        { id: "slot2", nameHe: "כיתוב", colorHex: "#e0483e" },
-      ],
-      printerProfileId: "genericFdm220",
-      printabilityProfileId: "fdmPla",
-      customPrintability: null,
-      usageProfileId: null,
-      templateId: null,
-    } as DesignDocument;
-  }
+  const doc = (layers: DesignLayer[]): DesignDocument =>
+    testDocumentWith(layers, { materialSlots: PAINT_SLOTS });
 
-  function plate(facePaint?: FacePaint[]): DesignLayer {
-    return {
+  const plate = (facePaint?: FacePaint[]): DesignLayer =>
+    testBoxLayer({
       id: "plate",
-      type: "primitive",
       name: "לוחית",
-      visible: true,
-      locked: false,
-      materialSlotId: "slot1",
-      transform: identityTransform(),
-      previewOpacity: 1,
       facePaint,
-      ...defaultPrimitive("box"),
       widthMm: 40,
       depthMm: 20,
       heightMm: 2,
-    } as DesignLayer;
-  }
+    });
 
   /**
    * A thin-WALLED body. The depth bound is derived from the bounding box, so

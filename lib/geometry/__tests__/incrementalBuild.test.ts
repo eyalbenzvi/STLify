@@ -12,9 +12,8 @@
  *    correct when one anchored layer changes.
  */
 
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { installNodeFontFetch } from "../nodeFontFetch";
 import {
   defaultPrimitive,
   identityTransform,
@@ -29,17 +28,7 @@ import {
 } from "../buildDocument";
 import { createTemplateDocument, emptyDocument } from "../documentTemplates";
 
-beforeAll(() => {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = String(input);
-    if (url.startsWith("/fonts/")) {
-      const buffer = readFileSync(join(process.cwd(), "public", url));
-      return new Response(new Uint8Array(buffer), { status: 200 });
-    }
-    return originalFetch(input, init);
-  }) as typeof fetch;
-});
+beforeAll(installNodeFontFetch);
 
 beforeEach(() => clearLayerSolidCache());
 

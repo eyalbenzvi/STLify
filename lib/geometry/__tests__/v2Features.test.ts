@@ -4,9 +4,8 @@
  * templates, and the detailed estimation heuristics.
  */
 
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
+import { installNodeFontFetch } from "../nodeFontFetch";
 import { buildDocument } from "../buildDocument";
 import {
   createTemplateDocument,
@@ -22,17 +21,7 @@ import {
 } from "../analysis/estimateDetailed";
 import type { DesignDocument } from "@/types/design";
 
-beforeAll(() => {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = String(input);
-    if (url.startsWith("/fonts/")) {
-      const buffer = readFileSync(join(process.cwd(), "public", url));
-      return new Response(new Uint8Array(buffer), { status: 200 });
-    }
-    return originalFetch(input, init);
-  }) as typeof fetch;
-});
+beforeAll(installNodeFontFetch);
 
 async function buildOk(document: DesignDocument) {
   const result = await buildDocument(document);
