@@ -437,6 +437,10 @@ export function closestPointOnTriangle(mesh: MeshData, t: number, p: Vec3Like): 
   };
 }
 
+// Reused across calls: this runs per ray per candidate triangle, which the
+// voxel remesher drives into the millions.
+const facingCross: [number, number, number] = [0, 0, 0];
+
 /** True when the triangle's outward normal points away from the ray. */
 function triangleFacesAway(mesh: MeshData, t: number, direction: Vec3Like): boolean {
   const idx = mesh.indices;
@@ -444,7 +448,8 @@ function triangleFacesAway(mesh: MeshData, t: number, direction: Vec3Like): bool
     mesh.positions,
     idx[t * 3],
     idx[t * 3 + 1],
-    idx[t * 3 + 2]
+    idx[t * 3 + 2],
+    facingCross
   );
   return nx * direction.x + ny * direction.y + nz * direction.z > 0;
 }

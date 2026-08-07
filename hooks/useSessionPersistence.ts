@@ -183,15 +183,17 @@ export function useSessionPersistence({
   }, [doc, runOp, showMessage]);
 
   // Load a shared design from the URL hash once, on startup. The hash is
-  // then cleared, so a reload does not re-import over the user's edits.
+  // cleared only on SUCCESS: a link that failed to decode stays in the
+  // address bar, where the user can still copy it, rather than being erased
+  // along with the only copy of the design it carried.
   useEffect(() => {
     const hash = window.location.hash;
     if (!hash.startsWith(SHARE_HASH_PREFIX)) return;
-    window.history.replaceState(null, "", window.location.pathname);
     void (async () => {
       try {
         const { document: shared, warningsHe } = await decodeShareHash(hash);
         applyDocument(shared, "טעינת עיצוב מקישור");
+        window.history.replaceState(null, "", window.location.pathname);
         if (warningsHe.length > 0) {
           showMessage({
             titleHe: "העיצוב מהקישור נטען עם הערות",

@@ -181,6 +181,10 @@ function EditorInner() {
 
   /** Which modal is showing; see hooks/useEditorDialogs.ts. */
   const dialogs = useEditorDialogs();
+  // Stable: the keyboard hook keeps its listener registered across renders
+  // only if the callbacks it depends on keep their identity.
+  const { open: openDialog } = dialogs;
+  const openShortcutHelp = useCallback(() => openDialog("shortcuts"), [openDialog]);
   const [message, setMessage] = useState<OpMessage | null>(null);
 
   /** Cut-plane definition: edited live in the dialog, remembered after. */
@@ -796,7 +800,7 @@ function EditorInner() {
     selectedParts,
     selectedLayers,
     onDuplicate: handleDuplicate,
-    onShowShortcutHelp: () => dialogs.open("shortcuts"),
+    onShowShortcutHelp: openShortcutHelp,
     setFocusTarget,
     setViewPreset,
   });
