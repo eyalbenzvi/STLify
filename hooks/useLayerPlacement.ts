@@ -10,7 +10,7 @@
  */
 
 import { useCallback } from "react";
-import type { DesignLayer, Transform3D } from "@/types/design";
+import type { Axis, DesignLayer, Transform3D } from "@/types/design";
 import { newId } from "@/types/design";
 import { getPrintabilityProfile, type PrinterProfile } from "@/types/profiles";
 import type { BuiltPart } from "@/hooks/useDocumentBuilder";
@@ -31,8 +31,6 @@ import {
   snapToObjectCenter,
   snapToObjectEdge,
 } from "@/lib/geometry/operations/placement";
-
-export type Axis = "x" | "y" | "z";
 
 /** Offset given to a duplicate so it does not hide under its original, mm. */
 const DUPLICATE_OFFSET_MM = { x: 10, y: -10, z: 0 };

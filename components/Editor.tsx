@@ -126,18 +126,20 @@ import { LibraryDialog } from "@/components/dialogs/LibraryDialog";
 import { ShortcutsDialog } from "@/components/dialogs/ShortcutsDialog";
 import { GeneratorDialog } from "@/components/dialogs/GeneratorDialog";
 import {
-  DeformDialog,
   EmbossDialog,
   FilletDialog,
-  InterferenceDialog,
-  LatticeDialog,
-  MeshInspectorDialog,
-  ModifierEditDialog,
-  PatternDialog,
-  RecoveryDialog,
   RevolveDialog,
   ShellDialog,
-} from "@/components/dialogs/AdvancedDialogs";
+} from "@/components/dialogs/ReshapeDialogs";
+import { DeformDialog } from "@/components/dialogs/DeformDialog";
+import { LatticeDialog } from "@/components/dialogs/LatticeDialog";
+import { PatternDialog } from "@/components/dialogs/PatternDialog";
+import {
+  InterferenceDialog,
+  MeshInspectorDialog,
+} from "@/components/dialogs/MeshHealthDialogs";
+import { ModifierEditDialog } from "@/components/dialogs/ModifierEditDialog";
+import { RecoveryDialog } from "@/components/dialogs/RecoveryDialog";
 import { BaseModeSwitchDialog, OrientationDialog } from "@/components/dialogs/MiscDialogs";
 
 // react-three-fiber requires the browser; skip server rendering entirely.

@@ -43,6 +43,9 @@ export interface Transform3D {
   scaleZ: number;
 }
 
+/** One of the three world axes. */
+export type Axis = "x" | "y" | "z";
+
 export function identityTransform(): Transform3D {
   return {
     x: 0,

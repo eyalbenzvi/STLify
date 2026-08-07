@@ -15,6 +15,7 @@ import {
   type ReactNode,
 } from "react";
 import type {
+  Axis,
   DesignDocument,
   DesignLayer,
   EditorHistoryState,
@@ -71,7 +72,7 @@ export interface SnapSettings {
 
 export interface SectionPlaneState {
   enabled: boolean;
-  axis: "x" | "y" | "z";
+  axis: Axis;
   offsetMm: number;
   flip: boolean;
 }

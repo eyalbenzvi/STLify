@@ -9,6 +9,7 @@
 import { useState } from "react";
 import { NumberField } from "@/components/ui/NumberField";
 import { ToggleGroup } from "@/components/ui/ToggleGroup";
+import type { Axis } from "@/types/design";
 import type { EditorTool, PrintPreviewState, SectionPlaneState } from "./store";
 
 export interface InspectPanelProps {
@@ -25,13 +26,13 @@ export interface InspectPanelProps {
   onSetXray: (xray: boolean) => void;
   onSetPrintPreview: (patch: Partial<PrintPreviewState>) => void;
   onClearMeasurements: () => void;
-  onScaleTo: (axis: "x" | "y" | "z" | "longest", targetMm: number, uniform: boolean) => void;
+  onScaleTo: (axis: Axis | "longest", targetMm: number, uniform: boolean) => void;
   onFitBuildVolume: () => void;
 }
 
 export function InspectPanel(props: InspectPanelProps) {
   const { tool, section, xray, printPreview, measurementCount, selectedDims, busy } = props;
-  const [scaleAxis, setScaleAxis] = useState<"x" | "y" | "z" | "longest">("x");
+  const [scaleAxis, setScaleAxis] = useState<Axis | "longest">("x");
   const [scaleTarget, setScaleTarget] = useState(100);
   const [uniform, setUniform] = useState(true);
 
