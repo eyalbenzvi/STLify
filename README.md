@@ -1,16 +1,21 @@
-# PrintCraft STL Studio — V5
+# PrintCraft STL Studio — V6
 
 A browser-only studio for designing genuinely 3D-printable models — text,
 SVG artwork, image silhouettes/reliefs and imported STL files — with a
 Hebrew, right-to-left UI. V3 added a layer-based 3D editor and print
 preparation tools; V4 added real modelling — creating geometry from nothing,
-reshaping it, and repairing broken meshes. V5 connects that engine to the
-user, puts a regression net under it, and makes the output actually print.
+reshaping it, and repairing broken meshes. V5 connected that engine to the
+user, put a regression net under it, and made the output actually print.
+V6 moves the hot path off the main thread, makes exports slicer-honest,
+and adds the automation and persistence a small production shop needs.
 
-Everything runs locally in the browser. There is **no AI, no server-side
-generation, no accounts and no persistence**: the active design exists only
-in the current browser session, and users save/restore work via portable
-`.formadesign.json` files.
+Everything runs locally, on this device. There is **no AI, no server-side
+generation, no accounts and no sync**: heuristics are deterministic and
+explained in Hebrew, the working document lives in the browser session, and
+the only storage is device-local — a single crash-recovery slot and an
+optional local design library (IndexedDB), both of which can be switched
+off entirely and wiped entirely. Portable `.formadesign.json` files are how
+work leaves the device.
 
 ## Getting started
 
@@ -25,6 +30,97 @@ npm run typecheck  # tsc --noEmit
 ```
 
 Open http://localhost:3000. A sample name-plate design is preloaded.
+
+Two additional commands arrived with V6:
+
+```bash
+npm run bench      # performance budgets (fails above named thresholds)
+npm run batch -- --design x.formadesign.json --csv rows.csv --out batch.zip
+```
+
+## V6 features
+
+V6 came out of a five-expert review of V5 (`docs/V6-PLAN.md` is the plan it
+was executed against). The governing findings: the hot path still ran on
+the main thread, exports were not slicer-honest, and the tool had no
+automation story despite a real expression engine.
+
+### Wave 1 — immediate wins
+
+- **BVH picking**: viewport face picking goes through the project's own
+  triangle BVH instead of three's linear scan — a pick on a 500K-triangle
+  import costs dozens of triangle tests, not half a million.
+- **Demand frameloop**: the canvas renders only when something changed
+  (`frameloop="demand"`, `dpr` capped at 2); every change point invalidates,
+  and an e2e journey proves the viewport repaints in every tool mode.
+- **Bounded history that actually frees memory**: 50 steps (a documented
+  memory bound), with a sweep that releases the meshes only trimmed history
+  entries referenced.
+- **Zero lint warnings**: the nine hook-dependency warnings are closed for
+  real, not silenced.
+
+### Wave 2 — the hot path
+
+- **The document build runs in the Web Worker** — the code path behind
+  every keystroke, with progress, cancellation of superseded builds, and an
+  honest `ranOn` report (pinned by an e2e assertion that fails on a silent
+  fallback).
+- **Incremental rebuilds**: derived per-layer solids are cached by a
+  content hash; changing one layer rebuilds one layer, moving a layer
+  rebuilds zero.
+- **Booleans, Minkowski hollow/thicken, drain drilling, thickness sampling
+  and support generation are worker jobs** with cancellation that stops
+  at memory-accounted checkpoints.
+- **The WASM memory contract is enforceable**: idempotent dispose, a live
+  handle counter, and a solid scope that frees everything on success and
+  throw alike — leak tests assert zero across boolean chains, error paths
+  and cancellations.
+- **Performance budgets** (`npm run bench`): synthetic 50K/200K/500K-triangle
+  meshes, named thresholds, failure above them — kept out of `npm test` so
+  the correctness gate never flakes on wall-clock.
+
+### Wave 3 — printing and slicer compatibility
+
+- **Supports export as SUPPORT objects in 3MF** (via a spec-compliant
+  component wrapper), so a slicer prints removable aids instead of
+  full-infill bodies; the ZIP README warns per support part.
+- **Slice-measured estimates**: print time is priced per component —
+  perimeters, skins/infill, travel, SLA exposure and area-dependent lift —
+  from real kernel slices, with the breakdown shown in Hebrew and the
+  "rough estimate" labelling kept everywhere.
+- **Warping analysis** with a deterministic, explained score (contact span,
+  contact area, height-to-base), and **brim/raft as real deletable
+  geometry** derived from the first-layer outline.
+- **3MF production structure**: stable object ids, local geometry placed by
+  build transforms, and the layer hierarchy exported as assemblies.
+
+### Wave 4 — automation and production
+
+- **Headless batch CLI**: a design file plus a CSV → a ZIP with a part per
+  row (parameters and text-layer content per column), watertight-checked,
+  with honest per-row failure reporting. Local only.
+- **Better plate arrangement**: rotation candidates (15° steps; rectangles
+  resolve to 0/90°) measured on the true convex hull of each part's
+  projection — deterministic, as before.
+- **A local design library** with names, tags and numbered versions per
+  design, in IndexedDB on this device only; loading goes through the same
+  validation as an untrusted file, and the whole feature can be disabled
+  and wiped.
+
+### Wave 5 — editing and UI
+
+- **Face paint survives edits**: painted regions carry spatial anchors and
+  are re-projected onto the rebuilt body by proximity + normal agreement
+  (thin walls stay two-sided). Pre-V6 paint keeps the honest discard.
+- **The full 3D-tool keyboard set**: F (frame selection), Ctrl+D, Ctrl+A,
+  numeric view presets, a remappable keymap stored locally, and a help
+  screen (Shift+?).
+- **Responsive + touch**: a collapsible tool sheet below `lg`, finger-sized
+  hit areas on coarse pointers, a touch-sized gizmo, and tap
+  select/deselect — with phone and tablet e2e journeys.
+- **Local fillet on a selected region**: cut-round-union through pure
+  Manifold booleans, watertight by construction, gated by a validity check
+  — with the boundary-step caveat stated in the UI (see limitations).
 
 ## V5 features
 
@@ -253,6 +349,10 @@ the plan they were executed against.
 | Snapping | `lib/geometry/snapping.ts` | Vertex/edge/face snapping, angle, radius and thickness measurement |
 | Jobs | `lib/geometry/jobs/*` | Named geometry jobs, Web Worker, in-process fallback |
 | Recovery | `lib/serialization/crashRecovery.ts` | Single-slot local snapshot |
+| Library | `lib/serialization/designLibrary.ts` | Device-local design library with numbered versions (IndexedDB) |
+| Batch | `cli/batch.ts`, `cli/batchCore.ts` | Headless CSV → ZIP production runs (local Node process) |
+| Keyboard | `lib/keyboard/keymap.ts` | Editable, locally persisted shortcut map |
+| Benchmarks | `bench/perf.bench.ts` | Performance budgets (`npm run bench`) |
 | UI | `components/**`, `hooks/useDocumentBuilder.ts` | RTL Hebrew editor, R3F viewer, dialogs |
 
 ### Why Manifold (manifold-3d)
@@ -296,34 +396,54 @@ interfaces so it can be swapped without touching the pipeline.
 
 - Niqqud / combining marks and full bidi nesting are not supported in text
   layout; kerning uses the `kern` table only.
-- Heavy geometry runs in a Web Worker with progress and cancel. Where the
-  worker cannot start, the operation falls back to the main thread and the
-  overlay says so; complexity caps refuse pathological inputs with a clear
-  Hebrew message.
+- Heavy geometry — including the document rebuild behind every edit — runs
+  in a Web Worker with progress and cancel. Where the worker cannot start,
+  the operation falls back to the main thread and says so honestly
+  (`ranOn`); complexity caps refuse pathological inputs with a clear Hebrew
+  message.
 - Hollow/thicken simplify very dense meshes before the Minkowski step, so
   the effective wall thickness may deviate slightly on complex models (a
   warning says so).
-- Orientation/support analysis is a transparent heuristic, not slicer
-  output, and the UI says so everywhere it appears.
+- Orientation/support/warping analyses and the print estimates are
+  transparent heuristics, not slicer output, and the UI says so everywhere
+  they appear. The V6 estimate measures real slice geometry, but its speeds
+  are documented workshop constants — always verify in your slicer.
 - Dovetail connectors assemble by sliding sideways (the UI explains this).
 
 ### Remaining caveats
 
-All thirty V4 features and all three V5 waves are implemented. Four carry
-honest limits worth repeating:
+All V4/V5 features and all five V6 waves are implemented. The honest limits
+worth repeating, updated for V6:
 
-- **Fillet remains global, not per-edge.** Sub-object selection now exists,
-  but Manifold still has no edge-select fillet operator, so rounding is
-  morphological and affects every edge of the chosen kind. Per-edge filleting
-  would need a different kernel.
+- **Per-edge fillet still does not exist — the local fillet is a
+  workaround.** Manifold has no edge-select fillet operator. V6's "round
+  the selected region" composes booleans (round a whole-body duplicate,
+  keep it only inside the region's zone, keep the original elsewhere), so
+  the result is watertight by construction — but an edge that continues
+  past the region boundary shows a small STEP where rounded meets sharp.
+  The UI says this before you click. True per-edge filleting would need a
+  different kernel.
 - **Booleans, cuts and connectors stay destructive.** The modifier stack
   covers unary operations on one body. Multi-body operations produce a
   different SET of layers rather than a different shape for one layer, so
   they are not expressible as a modifier.
-- **Face paint is index-based.** Painted regions are recorded as triangle
-  indices into the layer's built body, fingerprinted by that body's triangle
-  count. Editing the layer into a different shape therefore discards its
-  paint — with a message — rather than colouring unrelated faces.
-- **`Editor.tsx` is still large** (2,677 lines). Wave B moved import and
-  analysis handling out, but the operation handlers share a dense web of
-  state that would need lifting into the store before they can follow.
+- **Face paint now survives edits — within a catch radius.** Painted
+  regions carry spatial anchors and re-project onto the rebuilt body by
+  proximity and normal agreement. A region that MOVES far beyond its own
+  triangle size (a large push-pull of the painted face itself) is dropped
+  with the old honest warning rather than guessed at, and paint saved
+  before V6 (no anchors) keeps the old discard behaviour.
+- **The paint split at export runs in-process.** Everything else heavy is
+  a worker job; the export-time split is a one-shot user action whose
+  meshes double as live viewport buffers, which must not be transferred.
+- **The incremental build cache is per-layer, not per-assembly.** Changing
+  one layer rebuilds only that layer, but the assembly stage (base
+  booleans, holes, first-layer compensation) always re-runs — it genuinely
+  depends on multiple layers.
+- **The batch CLI drives parameters and text content.** Other layer fields
+  (colours, transforms) are not CSV-addressable; bind them to parameters
+  where the field supports it.
+- **`Editor.tsx` is still large** (3,242 lines — V6 added print-prep,
+  library, keymap and touch wiring faster than extraction removed it). The
+  operation handlers still share a dense web of state that would need
+  lifting into the store before they can follow the V5 extractions.

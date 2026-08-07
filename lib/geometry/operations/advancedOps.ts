@@ -205,12 +205,15 @@ export function generatorToLayer(
   solid: import("../kernel").Solid,
   nameHe: string,
   materialSlotId: string,
-  descriptionHe: string
+  descriptionHe: string,
+  // Print aids (supports/brim/raft) pass their own kind so the export can
+  // mark them for the slicer instead of shipping them as model bodies.
+  kind: ImportedMeshLayer["provenance"]["kind"] = "stlImport"
 ): ImportedMeshLayer {
   assertValidResult(solid, nameHe);
   return solidToResultLayer(solid, {
     nameHe,
-    provenance: { kind: "stlImport", descriptionHe },
+    provenance: { kind, descriptionHe },
     materialSlotId,
   });
 }

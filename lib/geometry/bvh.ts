@@ -8,6 +8,7 @@
  *   • self-intersection detection (overlapping triangle pairs)
  *   • signed-distance sampling for voxel remeshing and lattice infill
  *   • closest-feature queries for viewport snapping
+ *   • closest-hit ray casting for viewport picking (see viewportRaycast.ts)
  *
  * Built with a median split on the longest axis of the centroid bounds, which
  * is cheap to construct and good enough for the mesh sizes a browser-side
@@ -36,6 +37,19 @@ export interface Vec3Like {
   x: number;
   y: number;
   z: number;
+}
+
+/** Result of `raycastClosest`: nearest triangle along the ray. */
+export interface RaycastHit {
+  triangleIndex: number;
+  /** Ray parameter t (metric distance for a unit direction). */
+  distance: number;
+  point: Vec3Like;
+}
+
+/** Instrumentation for `raycastClosest` — lets tests pin the pick cost. */
+export interface RaycastStats {
+  triangleTests: number;
 }
 
 export class MeshBvh {
@@ -286,6 +300,71 @@ export class MeshBvh {
     return { crossings, winding };
   }
 
+  /**
+   * Closest intersection of a ray with the mesh, front or back facing (the
+   * viewport renders double-sided, so picking must too).
+   *
+   * `distance` is the ray parameter t — the metric distance when `direction`
+   * is unit length. Children are visited nearer-first and pruned against the
+   * best hit so far, which is what makes a pick O(log n) instead of a linear
+   * scan; `stats.triangleTests` counts the narrow-phase tests actually run so
+   * a regression back to linear scanning fails a test rather than a user.
+   */
+  raycastClosest(
+    origin: Vec3Like,
+    direction: Vec3Like,
+    stats?: RaycastStats
+  ): RaycastHit | null {
+    if (this.nodes.length === 0) return null;
+    let bestT = Infinity;
+    let bestTriangle = -1;
+
+    // Stack entries pair a node with its box entry distance, so subtrees
+    // entirely behind an existing hit are skipped without touching them.
+    const stack: { node: number; tEntry: number }[] = [];
+    const rootEntry = rayBoxEntry(origin, direction, this.nodes[0]);
+    if (rootEntry === Infinity) return null;
+    stack.push({ node: 0, tEntry: rootEntry });
+
+    while (stack.length > 0) {
+      const { node: nodeIndex, tEntry } = stack.pop() as { node: number; tEntry: number };
+      if (tEntry >= bestT) continue;
+      const node = this.nodes[nodeIndex];
+      if (node.count >= 0) {
+        this.forEachLeafTriangle(node, (t) => {
+          if (stats) stats.triangleTests++;
+          const hitT = rayTriangleDistance(this.mesh, t, origin, direction);
+          if (hitT > 0 && hitT < bestT) {
+            bestT = hitT;
+            bestTriangle = t;
+          }
+        });
+      } else {
+        const leftEntry = rayBoxEntry(origin, direction, this.nodes[node.left]);
+        const rightEntry = rayBoxEntry(origin, direction, this.nodes[node.right]);
+        // Push the farther child first so the nearer one is explored first.
+        if (leftEntry <= rightEntry) {
+          if (rightEntry < Infinity) stack.push({ node: node.right, tEntry: rightEntry });
+          if (leftEntry < Infinity) stack.push({ node: node.left, tEntry: leftEntry });
+        } else {
+          if (leftEntry < Infinity) stack.push({ node: node.left, tEntry: leftEntry });
+          if (rightEntry < Infinity) stack.push({ node: node.right, tEntry: rightEntry });
+        }
+      }
+    }
+
+    if (bestTriangle === -1) return null;
+    return {
+      triangleIndex: bestTriangle,
+      distance: bestT,
+      point: {
+        x: origin.x + direction.x * bestT,
+        y: origin.y + direction.y * bestT,
+        z: origin.z + direction.z * bestT,
+      },
+    };
+  }
+
   /** Every pair of triangles whose bounding boxes overlap, i < j. */
   candidatePairs(visit: (a: number, b: number) => void): void {
     for (let t = 0; t < this.triangleCount; t++) {
@@ -377,6 +456,33 @@ function triangleFacesAway(mesh: MeshData, t: number, direction: Vec3Like): bool
   return nx * direction.x + ny * direction.y + nz * direction.z > 0;
 }
 
+/**
+ * Ray parameter at which the ray enters the node's box, or Infinity when it
+ * misses. 0 when the origin is already inside.
+ */
+function rayBoxEntry(origin: Vec3Like, direction: Vec3Like, node: BvhNode): number {
+  let tMin = 0;
+  let tMax = Infinity;
+  const o = [origin.x, origin.y, origin.z];
+  const d = [direction.x, direction.y, direction.z];
+  const lo = [node.minX, node.minY, node.minZ];
+  const hi = [node.maxX, node.maxY, node.maxZ];
+  for (let axis = 0; axis < 3; axis++) {
+    if (Math.abs(d[axis]) < 1e-12) {
+      if (o[axis] < lo[axis] || o[axis] > hi[axis]) return Infinity;
+      continue;
+    }
+    const inv = 1 / d[axis];
+    let t1 = (lo[axis] - o[axis]) * inv;
+    let t2 = (hi[axis] - o[axis]) * inv;
+    if (t1 > t2) [t1, t2] = [t2, t1];
+    if (t1 > tMin) tMin = t1;
+    if (t2 < tMax) tMax = t2;
+    if (tMin > tMax) return Infinity;
+  }
+  return tMin;
+}
+
 function rayHitsBox(origin: Vec3Like, direction: Vec3Like, node: BvhNode): boolean {
   let tMin = 0;
   let tMax = Infinity;
@@ -407,6 +513,19 @@ function rayHitsTriangle(
   origin: Vec3Like,
   direction: Vec3Like
 ): boolean {
+  return rayTriangleDistance(mesh, t, origin, direction) > 0;
+}
+
+/**
+ * Ray parameter of the intersection with triangle `t`, or -1 when the ray
+ * misses (front and back faces alike; hits behind the origin rejected).
+ */
+function rayTriangleDistance(
+  mesh: MeshData,
+  t: number,
+  origin: Vec3Like,
+  direction: Vec3Like
+): number {
   const pos = mesh.positions;
   const idx = mesh.indices;
   const ia = idx[t * 3] * 3;
@@ -422,18 +541,18 @@ function rayHitsTriangle(
   const py = direction.z * e2x - direction.x * e2z;
   const pz = direction.x * e2y - direction.y * e2x;
   const det = e1x * px + e1y * py + e1z * pz;
-  if (Math.abs(det) < 1e-12) return false;
+  if (Math.abs(det) < 1e-12) return -1;
   const invDet = 1 / det;
   const tx = origin.x - pos[ia];
   const ty = origin.y - pos[ia + 1];
   const tz = origin.z - pos[ia + 2];
   const u = (tx * px + ty * py + tz * pz) * invDet;
-  if (u < 0 || u > 1) return false;
+  if (u < 0 || u > 1) return -1;
   const qx = ty * e1z - tz * e1y;
   const qy = tz * e1x - tx * e1z;
   const qz = tx * e1y - ty * e1x;
   const v = (direction.x * qx + direction.y * qy + direction.z * qz) * invDet;
-  if (v < 0 || u + v > 1) return false;
+  if (v < 0 || u + v > 1) return -1;
   const distance = (e2x * qx + e2y * qy + e2z * qz) * invDet;
-  return distance > 1e-9;
+  return distance > 1e-9 ? distance : -1;
 }

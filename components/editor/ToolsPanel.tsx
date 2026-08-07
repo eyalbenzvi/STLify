@@ -58,6 +58,9 @@ export interface ToolsPanelProps {
   onEmboss: () => void;
   onGenerateSupports: () => void;
   onCheckBridging: () => void;
+  onAnalyzeWarping: () => void;
+  onGenerateBrim: () => void;
+  onGenerateRaft: () => void;
   /** True when the selection is a profile that can be revolved. */
   canRevolve: boolean;
   /** Number of printable parts currently in the document. */
@@ -386,6 +389,24 @@ export function ToolsPanel(props: ToolsPanelProps) {
             title="מאתר מקטעים אופקיים ללא תמיכה מתחתם"
             disabled={partCount === 0 || busy}
             onClick={props.onCheckBridging}
+          />
+          <ToolButton
+            label="ניתוח כיווץ"
+            title="מעריך סיכון להתקמרות (Warping) לפי שטח מגע, אורך הקצה ויחס גובה־בסיס — ניקוד מוסבר"
+            disabled={partCount === 0 || busy}
+            onClick={props.onAnalyzeWarping}
+          />
+          <ToolButton
+            label="הוספת Brim"
+            title="טבעת ברוחב 5 מ״מ סביב השכבה הראשונה — גיאומטריה אמיתית בשכבה נפרדת שאפשר למחוק"
+            disabled={partCount === 0 || busy}
+            onClick={props.onGenerateBrim}
+          />
+          <ToolButton
+            label="הוספת Raft"
+            title="משטח בעובי 2 מ״מ מתחת לחלק (החלק מורם עליו) — שכבה נפרדת שאפשר למחוק"
+            disabled={partCount === 0 || busy}
+            onClick={props.onGenerateRaft}
           />
         </div>
       </div>

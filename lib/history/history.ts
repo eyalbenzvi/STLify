@@ -6,8 +6,17 @@
 
 import type { DesignDocument, EditorHistoryState, HistoryEntry } from "@/types/design";
 
-/** Bounded history depth (memory safety with imported meshes referenced). */
-export const HISTORY_CAPACITY = 100;
+/**
+ * Bounded history depth.
+ *
+ * The cap is a MEMORY bound, not just a UX choice: the mesh store's garbage
+ * collector keeps every mesh referenced anywhere in history, so an unbounded
+ * history is an unbounded mesh store — twenty booleans on an imported STL
+ * would keep all twenty intermediate meshes alive forever. 50 steps covers a
+ * real editing session while keeping the worst case at 50 retained meshes;
+ * `retention.ts` sweeps the store whenever entries fall off the old end.
+ */
+export const HISTORY_CAPACITY = 50;
 
 export function createHistory(document: DesignDocument): EditorHistoryState {
   return {

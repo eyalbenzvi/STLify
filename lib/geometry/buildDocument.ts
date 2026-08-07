@@ -31,6 +31,7 @@ import type {
 import { isContourLayer, isShapeLayer } from "@/types/design";
 import { getPrintabilityProfile } from "@/types/profiles";
 import { getGeometryKernel, type GeometryKernel, type Solid } from "./kernel";
+import { withSolidScopeSync } from "./solidScope";
 import {
   meshDataBounds,
   meshDataSurfaceArea,
@@ -94,6 +95,110 @@ export interface DocumentBuildResult {
   parts: PrintablePart[];
   /** Document-level issues (per-layer failures, emptiness, ...). */
   issues: ModelIssue[];
+}
+
+/**
+ * Progress and cancellation hooks, used when the build runs as a job.
+ *
+ * `throwIfCancelled` throws the CALLER's cancellation error; buildDocument
+ * guarantees that anything it throws propagates out with every solid built
+ * so far disposed — a cancelled build must not leak WASM memory.
+ */
+export interface BuildDocumentOptions {
+  onProgress?: (fraction: number, labelHe: string) => void;
+  throwIfCancelled?: () => void;
+  /** Filled in when provided: how many layers were rebuilt vs served from cache. */
+  stats?: BuildStats;
+  /** Disable the per-layer solid cache (comparison tests). Default: enabled. */
+  useLayerCache?: boolean;
+}
+
+export interface BuildStats {
+  layersBuilt: number;
+  layersFromCache: number;
+}
+
+// ---------------------------------------------------------------------------
+// Per-layer solid cache (incremental rebuilds)
+// ---------------------------------------------------------------------------
+
+/**
+ * Cache of the DERIVED per-layer solids, keyed by layer id.
+ *
+ * The expensive part of a rebuild is per layer: glyph contouring, extrusion,
+ * kernel loading of imported meshes, and the modifier stack. All of that is
+ * a pure function of the layer's RESOLVED content — not of its transform
+ * (solids are built in the layer's local frame; placement happens at
+ * assembly) and not of the other layers. So a solid can be reused as long
+ * as the content hash matches, and only the layers the edit touched are
+ * rebuilt; assembly (booleans, holes, elephant foot) always reruns because
+ * it genuinely depends on multiple layers.
+ *
+ * Manifold's memory model is what makes the bookkeeping strict: assembly
+ * CONSUMES the solids it is given, so the cache hands out `duplicate()`
+ * handles and never exposes the stored one. (duplicate() is a cheap extra
+ * handle to shared geometry — disposing one side never invalidates the
+ * other.) Invalidated and orphaned entries are disposed explicitly.
+ *
+ * Lives per thread (module state): the worker keeps it across builds, which
+ * is exactly where incremental rebuilds pay off.
+ */
+interface LayerCacheEntry {
+  hash: string;
+  solid: Solid;
+  /** Modifier warnings emitted when the solid was built — re-reported on hits. */
+  issues: ModelIssue[];
+}
+
+const layerSolidCache = new Map<string, LayerCacheEntry>();
+
+/** Dispose and forget every cached layer solid (tests, memory pressure). */
+export function clearLayerSolidCache(): void {
+  for (const entry of layerSolidCache.values()) entry.solid.dispose();
+  layerSolidCache.clear();
+}
+
+/** JSON.stringify with sorted object keys, so hashes are order-stable. */
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "u";
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  const keys = Object.keys(value as Record<string, unknown>).sort();
+  return `{${keys
+    .map((k) => `${JSON.stringify(k)}:${stableStringify((value as Record<string, unknown>)[k])}`)
+    .join(",")}}`;
+}
+
+/**
+ * Content hash of everything the layer's LOCAL solid depends on. The
+ * transform and name are deliberately excluded (they do not change the local
+ * geometry); the resolved layer is used so parameter/binding changes
+ * propagate; nozzle diameter feeds the lattice modifier's safety check.
+ */
+function layerContentHash(
+  resolvedLayer: ShapeLayer,
+  effectiveCombine: EffectiveCombine,
+  nozzleDiameterMm: number
+): string {
+  // Excluded on purpose: transform, pivot and parentId only place the solid
+  // (assembly-stage); name/locked/previewOpacity/facePaint are not geometry.
+  const {
+    transform,
+    pivot,
+    parentId,
+    name,
+    locked,
+    previewOpacity,
+    facePaint,
+    ...content
+  } = resolvedLayer as ShapeLayer & Record<string, unknown>;
+  void transform;
+  void pivot;
+  void parentId;
+  void name;
+  void locked;
+  void previewOpacity;
+  void facePaint;
+  return stableStringify({ content, effectiveCombine, nozzleDiameterMm });
 }
 
 export function findBaseLayer(document: DesignDocument): BaseLayer | null {
@@ -481,46 +586,43 @@ function applyElephantFoot(
   const toWorld = worldMatrix;
   const toLocal = worldMatrix.clone().invert();
 
-  // Work on a duplicate so a mid-way kernel failure cannot leave the caller
-  // holding a consumed handle — `refine`/`warp`/`split` all consume.
-  const working = solid.duplicate();
-  let bottom: Solid | null = null;
-  let top: Solid | null = null;
+  // The scope owns every intermediate; a mid-way kernel failure frees them
+  // all and leaves the caller holding the original untouched `solid`.
+  // (dispose() is idempotent, so handles consumed by split/union are
+  // skipped safely by the final sweep.)
   try {
-    // A world-space slab from below the part up to the compensation height,
-    // expressed in the part's own frame so it can cut the local solid.
-    const size = new THREE.Vector3();
-    worldBounds.getSize(size);
-    const pad = Math.max(size.x, size.y, 10) + 10;
-    const floor = worldBounds.min.z - 1;
-    const span = pad * 2;
-    const slab = kernel
-      .box(span, span, height - floor, false)
-      .translate(centreX - pad, centreY - pad, floor)
-      .transform(matrix4ToManifoldMat4(toLocal));
-    [bottom, top] = working.splitBySolid(slab);
-    if (bottom.isEmpty()) {
-      bottom.dispose();
-      top.dispose();
-      return { solid, failed: false };
-    }
-    const warped = insetSlabWalls(kernel, bottom, calibration, toWorld, toLocal);
-    bottom = null;
-    if (!warped) {
-      top.dispose();
-      return { solid, failed: true };
-    }
-    const merged = top.isEmpty() ? (top.dispose(), warped) : warped.union(top);
-    top = null;
-    if (merged.status() !== "NoError" || merged.isEmpty()) {
-      merged.dispose();
-      return { solid, failed: true };
-    }
-    solid.dispose();
-    return { solid: merged, failed: false };
+    return withSolidScopeSync((scope) => {
+      const working = scope.track(solid.duplicate());
+      // A world-space slab from below the part up to the compensation
+      // height, expressed in the part's own frame so it can cut the local
+      // solid.
+      const size = new THREE.Vector3();
+      worldBounds.getSize(size);
+      const pad = Math.max(size.x, size.y, 10) + 10;
+      const floor = worldBounds.min.z - 1;
+      const span = pad * 2;
+      const slab = scope.track(
+        kernel
+          .box(span, span, height - floor, false)
+          .translate(centreX - pad, centreY - pad, floor)
+          .transform(matrix4ToManifoldMat4(toLocal))
+      );
+      const [bottom, top] = working.splitBySolid(slab);
+      scope.track(bottom);
+      scope.track(top);
+      if (bottom.isEmpty()) return { solid, failed: false };
+      const warped = scope.trackMaybe(
+        insetSlabWalls(kernel, bottom, calibration, toWorld, toLocal)
+      );
+      if (!warped) return { solid, failed: true };
+      const merged = top.isEmpty() ? warped : scope.track(warped.union(top));
+      if (merged.status() !== "NoError" || merged.isEmpty()) {
+        return { solid, failed: true };
+      }
+      solid.dispose();
+      return { solid: scope.keep(merged), failed: false };
+    });
   } catch {
-    bottom?.dispose();
-    top?.dispose();
     return { solid, failed: true };
   }
 }
@@ -569,11 +671,29 @@ function bodyToPart(document: DesignDocument, body: PartBody): PrintablePart {
 
 /** Build all printable parts of a document. */
 export async function buildDocument(
-  document: DesignDocument
+  document: DesignDocument,
+  options: BuildDocumentOptions = {}
 ): Promise<DocumentBuildResult> {
   const kernel = await getGeometryKernel();
   const issues: ModelIssue[] = [];
   const holes: HoleLayer[] = [];
+  const onProgress = options.onProgress ?? (() => undefined);
+  const cancelPoint = () => options.throwIfCancelled?.();
+  const useCache = options.useLayerCache !== false;
+  const nozzleDiameterMm = documentNozzleDiameterMm(document);
+
+  // Entries whose layer no longer exists can never be reused — free their
+  // WASM memory now. (A concurrent cancelled build holds its own duplicate
+  // handles, so disposing the cache's handle here is safe.)
+  if (useCache) {
+    const liveIds = new Set(document.layers.map((l) => l.id));
+    for (const [id, entry] of layerSolidCache) {
+      if (!liveIds.has(id)) {
+        entry.solid.dispose();
+        layerSolidCache.delete(id);
+      }
+    }
+  }
 
   interface BuiltShape {
     layer: ShapeLayer;
@@ -597,7 +717,21 @@ export async function buildDocument(
   }
 
   const visibleLayers = document.layers.filter((l) => l.visible);
+  let layerIndex = 0;
   for (const layer of visibleLayers) {
+    // Cancellation and progress live OUTSIDE the per-layer try: the catch
+    // below exists to turn a broken layer into an issue and keep building,
+    // which is exactly the wrong treatment for "stop building".
+    try {
+      cancelPoint();
+    } catch (err) {
+      for (const b of built) b.solid.dispose();
+      throw err;
+    }
+    onProgress(
+      0.05 + 0.55 * (layerIndex++ / Math.max(1, visibleLayers.length)),
+      `בונה את השכבה "${layer.name}"`
+    );
     if (layer.type === "hole") {
       holes.push(layer);
       continue;
@@ -606,30 +740,57 @@ export async function buildDocument(
     if (!isShapeLayer(layer)) continue;
     const effectiveCombine = effectiveCombineMode(document, layer);
     try {
-      const solid = await buildShapeLayerSolid(kernel, resolveLayer(layer, parameters), effectiveCombine);
+      const resolved = resolveLayer(layer, parameters);
+      const hash = useCache
+        ? layerContentHash(resolved, effectiveCombine, nozzleDiameterMm)
+        : null;
+      if (hash) {
+        const cached = layerSolidCache.get(layer.id);
+        if (cached && cached.hash === hash) {
+          // Hand out a DUPLICATE — assembly consumes what it is given, and
+          // the stored handle must survive for the next build.
+          issues.push(...cached.issues);
+          built.push({ layer, solid: cached.solid.duplicate(), effectiveCombine });
+          if (options.stats) options.stats.layersFromCache++;
+          continue;
+        }
+      }
+
+      const solid = await buildShapeLayerSolid(kernel, resolved, effectiveCombine);
+      if (options.stats) options.stats.layersBuilt++;
       if (!solid) continue;
       // Apply the re-editable modifier stack. Failures are reported as
       // issues but never abort the build: the document is rebuilt on every
       // keystroke, and a momentarily invalid parameter should surface a
       // message rather than blank the viewport.
       const stack = layer.modifiers ?? [];
-      if (stack.length === 0) {
-        built.push({ layer, solid, effectiveCombine });
-        continue;
+      let finalSolid = solid;
+      const layerIssues: ModelIssue[] = [];
+      if (stack.length > 0) {
+        const applied = applyModifiers(kernel, solid, stack, { nozzleDiameterMm });
+        for (const errorHe of applied.errorsHe) {
+          layerIssues.push({
+            code: "modifier/failed",
+            severity: "warning",
+            titleHe: `מודיפייר בשכבה "${layer.name}" נכשל`,
+            detailHe: errorHe,
+            actionHe: "שנו את הפרמטרים של המודיפייר או כבו אותו",
+          });
+        }
+        finalSolid = applied.solid;
       }
-      const applied = applyModifiers(kernel, solid, stack, {
-        nozzleDiameterMm: documentNozzleDiameterMm(document),
-      });
-      for (const errorHe of applied.errorsHe) {
-        issues.push({
-          code: "modifier/failed",
-          severity: "warning",
-          titleHe: `מודיפייר בשכבה "${layer.name}" נכשל`,
-          detailHe: errorHe,
-          actionHe: "שנו את הפרמטרים של המודיפייר או כבו אותו",
+      issues.push(...layerIssues);
+      if (hash) {
+        // Cache the finished solid; modifier warnings are cached WITH it so
+        // a cache hit re-reports them instead of silently clearing them.
+        layerSolidCache.get(layer.id)?.solid.dispose();
+        layerSolidCache.set(layer.id, {
+          hash,
+          solid: finalSolid.duplicate(),
+          issues: layerIssues,
         });
       }
-      built.push({ layer, solid: applied.solid, effectiveCombine });
+      built.push({ layer, solid: finalSolid, effectiveCombine });
     } catch (err) {
       issues.push(issueForLayerFailure(layer, err));
     }
@@ -652,6 +813,18 @@ export async function buildDocument(
             ],
     };
   }
+
+  // Safe cancellation boundary: every solid built so far is still owned by
+  // `built`, so all of them can be disposed. (Inside the assembly below,
+  // handles are progressively consumed by booleans — a mid-assembly cancel
+  // could not tell live handles from consumed ones.)
+  try {
+    cancelPoint();
+  } catch (err) {
+    for (const b of built) b.solid.dispose();
+    throw err;
+  }
+  onProgress(0.65, "מאחד גופים");
 
   const bodies: PartBody[] = [];
   try {
@@ -737,6 +910,16 @@ export async function buildDocument(
     });
     return { status: "error", parts: [], issues };
   }
+
+  // Second safe boundary: assembly is done, every live handle sits in
+  // `bodies`.
+  try {
+    cancelPoint();
+  } catch (err) {
+    for (const body of bodies) body.solid.dispose();
+    throw err;
+  }
+  onProgress(0.85, "מכין חלקים להצגה");
 
   const parts: PrintablePart[] = [];
   for (const body of bodies) {

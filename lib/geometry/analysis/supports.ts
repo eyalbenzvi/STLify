@@ -174,9 +174,14 @@ function pointInTriangle2D(
 export function buildSupports(
   kernel: GeometryKernel,
   mesh: MeshData,
-  settings: SupportSettings
+  settings: SupportSettings,
+  hooks: { onProgress?: (fraction: number, labelHe: string) => void; throwIfCancelled?: () => void } = {}
 ): { solid: Solid | null; result: SupportGenerationResult } {
+  hooks.throwIfCancelled?.();
+  hooks.onProgress?.(0.15, "סורק משטחים תלויים");
   const candidates = findSupportPoints(mesh, settings);
+  hooks.throwIfCancelled?.();
+  hooks.onProgress?.(0.6, "בונה עמודי תמיכה");
   const cap = settings.maxPillars ?? DEFAULT_MAX_PILLARS;
   const pillars = candidates.slice(0, cap);
   const skipped = Math.max(0, candidates.length - pillars.length);
@@ -228,6 +233,14 @@ export function buildSupports(
     };
   }
 
+  // Last safe cancel point: the pillar solids are still individually owned.
+  try {
+    hooks.throwIfCancelled?.();
+  } catch (err) {
+    for (const s of solids) s.dispose();
+    throw err;
+  }
+  hooks.onProgress?.(0.85, "מאחד את התמיכות");
   const solid = kernel.unionAll(solids);
   const volume = solid.volumeMm3();
   const parts = [`נוצרו ${pillars.length} תמיכות`];

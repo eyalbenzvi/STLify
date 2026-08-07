@@ -504,12 +504,22 @@ function sanitizeLayer(
         typeof raw.originalMeshId === "string"
           ? (meshIdMap.get(raw.originalMeshId) ?? null)
           : null;
+      // Print-aid kinds must survive a save/load round trip: the 3MF export
+      // marks supports/brim/raft by provenance, and a reloaded design whose
+      // supports had been flattened to "stlImport" would export them as
+      // model bodies — full infill, unbreakable. Other kinds still collapse
+      // to "stlImport" (they carry no export semantics).
+      const rawKind = String(provenance.kind ?? "");
+      const preservedKind =
+        rawKind === "supportResult" || rawKind === "brimResult" || rawKind === "raftResult"
+          ? (rawKind as "supportResult" | "brimResult" | "raftResult")
+          : "stlImport";
       return {
         ...common,
         type: "importedMesh",
         meshId,
         provenance: {
-          kind: "stlImport",
+          kind: preservedKind,
           fileName: boundedString(provenance.fileName, "", 200) || undefined,
           descriptionHe: boundedString(provenance.descriptionHe, "", 300) || undefined,
         },
@@ -597,11 +607,28 @@ function sanitizeFacePaint(value: unknown): FacePaint[] | undefined {
     }
     if (triangles.length === 0) continue;
     const depthMm = Math.max(0.05, Math.min(finiteNumber(raw.depthMm, 0.8), 100));
+    // Spatial anchors (V6): 7 finite numbers per triangle, aligned with the
+    // triangle list. They are only kept when nothing disturbed the
+    // alignment — no merge with a previous same-slot entry, no dropped
+    // indices — because misaligned anchors would repaint the wrong faces.
+    // Dropping them degrades gracefully to the pre-V6 discard behaviour.
+    let anchors: number[] | undefined;
+    const rawAnchors = raw.anchors;
+    const untouched =
+      !entry &&
+      triangles.length === raw.triangles.length &&
+      Array.isArray(rawAnchors) &&
+      rawAnchors.length === triangles.length * 7 &&
+      rawAnchors.every((n) => typeof n === "number" && Number.isFinite(n));
+    if (untouched) anchors = [...(rawAnchors as number[])];
     bySlot.set(slotId, {
       materialSlotId: slotId,
-      triangles: triangles.sort((a, b) => a - b),
+      // Anchors are aligned with the triangle ORDER; sorting would break
+      // them, and nothing else requires sorted indices when anchors exist.
+      triangles: anchors ? triangles : triangles.sort((a, b) => a - b),
       meshTriangleCount,
       depthMm: entry ? Math.max(entry.depthMm, depthMm) : depthMm,
+      ...(anchors ? { anchors } : {}),
     });
   }
   return bySlot.size > 0 ? [...bySlot.values()] : undefined;

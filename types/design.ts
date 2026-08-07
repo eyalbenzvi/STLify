@@ -236,7 +236,14 @@ export interface MeshProvenance {
     | "smoothResult"
     | "simplifyResult"
     | "connectorResult"
-    | "imageRelief";
+    | "imageRelief"
+    /**
+     * Print-aid geometry. These kinds change EXPORT semantics: 3MF marks
+     * them so the slicer treats them as removable aids, not as the model.
+     */
+    | "supportResult"
+    | "brimResult"
+    | "raftResult";
   /** Original file name for stlImport. */
   fileName?: string;
   /** Hebrew description of the producing operation. */
@@ -268,6 +275,16 @@ export interface FacePaint {
    * for a multi-material print (mm).
    */
   depthMm: number;
+  /**
+   * SPATIAL anchors of the painted region: 7 numbers per painted triangle —
+   * centroid (x,y,z), outward normal (nx,ny,nz) and circumradius-ish size r,
+   * all in the layer's LOCAL frame at paint time. When the body is rebuilt
+   * into a different triangulation, the paint is re-projected onto the new
+   * mesh by anchor proximity instead of being discarded (painting.ts,
+   * reanchorPaints). Optional: paint saved before V6 has no anchors and
+   * keeps the old discard-with-warning behaviour.
+   */
+  anchors?: number[];
 }
 
 export interface ImportedMeshLayer extends LayerCommon {

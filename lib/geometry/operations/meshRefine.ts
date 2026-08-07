@@ -17,7 +17,8 @@ import type {
 } from "@/types/design";
 import { getGeometryKernel } from "../kernel";
 import type { MeshData } from "../meshData";
-import { materializeWorldSolid, OpError, solidToResultLayer } from "./layerOps";
+import { withSolidScope } from "../solidScope";
+import { materializeWorldSolid, OpError, solidToResultLayer, type OpHooks } from "./layerOps";
 
 // ---------------------------------------------------------------------------
 // Thicken
@@ -34,46 +35,53 @@ const DILATION_PROXY_MAX_TRIS = 6000;
 export async function performThicken(
   document: DesignDocument,
   layer: ShapeLayer,
-  thicknessMm: number
+  thicknessMm: number,
+  hooks: OpHooks = {}
 ): Promise<ThickenOutcome> {
   if (thicknessMm <= 0 || thicknessMm > 20) {
     throw new OpError("עובי ההוספה חייב להיות בין 0.1 ל-20 מ״מ");
   }
   const kernel = await getGeometryKernel();
-  let solid = await materializeWorldSolid(kernel, document, layer);
-  if (!solid || solid.isEmpty()) {
-    solid?.dispose();
-    throw new OpError(`לשכבה "${layer.name}" אין גאומטריה`);
-  }
-  const warningsHe: string[] = [
-    "העיבוי מנפח את הגוף בכל הכיוונים — פרטים דקים עשויים להתעגל ולהתמזג",
-  ];
-  if (solid.numTriangles() > DILATION_PROXY_MAX_TRIS) {
-    solid = solid.simplify(Math.min(thicknessMm * 0.25, 0.4));
-    if (solid.numTriangles() > DILATION_PROXY_MAX_TRIS * 4) {
-      solid.dispose();
-      throw new OpError("המודל מורכב מדי לעיבוי בדפדפן", [
-        "פשטו את הרשת ונסו שוב",
-      ]);
+  hooks.throwIfCancelled?.();
+  hooks.onProgress?.(0.15, "מכין את הגוף");
+  // Scope-owned lifetimes: any throw (including cancellation) frees every
+  // intermediate; consumed handles are skipped by the idempotent dispose.
+  return withSolidScope(async (scope) => {
+    let solid = scope.trackMaybe(await materializeWorldSolid(kernel, document, layer));
+    if (!solid || solid.isEmpty()) {
+      throw new OpError(`לשכבה "${layer.name}" אין גאומטריה`);
     }
-    warningsHe.push("המודל פושט מעט לפני העיבוי כדי לאפשר את החישוב");
-  }
-  const ball = kernel.sphere(thicknessMm, 8);
-  const result = solid.minkowskiSum(ball);
-  if (result.status() !== "NoError" || result.isEmpty()) {
-    result.dispose();
-    throw new OpError("העיבוי נכשל עקב גאומטריה מורכבת");
-  }
-  const resultLayer = solidToResultLayer(result, {
-    nameHe: `${layer.name} — מעובה`,
-    provenance: {
-      kind: "thickenResult",
-      descriptionHe: `עיבוי ב-${thicknessMm} מ״מ`,
-      sourceLayerIds: [layer.id],
-    },
-    materialSlotId: layer.materialSlotId,
+    const warningsHe: string[] = [
+      "העיבוי מנפח את הגוף בכל הכיוונים — פרטים דקים עשויים להתעגל ולהתמזג",
+    ];
+    if (solid.numTriangles() > DILATION_PROXY_MAX_TRIS) {
+      solid = scope.track(solid.simplify(Math.min(thicknessMm * 0.25, 0.4)));
+      if (solid.numTriangles() > DILATION_PROXY_MAX_TRIS * 4) {
+        throw new OpError("המודל מורכב מדי לעיבוי בדפדפן", [
+          "פשטו את הרשת ונסו שוב",
+        ]);
+      }
+      warningsHe.push("המודל פושט מעט לפני העיבוי כדי לאפשר את החישוב");
+    }
+    // Last cancel point before the Minkowski dilation.
+    hooks.throwIfCancelled?.();
+    hooks.onProgress?.(0.4, "מנפח את הגוף");
+    const ball = scope.track(kernel.sphere(thicknessMm, 8));
+    const result = scope.track(solid.minkowskiSum(ball));
+    if (result.status() !== "NoError" || result.isEmpty()) {
+      throw new OpError("העיבוי נכשל עקב גאומטריה מורכבת");
+    }
+    const resultLayer = solidToResultLayer(scope.keep(result), {
+      nameHe: `${layer.name} — מעובה`,
+      provenance: {
+        kind: "thickenResult",
+        descriptionHe: `עיבוי ב-${thicknessMm} מ״מ`,
+        sourceLayerIds: [layer.id],
+      },
+      materialSlotId: layer.materialSlotId,
+    });
+    return { layer: resultLayer, warningsHe };
   });
-  return { layer: resultLayer, warningsHe };
 }
 
 // ---------------------------------------------------------------------------

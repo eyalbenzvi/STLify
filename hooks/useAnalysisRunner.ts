@@ -21,7 +21,7 @@ import {
   type PrinterProfile,
 } from "@/types/profiles";
 import type { DocumentBuilderState } from "@/hooks/useDocumentBuilder";
-import { getGeometryKernel } from "@/lib/geometry/kernel";
+import { runGeometryJob } from "@/lib/geometry/jobs/client";
 import { meshDataBounds, transformMeshData } from "@/lib/geometry/meshData";
 import type { BuiltPart } from "@/hooks/useDocumentBuilder";
 import { matrix4ToTransform, transformToMatrix4 } from "@/lib/geometry/transform";
@@ -30,13 +30,19 @@ import {
   analyzeContact,
   analyzeFloatingParts,
   analyzeOverhangs,
-  analyzeThickness,
   overhangToVertexColors,
   suggestOrientations,
   thicknessToVertexColors,
   type OrientationCandidate,
 } from "@/lib/geometry/analysis";
+import { analyzeWarping } from "@/lib/geometry/analysis/warping";
 import { estimateDetailed, type DetailedEstimateResult } from "@/lib/geometry/analysis/estimateDetailed";
+import {
+  estimateFromSlices,
+  mergeSliceMetrics,
+  type SliceMetrics,
+  type SlicedEstimateResult,
+} from "@/lib/geometry/analysis/estimateSliced";
 
 /** Everything the analysis runner needs from the editor shell. */
 export interface AnalysisContext {
@@ -53,7 +59,7 @@ export interface AnalysisContext {
   setAnalysisBusy: (busy: boolean) => void;
   setModelIssues: (issues: ModelIssue[]) => void;
   setOverlayColors: (colors: Map<string, Float32Array>) => void;
-  setEstimate: (estimate: DetailedEstimateResult | null) => void;
+  setEstimate: (estimate: DetailedEstimateResult | SlicedEstimateResult | null) => void;
   setOrientationCandidates: (candidates: OrientationCandidate[] | null) => void;
 }
 
@@ -80,7 +86,6 @@ export function useAnalysisRunner(context: AnalysisContext) {
     // Yield to paint the busy state before the synchronous analysis work.
     setTimeout(async () => {
       try {
-        const kernel = await getGeometryKernel();
         const profile = getPrintabilityProfile(doc.printabilityProfileId);
         const custom = doc.customPrintability;
         const minWall = custom?.minWallMm ?? profile.minWallMm;
@@ -101,14 +106,18 @@ export function useAnalysisRunner(context: AnalysisContext) {
           const contact = analyzeContact(mesh);
           const floating = analyzeFloatingParts(mesh);
           const volume = analyzeBuildVolume(part.stats.bounds, printer);
+          const warping = analyzeWarping(mesh);
 
-          const { solid, status } = kernel.fromMeshData(mesh);
+          // Ray-sampled wall thickness is the expensive analysis — it runs
+          // as a job (in the worker when one exists). transferables=[]: the
+          // worldMesh stays live on this thread for export and later runs.
           let thicknessIssues: ModelIssue[] = [];
-          if (status === "NoError") {
-            const thickness = analyzeThickness(solid, mesh, {
-              minWallMm: minWall,
-              minFeatureMm: minFeature,
-            });
+          try {
+            const { result: thickness } = await runGeometryJob(
+              "analyzeThickness",
+              { mesh, minWallMm: minWall, minFeatureMm: minFeature },
+              { transferables: [] }
+            );
             thicknessIssues = thickness.issues;
             colors.set(
               part.primaryLayerId,
@@ -116,8 +125,10 @@ export function useAnalysisRunner(context: AnalysisContext) {
                 ? overhangToVertexColors(mesh, overhang.triangleFlags)
                 : thicknessToVertexColors(mesh, thickness, minWall)
             );
+          } catch {
+            // A body the kernel refuses (non-manifold) simply reports no
+            // thickness data — the same silent skip as before V6.
           }
-          solid.dispose();
 
           const prefix = build.parts.length > 1 ? `${part.nameHe}: ` : "";
           for (const issue of [
@@ -125,6 +136,7 @@ export function useAnalysisRunner(context: AnalysisContext) {
             ...contact.issues,
             ...floating.issues,
             ...volume.issues,
+            ...warping.issues,
             ...thicknessIssues,
           ]) {
             issues.push({ ...issue, titleHe: `${prefix}${issue.titleHe}` });
@@ -147,17 +159,41 @@ export function useAnalysisRunner(context: AnalysisContext) {
             z: bounds.z,
           };
         }
+        const estimateInputs = {
+          modelVolumeMm3: totalVolume,
+          boundsMm: bounds,
+          technology: profile.technology,
+          layerHeightMm: layerHeight,
+          nozzleDiameterMm: custom?.nozzleDiameterMm ?? profile.nozzleDiameterMm,
+          infillPercent: usage?.suggestedInfillPct ?? 20,
+          densityGCm3: material.densityGCm3,
+          pricePerKgIls: material.pricePerKgIls,
+        };
+        // Slice-measured time model: perimeter length, cross-section area
+        // and island count per layer, priced per component. A part the
+        // slicer cannot load falls back to the old volume-only model —
+        // honestly, with no component breakdown and lower confidence.
+        const sliceMetrics: SliceMetrics[] = [];
+        for (const part of build.parts) {
+          try {
+            const { result } = await runGeometryJob(
+              "measureSlices",
+              { mesh: part.worldMesh, layerHeightMm: layerHeight },
+              { transferables: [] }
+            );
+            sliceMetrics.push(result);
+          } catch {
+            // fall through to the volume-only estimate below
+          }
+        }
+        const merged =
+          sliceMetrics.length === build.parts.length
+            ? mergeSliceMetrics(sliceMetrics)
+            : null;
         setEstimate(
-          estimateDetailed({
-            modelVolumeMm3: totalVolume,
-            boundsMm: bounds,
-            technology: profile.technology,
-            layerHeightMm: layerHeight,
-            nozzleDiameterMm: custom?.nozzleDiameterMm ?? profile.nozzleDiameterMm,
-            infillPercent: usage?.suggestedInfillPct ?? 20,
-            densityGCm3: material.densityGCm3,
-            pricePerKgIls: material.pricePerKgIls,
-          })
+          merged
+            ? estimateFromSlices(estimateInputs, merged)
+            : estimateDetailed(estimateInputs)
         );
       } catch (err) {
         showError(err, "ניתוח המודל נכשל");
@@ -165,7 +201,17 @@ export function useAnalysisRunner(context: AnalysisContext) {
         setAnalysisBusy(false);
       }
     }, 30);
-  }, [build.parts, doc, printer, overlay, showError]);
+  }, [
+    build.parts,
+    doc,
+    printer,
+    overlay,
+    showError,
+    setAnalysisBusy,
+    setEstimate,
+    setModelIssues,
+    setOverlayColors,
+  ]);
 
   // Invalidate analysis results when the geometry changes (state adjustment
   // derived from the build id, done during render — no effect cascade).
@@ -192,7 +238,7 @@ export function useAnalysisRunner(context: AnalysisContext) {
         setAnalysisBusy(false);
       }
     }, 30);
-  }, [selectedParts, build.parts, doc, showError]);
+  }, [selectedParts, build.parts, doc, showError, setAnalysisBusy, setOrientationCandidates]);
 
   const handleApplyOrientation = useCallback(
     (candidate: OrientationCandidate) => {
@@ -217,7 +263,7 @@ export function useAnalysisRunner(context: AnalysisContext) {
       next.z -= bounds.min.z;
       commitTransform(layer.id, next);
     },
-    [selectedParts, build.parts, doc.layers, commitTransform]
+    [selectedParts, build.parts, doc.layers, commitTransform, setOrientationCandidates]
   );
 
   return { runAnalysis, handleSuggestOrientation, handleApplyOrientation };

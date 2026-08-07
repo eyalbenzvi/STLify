@@ -14,7 +14,7 @@
  * arrives via props from the editor shell.
  */
 
-import { Canvas, useThree, type ThreeEvent } from "@react-three/fiber";
+import { Canvas, invalidate, useThree, type ThreeEvent } from "@react-three/fiber";
 import { GizmoHelper, GizmoViewport, Grid, Html, Line, OrbitControls, TransformControls } from "@react-three/drei";
 import {
   memo,
@@ -30,6 +30,7 @@ import type { PrinterProfile } from "@/types/profiles";
 import type { BuiltPart } from "@/hooks/useDocumentBuilder";
 import { matrix4ToTransform, snapTransformNoise } from "@/lib/geometry/transform";
 import { activePaints } from "@/lib/geometry/painting";
+import { createBvhRaycast } from "@/lib/geometry/viewportRaycast";
 import type {
   EditorTool,
   OverlayMode,
@@ -68,9 +69,20 @@ export interface SceneViewProps {
    * World point to centre the camera on. Set by the mesh inspector and the
    * interference report so a listed problem can be looked at rather than
    * merely described. A new object identity re-triggers the move, so the
-   * same location can be revisited.
+   * same location can be revisited. With `fitRadius` the camera also moves
+   * to a distance that FRAMES a sphere of that radius (the F shortcut).
    */
-  focusTarget?: { x: number; y: number; z: number } | null;
+  focusTarget?: { x: number; y: number; z: number; fitRadius?: number } | null;
+  /**
+   * Numeric view preset (top/front/side/iso). A new nonce re-applies the
+   * same view.
+   */
+  viewPreset?: {
+    kind: "top" | "front" | "side" | "iso";
+    center: { x: number; y: number; z: number };
+    radius: number;
+    nonce: number;
+  } | null;
   /** Highlighted triangles on one body, from the sub-object selection. */
   faceSelection?: { layerId: string; triangles: number[] } | null;
   /** Fired in faceSelect mode with the clicked triangle. */
@@ -170,6 +182,7 @@ const PartMesh = memo(function PartMesh({
     group.quaternion.copy(quaternion);
     group.scale.copy(scale);
     group.updateMatrix();
+    invalidate();
   }, [part.worldMatrix, part]);
 
   // Vertex colors for analysis overlays.
@@ -183,6 +196,9 @@ const PartMesh = memo(function PartMesh({
     // Imperative three.js buffer invalidation — external-system sync.
     // eslint-disable-next-line react-hooks/immutability
     geometry.attributes.position.needsUpdate = true;
+    // Attribute swaps happen outside the React commit, so the demand
+    // frameloop has to be told about them explicitly.
+    invalidate();
   }, [part.geometry, overlay, overlayColors]);
 
   const useVertexColors = overlay !== "none" && overlayColors !== null;
@@ -198,6 +214,8 @@ const PartMesh = memo(function PartMesh({
       material.onBeforeCompile = () => undefined;
       material.needsUpdate = true;
     }
+    // Shader recompilation is imperative — repaint on demand.
+    invalidate();
   }, [printPreview.enabled, printPreview.layerHeightMm]);
 
   const bbox = useMemo(() => {
@@ -205,10 +223,16 @@ const PartMesh = memo(function PartMesh({
     return part.geometry.boundingBox ?? new THREE.Box3();
   }, [part.geometry]);
 
+  // Picking goes through the project BVH instead of three's linear scan —
+  // same closest-hit semantics, O(log n) per pointer move. Cached per
+  // localMesh identity, so a rebuild swaps in a fresh index automatically.
+  const raycast = useMemo(() => createBvhRaycast(part.localMesh), [part.localMesh]);
+
   return (
     <group ref={groupRef}>
       <mesh
         geometry={part.geometry}
+        raycast={raycast}
         onClick={(event) => onClick(event, part)}
         onPointerOver={(e) => {
           if (pickMode) {
@@ -300,6 +324,24 @@ function PendingPoint({ point }: { point: THREE.Vector3 }) {
       <meshBasicMaterial color="#f59e0b" depthTest={false} transparent opacity={0.9} />
     </mesh>
   );
+}
+
+/**
+ * Repaints once after EVERY commit of the scene tree.
+ *
+ * The canvas runs `frameloop="demand"`, so a missed invalidation is a frozen
+ * viewport. R3F invalidates automatically when ITS elements change, but this
+ * scene also mutates three objects inside effects (group poses, buffer
+ * attributes, shader recompiles) and those are invisible to the reconciler.
+ * The imperative spots call `invalidate()` themselves; this catch-all covers
+ * every prop-driven change (tool, selection, overlay, section, measurements,
+ * xray, building, …) so no tool mode can be forgotten.
+ */
+function InvalidateOnUpdate() {
+  useEffect(() => {
+    invalidate();
+  });
+  return null;
 }
 
 function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string) => void }) {
@@ -432,6 +474,16 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
     gizmoMode && gizmoObject && gizmoLayer && !gizmoLayer.locked
   );
 
+  // Finger-sized gizmo on touch hardware: drei's default handles are tuned
+  // for a mouse cursor and are nearly unusable under a fingertip.
+  const coarsePointer = useMemo(
+    () =>
+      typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(pointer: coarse)").matches,
+    []
+  );
+
   const commitGizmo = useCallback(() => {
     if (!gizmoLayerId) return;
     const object = objects.get(gizmoLayerId);
@@ -443,6 +495,7 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
 
   return (
     <>
+      <InvalidateOnUpdate />
       <color attach="background" args={["#eef2f7"]} />
       <ambientLight intensity={0.55} />
       <directionalLight position={[60, -80, 120]} intensity={1.1} />
@@ -475,7 +528,10 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
           rotationSnap={snap.enabled ? (snap.rotationDeg * Math.PI) / 180 : null}
           scaleSnap={snap.enabled ? snap.scaleStep : null}
           onMouseUp={commitGizmo}
-          size={0.8}
+          // A drag mutates the object outside React; each change event asks
+          // the demand frameloop for a repaint or the drag appears frozen.
+          onChange={() => invalidate()}
+          size={coarsePointer ? 1.35 : 0.8}
         />
       )}
 
@@ -519,6 +575,7 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
 
       <OrbitControls makeDefault enableDamping />
       <CameraFocus target={focusTarget ?? null} />
+      <ViewPresetApplier preset={props.viewPreset ?? null} />
     </>
   );
 }
@@ -678,9 +735,14 @@ function FaceSelectionHighlight({
 
 /**
  * Pans the orbit target onto a world point, keeping the current viewing
- * direction and distance so the user does not lose their bearings.
+ * direction — and, when `fitRadius` is given (the F shortcut), moving to a
+ * distance that frames a sphere of that radius.
  */
-function CameraFocus({ target }: { target: { x: number; y: number; z: number } | null }) {
+function CameraFocus({
+  target,
+}: {
+  target: { x: number; y: number; z: number; fitRadius?: number } | null;
+}) {
   const camera = useThree((s) => s.camera);
   const controls = useThree((s) => s.controls) as
     | { target: THREE.Vector3; update: () => void }
@@ -690,10 +752,49 @@ function CameraFocus({ target }: { target: { x: number; y: number; z: number } |
     if (!target || !controls) return;
     const next = new THREE.Vector3(target.x, target.y, target.z);
     const offset = camera.position.clone().sub(controls.target);
+    if (target.fitRadius !== undefined) {
+      // ~2.8× the radius fills most of a 40° field of view.
+      offset.setLength(Math.max(40, target.fitRadius * 2.8));
+    }
     controls.target.copy(next);
     camera.position.copy(next).add(offset);
     controls.update();
+    invalidate();
   }, [target, controls, camera]);
+
+  return null;
+}
+
+/** Applies the numeric view presets (top/front/side/iso). */
+function ViewPresetApplier({
+  preset,
+}: {
+  preset: SceneViewProps["viewPreset"];
+}) {
+  const camera = useThree((s) => s.camera);
+  const controls = useThree((s) => s.controls) as
+    | { target: THREE.Vector3; update: () => void }
+    | null;
+
+  useEffect(() => {
+    if (!preset || !controls) return;
+    const directions: Record<string, THREE.Vector3> = {
+      // Top keeps a hair of Y so the view is never exactly parallel to the
+      // camera's up axis (+Z), which makes OrbitControls flip.
+      top: new THREE.Vector3(0, -0.02, 1),
+      front: new THREE.Vector3(0, -1, 0.02),
+      side: new THREE.Vector3(1, 0, 0.02),
+      iso: new THREE.Vector3(1, -1, 0.8),
+    };
+    const center = new THREE.Vector3(preset.center.x, preset.center.y, preset.center.z);
+    const distance = Math.max(60, preset.radius * 2.8);
+    controls.target.copy(center);
+    camera.position
+      .copy(center)
+      .add(directions[preset.kind].clone().normalize().multiplyScalar(distance));
+    controls.update();
+    invalidate();
+  }, [preset, controls, camera]);
 
   return null;
 }
@@ -707,6 +808,20 @@ export function SceneView(
         camera={{ position: [0, -160, 110], up: [0, 0, 1], fov: 40, near: 0.1, far: 3000 }}
         className="h-full w-full"
         gl={{ localClippingEnabled: true }}
+        // The scene is static between edits — rendering 60fps for nothing
+        // burned battery, and unbounded dpr rendered 4x the pixels on Retina.
+        // Every change point calls invalidate(); see InvalidateOnUpdate.
+        frameloop="demand"
+        dpr={[1, 2]}
+        // Standard 3D-tool behaviour (and what makes touch workable): a
+        // click/tap on empty space clears the selection — but only in the
+        // selection/transform tools, never in pick modes where a miss is
+        // just a miss.
+        onPointerMissed={(event) => {
+          if (event.type !== "click") return;
+          if (!["select", "translate", "rotate", "scale"].includes(props.tool)) return;
+          props.onSelect([], false);
+        }}
       >
         <SceneContent {...props} />
       </Canvas>

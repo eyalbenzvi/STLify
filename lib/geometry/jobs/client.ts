@@ -23,6 +23,13 @@ export interface RunJobOptions {
   signal?: AbortSignal;
   /** Force the in-process path (used by tests). */
   forceInProcess?: boolean;
+  /**
+   * Buffers to move to the worker instead of the default "transfer every
+   * buffer in the payload". Callers whose payload references LONG-LIVED
+   * buffers (the mesh store) must pass copies here — transferring the
+   * originals would detach them on this thread. Ignored in-process.
+   */
+  transferables?: ArrayBuffer[];
 }
 
 export interface JobOutcome<T> {
@@ -34,6 +41,8 @@ export interface JobOutcome<T> {
 let workerInstance: Worker | null = null;
 let workerUnavailable = false;
 let nextJobId = 1;
+/** Bumped whenever a NEW worker is created (see workerGeneration()). */
+let workerGenerationCounter = 0;
 
 interface PendingJob {
   resolve: (value: unknown) => void;
@@ -56,6 +65,7 @@ function getWorker(): Worker | null {
     workerInstance = new Worker(new URL("./worker.ts", import.meta.url), {
       type: "module",
     });
+    workerGenerationCounter++;
     workerInstance.onmessage = (event: MessageEvent<WorkerOutbound>) => {
       const message = event.data;
       const job = pending.get(message.id);
@@ -101,6 +111,15 @@ export function geometryWorkerAvailable(): boolean {
 }
 
 /**
+ * Identity of the current worker. Callers that maintain worker-side caches
+ * (the build client's "which meshes has the worker seen" set) compare this
+ * to know when a crashed-and-recreated worker made their bookkeeping stale.
+ */
+export function workerGeneration(): number {
+  return workerGenerationCounter;
+}
+
+/**
  * Run a geometry job, preferring the worker.
  *
  * Rejects with `JobCancelledError` when aborted, so callers can distinguish
@@ -126,7 +145,7 @@ export async function runGeometryJob<K extends GeometryJobName>(
     options.signal?.addEventListener("abort", abort, { once: true });
     const request: WorkerInbound = { type: "run", id, name, payload };
     try {
-      worker.postMessage(request, collectTransferables(payload));
+      worker.postMessage(request, options.transferables ?? collectTransferables(payload));
       const result = (await promise) as GeometryJobMap[K]["result"];
       return { result, ranOn: "worker" };
     } finally {

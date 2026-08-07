@@ -18,6 +18,8 @@ export interface PackagePart {
   materialSlot: MaterialSlot | null;
   triangleCount: number;
   suggestedOrientationHe?: string;
+  /** Set for print aids (supports/brim/raft): a Hebrew handling note. */
+  printAidHe?: string;
 }
 
 export interface PackageOptions {
@@ -60,6 +62,9 @@ function buildReadme(parts: PackagePart[], options: PackageOptions): string {
     }
     if (part.suggestedOrientationHe) {
       lines.push(`  - תנוחת הדפסה מוצעת: ${part.suggestedOrientationHe}`);
+    }
+    if (part.printAidHe) {
+      lines.push(`  - ⚠ ${part.printAidHe}`);
     }
   }
   if (options.suggestedMaterialHe) {

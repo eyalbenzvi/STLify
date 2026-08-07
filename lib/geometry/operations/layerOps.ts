@@ -23,6 +23,17 @@ import { matrix4ToManifoldMat4 } from "../transform";
 import { buildShapeLayerSolid } from "../solids";
 import { storeMesh } from "../meshStore";
 
+/**
+ * Progress/cancellation hooks threaded through heavy operations so they can
+ * run as registry jobs. Cancellation is only checked at points where every
+ * live kernel handle is accounted for — a cancelled operation must not leak
+ * WASM memory.
+ */
+export interface OpHooks {
+  onProgress?: (fraction: number, labelHe: string) => void;
+  throwIfCancelled?: () => void;
+}
+
 /** Operation failure with a Hebrew user-facing message + fix suggestions. */
 export class OpError extends Error {
   constructor(

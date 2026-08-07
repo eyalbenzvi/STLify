@@ -43,11 +43,10 @@ import { createTemplateDocument, makeBaseLayer, makeHoleLayer, makeTextLayer, PR
 import { getGeometryKernel } from "@/lib/geometry/kernel";
 import { meshDataBounds } from "@/lib/geometry/meshData";
 import { getMesh, storeMesh } from "@/lib/geometry/meshStore";
-import { performBoolean } from "@/lib/geometry/operations/booleans";
 import { performPlaneCut, splitDisconnectedParts } from "@/lib/geometry/operations/cut";
 import { addConnectors } from "@/lib/geometry/operations/connectors";
-import { performDrainHoles, performHollow } from "@/lib/geometry/operations/hollow";
-import { performSimplify, performSmooth, performThicken } from "@/lib/geometry/operations/meshRefine";
+import { performSimplify, performSmooth } from "@/lib/geometry/operations/meshRefine";
+import { adoptDocOpResult, docOpMeshSync } from "@/lib/geometry/jobs/docOpsClient";
 import { OpError } from "@/lib/geometry/operations/layerOps";
 import {
   alignTransforms,
@@ -64,6 +63,7 @@ import {
 } from "@/lib/geometry/operations/placement";
 import type { OrientationCandidate } from "@/lib/geometry/analysis";
 import type { DetailedEstimateResult } from "@/lib/geometry/analysis/estimateDetailed";
+import type { SlicedEstimateResult } from "@/lib/geometry/analysis/estimateSliced";
 import { attemptMeshRepair } from "@/lib/geometry/repair/repair";
 import { StlImportError } from "@/lib/import/stl";
 import { SvgImportError } from "@/lib/import/svg";
@@ -93,9 +93,15 @@ import type { LatticeSettings } from "@/lib/geometry/operations/lattice";
 import { buildPattern, PatternError, type PatternSettings } from "@/lib/geometry/operations/pattern";
 import {
   arrangeOnPlate,
+  convexHullXY,
   detectInterference,
   type InterferenceReport,
 } from "@/lib/geometry/analysis/collision";
+import {
+  matrix4ToTransform,
+  snapTransformNoise,
+  transformToMatrix4,
+} from "@/lib/geometry/transform";
 import {
   buildEnclosure,
   buildGear,
@@ -110,7 +116,7 @@ import { downloadBlob } from "@/lib/export/stl";
 import { meshDataToBinaryStl } from "@/lib/export/stlData";
 import type { PrintablePart } from "@/lib/geometry/buildDocument";
 import { buildMultiPartZip } from "@/lib/export/package";
-import { buildThreeMf } from "@/lib/export/threeMF";
+import { buildThreeMf, matrixToThreeMfTransform } from "@/lib/export/threeMF";
 import { DESIGN_FILE_EXTENSION, DesignFileError, serializeDesignFile } from "@/lib/serialization/designFile";
 import { decodeShareHash, encodeShareHash, SHARE_HASH_PREFIX, shareLinkEligibility } from "@/lib/serialization/shareLink";
 import type { ModelIssue } from "@/types/design";
@@ -141,6 +147,9 @@ import {
   type StlImportPreview,
 } from "@/components/dialogs/ImportDialogs";
 import { ExportDialog, type ExportKind } from "@/components/dialogs/ExportDialog";
+import { LibraryDialog } from "@/components/dialogs/LibraryDialog";
+import { ShortcutsDialog } from "@/components/dialogs/ShortcutsDialog";
+import { actionForEvent, loadKeymap, type Keymap } from "@/lib/keyboard/keymap";
 import { CreatePanel, type GeneratorKind } from "@/components/editor/CreatePanel";
 import {
   SubObjectPanel,
@@ -153,6 +162,7 @@ import {
   hasStalePaint,
   paintedTriangleSlots,
   paintTriangles,
+  reanchorPaints,
   splitPartsByPaint,
   unpaintTriangles,
 } from "@/lib/geometry/painting";
@@ -164,9 +174,10 @@ import {
 } from "@/lib/geometry/calibration";
 import {
   analyzeBridging,
-  buildSupports,
   DEFAULT_SUPPORT_SETTINGS,
 } from "@/lib/geometry/analysis/supports";
+import { analyzeWarping } from "@/lib/geometry/analysis/warping";
+import { buildBrim, buildRaft } from "@/lib/geometry/operations/brimRaft";
 import {
   buildAdjacency,
   growSelection,
@@ -193,6 +204,7 @@ import {
 import { resolveParameters, type ParameterDefinition } from "@/lib/geometry/expression";
 import { garbageCollect, meshStoreStats, type MeshStoreStats } from "@/lib/geometry/meshStore";
 import { referencedMeshIds } from "@/lib/history/history";
+import { sweepUnreferencedMeshes } from "@/lib/history/retention";
 import {
   clearSnapshot,
   describeSnapshotAge,
@@ -241,6 +253,22 @@ export function Editor() {
   );
 }
 
+/** Hebrew handling note for print-aid parts in the ZIP README. */
+function printAidNote(doc: DesignDocument, part: PrintablePart): string | undefined {
+  const layer = doc.layers.find((l) => l.id === part.primaryLayerId);
+  if (layer?.type !== "importedMesh") return undefined;
+  switch (layer.provenance.kind) {
+    case "supportResult":
+      return "חלק תמיכה — הדפיסו בהגדרות תמיכה (ללא מילוי מלא) והסירו לאחר ההדפסה";
+    case "brimResult":
+      return "Brim — טבעת הצמדה למשטח; קלפו אותה מהחלק לאחר ההדפסה";
+    case "raftResult":
+      return "Raft — משטח בסיס; הפרידו את החלק ממנו לאחר ההדפסה";
+    default:
+      return undefined;
+  }
+}
+
 /** Read a File as ArrayBuffer. */
 function EditorInner() {
   const { state, dispatch, document: doc, selection, selectedLayers, canUndo, canRedo } =
@@ -271,11 +299,22 @@ function EditorInner() {
   const [svgPending, setSvgPending] = useState<{ text: string; fileName: string } | null>(null);
   const [imagePending, setImagePending] = useState<{ file: File; fileName: string } | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
+  const [libraryOpen, setLibraryOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  /** Below lg the tool panel is a collapsible bottom sheet. */
+  const [panelOpen, setPanelOpen] = useState(true);
+  const [keymap, setKeymap] = useState<Keymap>(() => loadKeymap());
+  const [viewPreset, setViewPreset] = useState<{
+    kind: "top" | "front" | "side" | "iso";
+    center: { x: number; y: number; z: number };
+    radius: number;
+    nonce: number;
+  } | null>(null);
   const [orientationCandidates, setOrientationCandidates] = useState<OrientationCandidate[] | null>(null);
   const [modeSwitchTarget, setModeSwitchTarget] = useState<"withBase" | "baseless" | null>(null);
   const [modelIssues, setModelIssues] = useState<ModelIssue[]>([]);
   const [overlayColors, setOverlayColors] = useState<Map<string, Float32Array>>(new Map());
-  const [estimate, setEstimate] = useState<DetailedEstimateResult | null>(null);
+  const [estimate, setEstimate] = useState<DetailedEstimateResult | SlicedEstimateResult | null>(null);
   const [analysisBusy, setAnalysisBusy] = useState(false);
   const [filletOpen, setFilletOpen] = useState(false);
   const [shellOpen, setShellOpen] = useState(false);
@@ -287,12 +326,18 @@ function EditorInner() {
   const [diagnosis, setDiagnosis] = useState<MeshDiagnosis | null>(null);
   const [repairReport, setRepairReport] = useState<MeshRepairReport | null>(null);
   const [interference, setInterference] = useState<InterferenceReport | null>(null);
-  const [focusTarget, setFocusTarget] = useState<{ x: number; y: number; z: number } | null>(null);
+  const [focusTarget, setFocusTarget] = useState<{
+    x: number;
+    y: number;
+    z: number;
+    fitRadius?: number;
+  } | null>(null);
   /** Bumped by the GC handler, which changes the store without changing doc. */
   const [memoryVersion, setMemoryVersion] = useState(0);
   const [recovery, setRecovery] = useState<RecoverySnapshot | null>(null);
   const [editingModifierId, setEditingModifierId] = useState<string | null>(null);
   const [pushPullMm, setPushPullMm] = useState(2);
+  const [filletRegionMm, setFilletRegionMm] = useState(2);
   const [paintSlotId, setPaintSlotId] = useState<string | null>(null);
   const [paintDepthMm, setPaintDepthMm] = useState(DEFAULT_PAINT_DEPTH_MM);
   const [revolveOpen, setRevolveOpen] = useState(false);
@@ -621,14 +666,27 @@ function EditorInner() {
       );
       if (!layer) return;
       void runOp("קדיחת חור ניקוז", async () => {
-        const result = await performDrainHoles(doc, layer, [
+        const sync = docOpMeshSync([layer]);
+        const jobResult = await jobs.run(
+          "docDrainHoles",
           {
-            diameterMm,
-            depthMm,
-            position: pick.point,
-            direction: { x: -pick.normal.x, y: -pick.normal.y, z: -pick.normal.z },
+            document: doc,
+            meshes: sync.meshes,
+            layerId: layer.id,
+            holes: [
+              {
+                diameterMm,
+                depthMm,
+                position: pick.point,
+                direction: { x: -pick.normal.x, y: -pick.normal.y, z: -pick.normal.z },
+              },
+            ],
           },
-        ]);
+          "קדיחת חור ניקוז",
+          { transferables: sync.transferables }
+        );
+        if (!jobResult) return; // cancelled
+        const result = adoptDocOpResult(jobResult);
         applyOpResult("חור ניקוז", [result.layer], [layer.id], "hide", [
           ...result.warningsHe,
           result.reachedCavity[0]
@@ -637,7 +695,7 @@ function EditorInner() {
         ]);
       });
     },
-    [drainPick, doc, runOp, applyOpResult, dispatch]
+    [drainPick, doc, runOp, applyOpResult, dispatch, jobs]
   );
 
   // ---- boolean / body operations -------------------------------------------
@@ -648,7 +706,22 @@ function EditorInner() {
       setBooleanKind(null);
       if (!kind || selectedShapeLayers.length < 2) return;
       void runOp("פעולה בוליאנית", async () => {
-        const outcome = await performBoolean(doc, selectedShapeLayers, kind);
+        // Runs as a registry job: in the worker where one exists, with
+        // progress and a cancel button; operand meshes sync on demand.
+        const sync = docOpMeshSync(selectedShapeLayers);
+        const result = await jobs.run(
+          "docBoolean",
+          {
+            document: doc,
+            meshes: sync.meshes,
+            layerIds: selectedShapeLayers.map((l) => l.id),
+            kind,
+          },
+          "פעולה בוליאנית",
+          { transferables: sync.transferables }
+        );
+        if (!result) return; // cancelled
+        const outcome = adoptDocOpResult(result);
         applyOpResult(
           kind === "union" ? "איחוד" : kind === "difference" ? "חיסור" : "חיתוך משותף",
           [outcome.layer],
@@ -658,7 +731,7 @@ function EditorInner() {
         );
       });
     },
-    [booleanKind, selectedShapeLayers, doc, runOp, applyOpResult]
+    [booleanKind, selectedShapeLayers, doc, runOp, applyOpResult, jobs]
   );
 
   const handleCutConfirm = useCallback(
@@ -721,14 +794,24 @@ function EditorInner() {
       const layer = singleSelectedShape;
       if (!layer) return;
       void runOp("חלול", async () => {
-        const outcome = await performHollow(doc, layer, settings);
+        // Minkowski erosion — the slowest operation in the app; run it as a
+        // job so the tab keeps painting and the user can cancel.
+        const sync = docOpMeshSync([layer]);
+        const result = await jobs.run(
+          "docHollow",
+          { document: doc, meshes: sync.meshes, layerId: layer.id, settings },
+          "חלול",
+          { transferables: sync.transferables }
+        );
+        if (!result) return; // cancelled
+        const outcome = adoptDocOpResult(result);
         applyOpResult("חלול", [outcome.layer], [layer.id], "hide", [
           `נחסכו ${(outcome.savedFraction * 100).toFixed(0)}% מהחומר (${((outcome.originalVolumeMm3 - outcome.hollowVolumeMm3) / 1000).toFixed(1)} סמ״ק)`,
           ...outcome.warningsHe,
         ]);
       });
     },
-    [singleSelectedShape, doc, runOp, applyOpResult]
+    [singleSelectedShape, doc, runOp, applyOpResult, jobs]
   );
 
   const handleThickenConfirm = useCallback(
@@ -737,11 +820,20 @@ function EditorInner() {
       const layer = singleSelectedShape;
       if (!layer) return;
       void runOp("עיבוי", async () => {
-        const outcome = await performThicken(doc, layer, thicknessMm);
+        // Minkowski dilation — same treatment as hollow: worker + cancel.
+        const sync = docOpMeshSync([layer]);
+        const result = await jobs.run(
+          "docThicken",
+          { document: doc, meshes: sync.meshes, layerId: layer.id, thicknessMm },
+          "עיבוי",
+          { transferables: sync.transferables }
+        );
+        if (!result) return; // cancelled
+        const outcome = adoptDocOpResult(result);
         applyOpResult("עיבוי", [outcome.layer], [layer.id], "hide", outcome.warningsHe);
       });
     },
-    [singleSelectedShape, doc, runOp, applyOpResult]
+    [singleSelectedShape, doc, runOp, applyOpResult, jobs]
   );
 
   const handleSmoothConfirm = useCallback(
@@ -1171,13 +1263,32 @@ function EditorInner() {
   }, [build.parts, runOp]);
 
   const handleArrangePlate = useCallback(() => {
-    const items = build.parts.map((part) => ({
-      layerId: part.primaryLayerId,
-      widthMm: part.stats.dimensionsMm.x,
-      depthMm: part.stats.dimensionsMm.y,
-      currentX: (part.stats.bounds.min.x + part.stats.bounds.max.x) / 2,
-      currentY: (part.stats.bounds.min.y + part.stats.bounds.max.y) / 2,
-    }));
+    const layerById = new Map(doc.layers.map((l) => [l.id, l]));
+    const items = build.parts.map((part) => {
+      const layer = layerById.get(part.primaryLayerId);
+      const currentX = (part.stats.bounds.min.x + part.stats.bounds.max.x) / 2;
+      const currentY = (part.stats.bounds.min.y + part.stats.bounds.max.y) / 2;
+      // The REAL footprint: convex hull of the world mesh's XY projection
+      // (relative to the part centre) — a diagonal part stops costing its
+      // huge axis-aligned box.
+      const points: [number, number][] = [];
+      const pos = part.worldMesh.positions;
+      for (let i = 0; i < pos.length; i += 3) {
+        points.push([pos[i] - currentX, pos[i + 1] - currentY]);
+      }
+      return {
+        layerId: part.primaryLayerId,
+        widthMm: part.stats.dimensionsMm.x,
+        depthMm: part.stats.dimensionsMm.y,
+        currentX,
+        currentY,
+        hull: convexHullXY(points),
+        // Rotation composes into the layer transform, which is only sound
+        // for a free-standing layer — parents and pivots change what a Z
+        // rotation about the part centre means.
+        allowRotation: !!layer && !layer.locked && !layer.parentId && !layer.pivot,
+      };
+    });
     if (items.length === 0) return;
     const result = arrangeOnPlate(items, {
       plateWidthMm: printer.buildVolumeMm.x,
@@ -1190,6 +1301,25 @@ function EditorInner() {
       if (!placement) return layer;
       const item = items.find((i) => i.layerId === layer.id);
       if (!item) return layer;
+      if (placement.rotationDeg !== 0) {
+        // Rotate about the part's current centre, then move the centre to
+        // its shelf position — composed on the layer's own matrix.
+        const rad = (placement.rotationDeg * Math.PI) / 180;
+        const pivotRotation = new THREE.Matrix4()
+          .makeTranslation(item.currentX, item.currentY, 0)
+          .multiply(new THREE.Matrix4().makeRotationZ(rad))
+          .multiply(new THREE.Matrix4().makeTranslation(-item.currentX, -item.currentY, 0));
+        const move = new THREE.Matrix4().makeTranslation(
+          placement.x - item.currentX,
+          placement.y - item.currentY,
+          0
+        );
+        const next = move.multiply(pivotRotation).multiply(transformToMatrix4(layer.transform));
+        return {
+          ...layer,
+          transform: snapTransformNoise(matrix4ToTransform(next)),
+        } as DesignLayer;
+      }
       // Placements are absolute plate positions; shift the layer transform by
       // the delta so any local offset baked into the mesh is preserved.
       return {
@@ -1299,7 +1429,6 @@ function EditorInner() {
     const targets = selectedParts.length > 0 ? selectedParts : build.parts;
     if (targets.length === 0) return;
     void runOp("יצירת תמיכות", async () => {
-      const kernel = await getGeometryKernel();
       const profile = getPrintabilityProfile(doc.printabilityProfileId);
       const maxOverhangDeg =
         doc.customPrintability?.maxOverhangDeg ?? profile.maxOverhangDeg;
@@ -1307,18 +1436,34 @@ function EditorInner() {
       const layers: DesignLayer[] = [];
       const lines: string[] = [];
       for (const part of targets) {
-        const { solid, result } = buildSupports(kernel, part.worldMesh, {
-          ...DEFAULT_SUPPORT_SETTINGS,
-          maxOverhangDeg,
-        });
-        lines.push(`${part.nameHe}: ${result.summaryHe}`);
-        if (!solid) continue;
+        // Off-thread with progress + cancel. transferables=[] on purpose:
+        // worldMesh doubles as live analysis/export data on this thread and
+        // must not be detached by the postMessage.
+        const jobResult = await jobs.run(
+          "buildSupports",
+          {
+            mesh: part.worldMesh,
+            settings: { ...DEFAULT_SUPPORT_SETTINGS, maxOverhangDeg },
+          },
+          `יצירת תמיכות — ${part.nameHe}`,
+          { transferables: [] }
+        );
+        if (!jobResult) return; // cancelled
+        lines.push(`${part.nameHe}: ${jobResult.result.summaryHe}`);
+        if (!jobResult.mesh) continue;
+        const kernel = await getGeometryKernel();
+        const { solid, status } = kernel.fromMeshData(jobResult.mesh);
+        if (status !== "NoError" || solid.isEmpty()) {
+          solid.dispose();
+          continue;
+        }
         layers.push(
           generatorToLayer(
             solid,
             `${part.nameHe} — תמיכות`,
             doc.materialSlots[0]?.id ?? "slot1",
-            result.summaryHe
+            jobResult.result.summaryHe,
+            "supportResult"
           )
         );
       }
@@ -1330,7 +1475,7 @@ function EditorInner() {
       dispatch({ type: "ui/select", selection: layers.map((l) => l.id) });
       setMessage({ titleHe: "תמיכות נוצרו", bodyHe: lines.join("\n"), kind: "success" });
     });
-  }, [selectedParts, build.parts, doc, runOp, applyDocument, dispatch]);
+  }, [selectedParts, build.parts, doc, runOp, applyDocument, dispatch, jobs]);
 
   const handleCheckBridging = useCallback(() => {
     const targets = selectedParts.length > 0 ? selectedParts : build.parts;
@@ -1357,6 +1502,85 @@ function EditorInner() {
       if (worst.report.spans[0]) setFocusTarget({ ...worst.report.spans[0].center });
     });
   }, [selectedParts, build.parts, runOp]);
+
+  const handleAnalyzeWarping = useCallback(() => {
+    const targets = selectedParts.length > 0 ? selectedParts : build.parts;
+    if (targets.length === 0) return;
+    void runOp("ניתוח כיווץ", async () => {
+      const levelHe = { low: "נמוך", medium: "בינוני", high: "גבוה" } as const;
+      const sections = targets.map((part) => {
+        const a = analyzeWarping(part.worldMesh);
+        return `${part.nameHe}: סיכון ${levelHe[a.riskLevel]} (${a.riskScore}/100)\n${a.explanationHe.map((line) => `• ${line}`).join("\n")}`;
+      });
+      const worstHigh = targets.some(
+        (part) => analyzeWarping(part.worldMesh).riskLevel === "high"
+      );
+      setMessage({
+        titleHe: "ניתוח כיווץ (Warping) — היוריסטיקה מוסברת",
+        bodyHe: sections.join("\n\n"),
+        kind: worstHigh ? "error" : "info",
+      });
+    });
+  }, [selectedParts, build.parts, runOp]);
+
+  const handleGenerateBrim = useCallback(() => {
+    const targets = selectedParts.length > 0 ? selectedParts : build.parts;
+    if (targets.length === 0) return;
+    void runOp("הוספת Brim", async () => {
+      const kernel = await getGeometryKernel();
+      const layers: DesignLayer[] = [];
+      const lines: string[] = [];
+      for (const part of targets) {
+        const outcome = await buildBrim(kernel, part.worldMesh);
+        lines.push(`${part.nameHe}: ${outcome.summaryHe}`);
+        layers.push(
+          generatorToLayer(
+            outcome.solid,
+            `${part.nameHe} — Brim`,
+            doc.materialSlots[0]?.id ?? "slot1",
+            outcome.summaryHe,
+            "brimResult"
+          )
+        );
+      }
+      applyDocument({ ...doc, layers: [...doc.layers, ...layers] }, "הוספת Brim");
+      dispatch({ type: "ui/select", selection: layers.map((l) => l.id) });
+      setMessage({ titleHe: "Brim נוסף", bodyHe: lines.join("\n"), kind: "success" });
+    });
+  }, [selectedParts, build.parts, doc, runOp, applyDocument, dispatch]);
+
+  const handleGenerateRaft = useCallback(() => {
+    const targets = selectedParts.length > 0 ? selectedParts : build.parts;
+    if (targets.length === 0) return;
+    void runOp("הוספת Raft", async () => {
+      const kernel = await getGeometryKernel();
+      const raftLayers: DesignLayer[] = [];
+      const lines: string[] = [];
+      // Two changes in ONE history step: the raft layers appear and each
+      // part is lifted onto its raft — undo reverts both together.
+      let layers = doc.layers;
+      for (const part of targets) {
+        const outcome = await buildRaft(kernel, part.worldMesh);
+        lines.push(`${part.nameHe}: ${outcome.summaryHe}`);
+        const raftLayer = generatorToLayer(
+          outcome.solid,
+          `${part.nameHe} — Raft`,
+          doc.materialSlots[0]?.id ?? "slot1",
+          outcome.summaryHe,
+          "raftResult"
+        );
+        raftLayers.push(raftLayer);
+        layers = layers.map((l) =>
+          l.id === part.primaryLayerId && !l.locked
+            ? { ...l, transform: { ...l.transform, z: l.transform.z + outcome.liftMm } }
+            : l
+        );
+      }
+      applyDocument({ ...doc, layers: [...layers, ...raftLayers] }, "הוספת Raft");
+      dispatch({ type: "ui/select", selection: raftLayers.map((l) => l.id) });
+      setMessage({ titleHe: "Raft נוסף", bodyHe: lines.join("\n"), kind: "success" });
+    });
+  }, [selectedParts, build.parts, doc, runOp, applyDocument, dispatch]);
 
   const handleReparent = useCallback(
     (childId: string, parentId: string | null) => {
@@ -1460,7 +1684,7 @@ function EditorInner() {
       fn: (
         mesh: import("@/lib/geometry/meshData").MeshData,
         triangles: Set<number>
-      ) => Promise<{ layers: DesignLayer[]; warningsHe: string[] }>
+      ) => Promise<{ layers: DesignLayer[]; warningsHe: string[] } | null>
     ) => {
       const sel = state.ui.faceSelection;
       if (!sel || sel.triangles.length === 0) return;
@@ -1468,13 +1692,43 @@ function EditorInner() {
       const layer = doc.layers.find((l) => l.id === sel.layerId);
       if (!part || !layer || layer.locked) return;
       void runOp(labelHe, async () => {
-        const { layers, warningsHe } = await fn(part.worldMesh, new Set(sel.triangles));
+        const outcome = await fn(part.worldMesh, new Set(sel.triangles));
+        // null = the user cancelled the job; nothing must change.
+        if (!outcome) return;
         dispatch({ type: "ui/setFaceSelection", selection: null });
-        applyOpResult(labelHe, layers, [layer.id], "hide", warningsHe);
+        applyOpResult(labelHe, outcome.layers, [layer.id], "hide", outcome.warningsHe);
       });
     },
     [state.ui.faceSelection, partByLayer, doc.layers, runOp, applyOpResult, dispatch]
   );
+
+  const handleFilletRegion = useCallback(() => {
+    const sel = state.ui.faceSelection;
+    const layer = sel ? doc.layers.find((l) => l.id === sel.layerId) : null;
+    if (!layer || !isShapeLayer(layer)) return;
+    runRegionOp("עיגול אזור", async (mesh, triangles) => {
+      // Runs as a job (worker + cancel): whole-body rounding is Minkowski.
+      // transferables=[]: the worldMesh must stay live on this thread.
+      const result = await jobs.run(
+        "filletRegion",
+        {
+          mesh,
+          regionTriangles: [...triangles],
+          settings: { sizeMm: filletRegionMm, style: "fillet", scope: "both" },
+        },
+        "עיגול אזור",
+        { transferables: [] }
+      );
+      if (!result) return null; // cancelled — nothing changes
+      const resultLayer = await meshToResultLayer(result.mesh, {
+        nameHe: `${layer.name} — עיגול אזור`,
+        descriptionHe: `עיגול אזור נבחר ברדיוס ${filletRegionMm} מ״מ`,
+        materialSlotId: layer.materialSlotId,
+        sourceLayerId: layer.id,
+      });
+      return { layers: [resultLayer], warningsHe: result.warningsHe };
+    });
+  }, [state.ui.faceSelection, doc.layers, runRegionOp, filletRegionMm, jobs]);
 
   const handlePushPull = useCallback(() => {
     const sel = state.ui.faceSelection;
@@ -1611,7 +1865,9 @@ function EditorInner() {
           resolvedPaintSlotId,
           sel.triangles,
           paintTriangleCount,
-          paintDepthMm
+          paintDepthMm,
+          // Spatial anchors: what lets the paint survive a rebuild (V6).
+          faceSelectionPart?.localMesh
         ),
       },
       "צביעת אזור"
@@ -1623,6 +1879,7 @@ function EditorInner() {
     paintTriangleCount,
     paintDepthMm,
     updateLayer,
+    faceSelectionPart,
   ]);
 
   const handleUnpaintRegion = useCallback(() => {
@@ -1634,12 +1891,13 @@ function EditorInner() {
         facePaint: unpaintTriangles(
           paintTargetLayer.facePaint,
           sel.triangles,
-          paintTriangleCount
+          paintTriangleCount,
+          faceSelectionPart?.localMesh
         ),
       },
       "הסרת צבע מאזור"
     );
-  }, [state.ui.faceSelection, paintTargetLayer, paintTriangleCount, updateLayer]);
+  }, [state.ui.faceSelection, paintTargetLayer, paintTriangleCount, updateLayer, faceSelectionPart]);
 
   const handleClearPaint = useCallback(() => {
     if (!paintTargetLayer || paintTargetLayer.locked) return;
@@ -1695,6 +1953,45 @@ function EditorInner() {
     void memoryVersion;
     return meshStoreStats();
   }, [doc, memoryVersion]);
+
+  // The history is bounded (HISTORY_CAPACITY): entries that fall off the old
+  // end may hold the last reference to a stored mesh, so every history change
+  // sweeps the store. A pending STL import (stored, previewed, not yet a
+  // layer) is passed as an extra root or an edit made while its dialog is
+  // open would free it out from under the confirm button.
+  useEffect(() => {
+    const pendingStl = pendingStlRef.current;
+    const result = sweepUnreferencedMeshes(
+      state.history,
+      pendingStl ? [pendingStl.meshId] : []
+    );
+    if (result.removed > 0) setMemoryVersion((v) => v + 1);
+  }, [state.history]);
+
+  // Paint recorded with spatial anchors survives a rebuild by re-projection
+  // (V6 item 17): after each completed build, a layer whose paint no longer
+  // matches its body is re-anchored onto the new mesh — quietly, with no
+  // history entry, exactly like a derived value. Entries without anchors
+  // (pre-V6 paint) keep the old discard-with-warning behaviour.
+  useEffect(() => {
+    if (build.parts.length === 0) return;
+    let changed = false;
+    const document = state.history.present.document;
+    const layers = document.layers.map((layer) => {
+      if (!layer.facePaint || layer.facePaint.length === 0) return layer;
+      const part = build.parts.find((p) => p.primaryLayerId === layer.id);
+      if (!part) return layer;
+      const count = part.localMesh.indices.length / 3;
+      if (!hasStalePaint(layer.facePaint, count)) return layer;
+      const result = reanchorPaints(layer.facePaint, part.localMesh);
+      if (result.reanchored === 0 && result.dropped === 0) return layer;
+      changed = true;
+      return { ...layer, facePaint: result.paints };
+    });
+    if (changed) {
+      dispatch({ type: "document/replaceTransient", document: { ...document, layers } });
+    }
+  }, [build.buildId, build.parts, state.history.present.document, dispatch]);
 
   const handleCollectGarbage = useCallback(() => {
     // Sweep against the union of every state in the history: a mesh that only
@@ -1844,6 +2141,17 @@ function EditorInner() {
           }
         }
 
+        // Generated supports export as SUPPORT objects, not model bodies —
+        // otherwise the slicer gives them full perimeters and infill and
+        // they come out too strong to snap off.
+        const roleOf = (part: PrintablePart): "model" | "support" => {
+          const layer = doc.layers.find((l) => l.id === part.primaryLayerId);
+          return layer?.type === "importedMesh" &&
+            layer.provenance.kind === "supportResult"
+            ? "support"
+            : "model";
+        };
+
         if (kind === "threemf") {
           const usage = USAGE_PROFILES.find((u) => u.id === doc.usageProfileId);
           const material =
@@ -1852,12 +2160,32 @@ function EditorInner() {
           const blob = buildThreeMf(
             parts.map((part) => {
               const slot = doc.materialSlots.find((s) => s.id === part.materialSlotId);
+              // LOCAL geometry placed by a build transform — the slicer sees
+              // a movable object, so repositioning there needs no re-bake
+              // here. The layer hierarchy travels as an assembly: a child
+              // part rides its parent's assembly object at its relative
+              // placement.
+              const layer = doc.layers.find((l) => l.id === part.primaryLayerId);
+              const parentPart = layer?.parentId
+                ? parts.find((p) => p.primaryLayerId === layer.parentId)
+                : undefined;
+              const relativeTransform = parentPart
+                ? matrixToThreeMfTransform(
+                    parentPart.worldMatrix.clone().invert().multiply(part.worldMatrix)
+                      .elements
+                  )
+                : undefined;
               return {
+                id: part.id,
                 name: part.nameHe,
                 colorHex: slot?.colorHex ?? "#8a8f98",
                 materialName: slot ? `${slot.nameHe} (${material.nameHe})` : material.nameHe,
-                vertices: part.worldMesh.positions,
-                triangles: part.worldMesh.indices,
+                vertices: part.localMesh.positions,
+                triangles: part.localMesh.indices,
+                role: roleOf(part),
+                buildTransform: matrixToThreeMfTransform(part.worldMatrix.elements),
+                parentId: parentPart?.id ?? null,
+                relativeTransform,
               };
             }),
             fileName
@@ -1897,6 +2225,7 @@ function EditorInner() {
             materialSlot:
               doc.materialSlots.find((s) => s.id === part.materialSlotId) ?? null,
             triangleCount: part.stats.triangleCount,
+            printAidHe: printAidNote(doc, part),
           })),
           {
             designName: fileName,
@@ -2067,44 +2396,156 @@ function EditorInner() {
   }, [applyDocument]);
 
   // ---- keyboard shortcuts -----------------------------------------------------
+  // The full 3D-tool set (V6 item 18), driven by an EDITABLE keymap stored
+  // on this device (lib/keyboard/keymap.ts). Esc stays hardcoded — a panic
+  // key must not be remappable into oblivion.
+
+  /** Bounds of the selection (fallback: all parts) for framing and views. */
+  const selectionFrame = useCallback(() => {
+    const parts = selectedParts.length > 0 ? selectedParts : build.parts;
+    if (parts.length === 0) return null;
+    const min = { x: Infinity, y: Infinity, z: Infinity };
+    const max = { x: -Infinity, y: -Infinity, z: -Infinity };
+    for (const part of parts) {
+      min.x = Math.min(min.x, part.stats.bounds.min.x);
+      min.y = Math.min(min.y, part.stats.bounds.min.y);
+      min.z = Math.min(min.z, part.stats.bounds.min.z);
+      max.x = Math.max(max.x, part.stats.bounds.max.x);
+      max.y = Math.max(max.y, part.stats.bounds.max.y);
+      max.z = Math.max(max.z, part.stats.bounds.max.z);
+    }
+    const center = {
+      x: (min.x + max.x) / 2,
+      y: (min.y + max.y) / 2,
+      z: (min.z + max.z) / 2,
+    };
+    const radius =
+      Math.hypot(max.x - min.x, max.y - min.y, max.z - min.z) / 2 || 10;
+    return { center, radius };
+  }, [selectedParts, build.parts]);
+
+  const handleFrameSelection = useCallback(() => {
+    const frame = selectionFrame();
+    if (!frame) return;
+    setFocusTarget({ ...frame.center, fitRadius: frame.radius });
+  }, [selectionFrame]);
+
+  const handleViewPreset = useCallback(
+    (kind: "top" | "front" | "side" | "iso") => {
+      const frame = selectionFrame();
+      if (!frame) return;
+      setViewPreset((prev) => ({
+        kind,
+        center: frame.center,
+        radius: frame.radius,
+        nonce: (prev?.nonce ?? 0) + 1,
+      }));
+    },
+    [selectionFrame]
+  );
+
+  const handleSelectAll = useCallback(() => {
+    dispatch({
+      type: "ui/select",
+      selection: build.parts.map((p) => p.primaryLayerId),
+    });
+  }, [dispatch, build.parts]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
-      if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
-      if ((e.ctrlKey || e.metaKey) && e.code === "KeyZ") {
-        e.preventDefault();
-        dispatch({ type: e.shiftKey ? "history/redo" : "history/undo" });
-        return;
-      }
-      if ((e.ctrlKey || e.metaKey) && e.code === "KeyY") {
-        e.preventDefault();
-        dispatch({ type: "history/redo" });
-        return;
-      }
-      if (e.code === "Delete" || e.code === "Backspace") {
-        for (const layer of selectedLayers) {
-          if (!layer.locked) handleDeleteLayer(layer.id);
-        }
-        return;
-      }
-      const toolByCode: Record<string, "select" | "translate" | "rotate" | "scale"> = {
-        KeyQ: "select",
-        KeyG: "translate",
-        KeyR: "rotate",
-        KeyS: "scale",
-      };
-      if (toolByCode[e.code] && !e.ctrlKey && !e.metaKey) {
-        dispatch({ type: "ui/setTool", tool: toolByCode[e.code] });
+      // Never swallow typing: form fields and editable content keep every key.
+      if (
+        target &&
+        (["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName) || target.isContentEditable)
+      ) {
         return;
       }
       if (e.code === "Escape") {
         dispatch({ type: "ui/setTool", tool: "select" });
+        return;
+      }
+      const action = actionForEvent(e, keymap);
+      if (!action) return;
+      switch (action) {
+        case "undo":
+          e.preventDefault();
+          dispatch({ type: "history/undo" });
+          break;
+        case "redo":
+          e.preventDefault();
+          dispatch({ type: "history/redo" });
+          break;
+        case "delete": {
+          // One document update for the whole selection. The old per-layer
+          // loop called the single-delete handler repeatedly over the SAME
+          // stale document, so only the last deletion survived.
+          const doomed = new Set(
+            selectedLayers.filter((l) => !l.locked).map((l) => l.id)
+          );
+          if (doomed.size > 0) {
+            const current = state.history.present.document;
+            applyDocument(
+              { ...current, layers: current.layers.filter((l) => !doomed.has(l.id)) },
+              doomed.size === 1 ? "מחיקת שכבה" : `מחיקת ${doomed.size} שכבות`
+            );
+          }
+          break;
+        }
+        case "toolSelect":
+          dispatch({ type: "ui/setTool", tool: "select" });
+          break;
+        case "toolTranslate":
+          dispatch({ type: "ui/setTool", tool: "translate" });
+          break;
+        case "toolRotate":
+          dispatch({ type: "ui/setTool", tool: "rotate" });
+          break;
+        case "toolScale":
+          dispatch({ type: "ui/setTool", tool: "scale" });
+          break;
+        case "frameSelection":
+          handleFrameSelection();
+          break;
+        case "duplicate":
+          e.preventDefault();
+          handleDuplicate();
+          break;
+        case "selectAll":
+          e.preventDefault();
+          handleSelectAll();
+          break;
+        case "viewTop":
+          handleViewPreset("top");
+          break;
+        case "viewFront":
+          handleViewPreset("front");
+          break;
+        case "viewSide":
+          handleViewPreset("side");
+          break;
+        case "viewIso":
+          handleViewPreset("iso");
+          break;
+        case "shortcutHelp":
+          e.preventDefault();
+          setShortcutsOpen(true);
+          break;
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [dispatch, selectedLayers, handleDeleteLayer]);
+  }, [
+    dispatch,
+    keymap,
+    selectedLayers,
+    state.history.present.document,
+    applyDocument,
+    handleFrameSelection,
+    handleViewPreset,
+    handleDuplicate,
+    handleSelectAll,
+  ]);
 
   // ---- derived UI -----------------------------------------------------------
 
@@ -2216,6 +2657,23 @@ function EditorInner() {
           <button
             type="button"
             className="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-sm text-slate-600 hover:bg-slate-50"
+            title="ספריית עיצובים עם גרסאות — במכשיר זה בלבד, ללא חשבון וללא סנכרון"
+            onClick={() => setLibraryOpen(true)}
+          >
+            ספרייה
+          </button>
+          <button
+            type="button"
+            className="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-sm text-slate-600 hover:bg-slate-50"
+            title="קיצורי מקלדת (Shift+?)"
+            aria-label="קיצורי מקלדת"
+            onClick={() => setShortcutsOpen(true)}
+          >
+            ⌨
+          </button>
+          <button
+            type="button"
+            className="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-sm text-slate-600 hover:bg-slate-50"
             title="קישור שמכיל את העיצוב עצמו — לעיצובים קטנים בלבד"
             onClick={handleShareLink}
           >
@@ -2238,8 +2696,13 @@ function EditorInner() {
       </div>
 
       <main className="flex min-h-0 flex-1 flex-col-reverse lg:flex-row">
-        {/* Panels (start side = right in RTL) */}
-        <aside className="max-h-[55dvh] w-full overflow-y-auto border-t border-slate-200 bg-white lg:max-h-none lg:w-[420px] lg:border-e lg:border-t-0">
+        {/* Panels (start side = right in RTL). Below lg the panel column is
+            a COLLAPSIBLE bottom sheet, so a phone can give the whole screen
+            to the viewport and pull the tools up only when needed. */}
+        <aside
+          data-testid="panel-drawer"
+          className={`${panelOpen ? "max-h-[55dvh]" : "hidden"} w-full overflow-y-auto border-t border-slate-200 bg-white lg:block lg:max-h-none lg:w-[420px] lg:border-e lg:border-t-0`}
+        >
           <Section title="יצירה">
             <CreatePanel
               busy={busy}
@@ -2353,6 +2816,9 @@ function EditorInner() {
               onArrangePlate={handleArrangePlate}
               onGenerateSupports={handleGenerateSupports}
               onCheckBridging={handleCheckBridging}
+              onAnalyzeWarping={handleAnalyzeWarping}
+              onGenerateBrim={handleGenerateBrim}
+              onGenerateRaft={handleGenerateRaft}
               onRevolve={() => setRevolveOpen(true)}
               onEmboss={() => setEmbossOpen(true)}
               canRevolve={
@@ -2424,6 +2890,9 @@ function EditorInner() {
               onSetGrowAngle={(degrees) => dispatch({ type: "ui/setFaceGrowAngle", degrees })}
               onSetPushPull={setPushPullMm}
               onPushPull={handlePushPull}
+              filletRegionMm={filletRegionMm}
+              onSetFilletRegionMm={setFilletRegionMm}
+              onFilletRegion={handleFilletRegion}
               onSmooth={handleRegionSmooth}
               onDelete={handleRegionDelete}
               onSplit={handleRegionSplit}
@@ -2484,6 +2953,17 @@ function EditorInner() {
 
         {/* 3D viewport */}
         <section className="relative min-h-[45dvh] flex-1">
+          {/* Phone/tablet: pull the tool sheet up or give the viewport the
+              whole screen. Hidden on lg, where the panel is a fixed column. */}
+          <button
+            type="button"
+            data-testid="panel-toggle"
+            className="absolute bottom-3 end-3 z-10 rounded-full border border-slate-300 bg-white/95 px-4 py-2 text-sm font-medium text-slate-700 shadow lg:hidden"
+            aria-expanded={panelOpen}
+            onClick={() => setPanelOpen((v) => !v)}
+          >
+            {panelOpen ? "הסתרת לוח הכלים ⌄" : "לוח הכלים ⌃"}
+          </button>
           <JobProgressOverlay progress={jobs.progress} onCancel={jobs.cancel} />
           <ErrorBoundary
             areaHe="תצוגה התלת־ממדית"
@@ -2514,6 +2994,7 @@ function EditorInner() {
             onSurfacePick={handleSurfacePick}
             onAddMeasurement={handleAddMeasurement}
             focusTarget={focusTarget}
+            viewPreset={viewPreset}
             faceSelection={faceSelection}
             onFacePick={handleFacePick}
             onRemoveMeasurement={(id) => dispatch({ type: "ui/removeMeasurement", id })}
@@ -2525,6 +3006,10 @@ function EditorInner() {
               // driven by the real geometry pipeline, so watching it is how
               // the tests prove an operation actually ran.
               data-testid="viewport-dimensions"
+              // Honest execution-path report of the last completed build:
+              // "worker" or "main". The e2e suite pins the worker path here —
+              // a silent fallback would otherwise be invisible.
+              data-build-ran-on={build.ranOn ?? ""}
               className="pointer-events-none absolute bottom-3 start-3 rounded-md bg-white/85 px-3 py-1.5 font-mono text-xs text-slate-700 shadow-sm"
               dir="ltr"
             >
@@ -2535,7 +3020,14 @@ function EditorInner() {
           {(busy || build.status === "building") && (
             <div className="pointer-events-none absolute end-3 top-3 flex items-center gap-2 rounded-md bg-white/90 px-3 py-1.5 text-xs text-slate-600 shadow">
               <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-blue-500 border-t-transparent" />
-              {state.ui.busyLabelHe ?? "בונה מודל…"}
+              {state.ui.busyLabelHe ??
+                (build.progress
+                  ? `${build.progress.labelHe} · ${Math.round(build.progress.fraction * 100)}%`
+                  : // ranOn reports the LAST completed build; when it fell back
+                    // to the main thread the next builds will too, so say so.
+                    build.ranOn === "main"
+                    ? "בונה מודל… (בחלון הראשי)"
+                    : "בונה מודל…")}
             </div>
           )}
           {build.status === "invalid" && (
@@ -2634,6 +3126,27 @@ function EditorInner() {
         buildOk={build.status === "ok"}
         onExport={handleExport}
         onClose={() => setExportOpen(false)}
+      />
+      <ShortcutsDialog
+        open={shortcutsOpen}
+        keymap={keymap}
+        onClose={() => setShortcutsOpen(false)}
+        onChange={setKeymap}
+      />
+      <LibraryDialog
+        open={libraryOpen}
+        document={doc}
+        onClose={() => setLibraryOpen(false)}
+        onLoad={(loaded, labelHe, warningsHe) => {
+          applyDocument(loaded, labelHe);
+          dispatch({ type: "ui/select", selection: [] });
+          if (warningsHe.length > 0) {
+            setMessage({ titleHe: labelHe, bodyHe: warningsHe.join("\n"), kind: "info" });
+          }
+        }}
+        onError={(messageHe) =>
+          setMessage({ titleHe: "ספריית עיצובים", bodyHe: messageHe, kind: "error" })
+        }
       />
       <OrientationDialog
         candidates={orientationCandidates}

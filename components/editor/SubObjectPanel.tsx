@@ -51,6 +51,9 @@ export interface SubObjectPanelProps {
   onSetGrowAngle: (degrees: number) => void;
   onSetPushPull: (mm: number) => void;
   onPushPull: () => void;
+  filletRegionMm: number;
+  onSetFilletRegionMm: (mm: number) => void;
+  onFilletRegion: () => void;
   onSmooth: () => void;
   onDelete: () => void;
   onSplit: () => void;
@@ -185,6 +188,29 @@ export function SubObjectPanel(props: SubObjectPanelProps) {
                 ב״עיוות״.
               </p>
             )}
+          </div>
+
+          <div>
+            <p className="mb-1.5 text-xs font-bold text-slate-500">עיגול אזור נבחר</p>
+            <NumberField
+              label="רדיוס עיגול האזור"
+              value={props.filletRegionMm}
+              min={0.2}
+              max={20}
+              step={0.2}
+              unit="מ״מ"
+              onChange={props.onSetFilletRegionMm}
+            />
+            <ActionButton
+              label="עגל את האזור"
+              title="מעגל רק את המקצועות שבתוך האזור הנבחר. מקצוע שממשיך אל מחוץ לאזור יציג מדרגה קטנה בגבול — עקיפה מתועדת: ל-Manifold אין עיגול לפי מקצוע"
+              disabled={!hasRegion || busy || props.filletRegionMm <= 0}
+              onClick={props.onFilletRegion}
+            />
+            <p className="mt-1 text-[11px] leading-snug text-slate-400">
+              עיגול מקומי דרך חיתוך-עיגול-איחוד; התוצאה עוברת שער אטימות, אך
+              בגבול האזור עשויה להופיע מדרגה קטנה.
+            </p>
           </div>
 
           <div>

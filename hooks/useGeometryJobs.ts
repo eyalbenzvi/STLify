@@ -50,7 +50,15 @@ export interface UseGeometryJobs {
   run: <K extends GeometryJobName>(
     name: K,
     payload: GeometryJobMap[K]["payload"],
-    labelHe: string
+    labelHe: string,
+    options?: {
+      /**
+       * Buffers to move to the worker instead of "transfer everything in the
+       * payload". Required when the payload references long-lived buffers
+       * (mesh store, live viewport meshes) — pass [] to clone, or copies.
+       */
+      transferables?: ArrayBuffer[];
+    }
   ) => Promise<GeometryJobMap[K]["result"] | null>;
   cancel: () => void;
 }
@@ -67,7 +75,8 @@ export function useGeometryJobs(): UseGeometryJobs {
     async <K extends GeometryJobName>(
       name: K,
       payload: GeometryJobMap[K]["payload"],
-      labelHe: string
+      labelHe: string,
+      options?: { transferables?: ArrayBuffer[] }
     ): Promise<GeometryJobMap[K]["result"] | null> => {
       // A second job would fight the first over the same worker slot and the
       // same progress state; the caller's buttons are disabled while busy,
@@ -82,6 +91,7 @@ export function useGeometryJobs(): UseGeometryJobs {
       try {
         const outcome = await runGeometryJob(name, payload, {
           signal: controller.signal,
+          transferables: options?.transferables,
           onProgress: (fraction, stageHe) =>
             setProgress({ labelHe, fraction, stageHe, offThread }),
         });

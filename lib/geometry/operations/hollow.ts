@@ -19,8 +19,9 @@ import type {
 } from "@/types/design";
 import * as THREE from "three";
 import { getGeometryKernel, type GeometryKernel, type Solid } from "../kernel";
+import { withSolidScope } from "../solidScope";
 import { matrix4ToManifoldMat4 } from "../transform";
-import { materializeWorldSolid, OpError, solidToResultLayer } from "./layerOps";
+import { materializeWorldSolid, OpError, solidToResultLayer, type OpHooks } from "./layerOps";
 
 /** Triangle budget for the erosion proxy (keeps minkowski tractable). */
 const EROSION_PROXY_MAX_TRIS = 6000;
@@ -70,80 +71,88 @@ function computeCavity(
 export async function performHollow(
   document: DesignDocument,
   layer: ShapeLayer,
-  settings: HollowSettings
+  settings: HollowSettings,
+  hooks: OpHooks = {}
 ): Promise<HollowOutcome> {
   if (settings.wallThicknessMm < 0.5) {
     throw new OpError("עובי דופן מינימלי לחלול הוא 0.5 מ״מ");
   }
   const kernel = await getGeometryKernel();
-  const solid = await materializeWorldSolid(kernel, document, layer);
-  if (!solid || solid.isEmpty()) {
-    solid?.dispose();
-    throw new OpError(`לשכבה "${layer.name}" אין גאומטריה לחלול`);
-  }
+  hooks.throwIfCancelled?.();
+  hooks.onProgress?.(0.15, "מכין את הגוף");
 
-  const warningsHe: string[] = [];
-  const originalVolume = solid.volumeMm3();
-  const bounds = solid.boundingBox();
+  // The scope owns every intermediate: any throw below (including a
+  // cancellation) frees them all — dispose() is idempotent, so handles the
+  // subtract consumed are skipped safely.
+  return withSolidScope(async (scope) => {
+    const solid = scope.trackMaybe(await materializeWorldSolid(kernel, document, layer));
+    if (!solid || solid.isEmpty()) {
+      throw new OpError(`לשכבה "${layer.name}" אין גאומטריה לחלול`);
+    }
 
-  let cavity: Solid | null;
-  try {
-    cavity = computeCavity(kernel, solid, settings.wallThicknessMm, warningsHe);
-  } catch (err) {
-    solid.dispose();
-    throw err;
-  }
-  if (!cavity) {
-    solid.dispose();
-    throw new OpError("עובי הדופן גדול מדי — לא נותר חלל פנימי", [
-      "הקטינו את עובי הדופן",
-    ]);
-  }
+    const warningsHe: string[] = [];
+    const originalVolume = solid.volumeMm3();
+    const bounds = solid.boundingBox();
 
-  // Preserve a solid floor: clip the cavity below the base-preserve level.
-  if (settings.preserveBaseMm > 0) {
-    cavity = cavity.trimByPlane(0, 0, 1, bounds.min.z + settings.preserveBaseMm);
-    if (cavity.isEmpty()) {
-      cavity.dispose();
-      solid.dispose();
-      throw new OpError("שימור הבסיס גבוה מדי — לא נותר חלל", [
-        "הקטינו את עובי הבסיס לשימור",
+    // Last cancel point before the Minkowski erosion (the expensive,
+    // uninterruptible stage).
+    hooks.throwIfCancelled?.();
+    hooks.onProgress?.(0.35, "מחשב את החלל הפנימי");
+
+    let cavity = scope.trackMaybe(
+      computeCavity(kernel, solid, settings.wallThicknessMm, warningsHe)
+    );
+    hooks.onProgress?.(0.75, "מחסר את החלל מהגוף");
+    if (!cavity) {
+      throw new OpError("עובי הדופן גדול מדי — לא נותר חלל פנימי", [
+        "הקטינו את עובי הדופן",
       ]);
     }
-  }
 
-  const result = solid.subtract(cavity);
-  if (result.status() !== "NoError" || result.isEmpty()) {
-    result.dispose();
-    throw new OpError("החלול נכשל עקב גאומטריה מורכבת", [
-      "נסו עובי דופן שונה או פשטו את המודל",
-    ]);
-  }
-  const hollowVolume = result.volumeMm3();
-  const saved = Math.max(0, 1 - hollowVolume / originalVolume);
-  if (saved < 0.02) {
-    warningsHe.push("החלול חסך פחות מ-2% חומר — ייתכן שהמודל דק מדי לחלול");
-  }
-  warningsHe.push(
-    "מומלץ להוסיף חורי ניקוז לגוף חלול, במיוחד בהדפסת שרף (SLA)"
-  );
+    // Preserve a solid floor: clip the cavity below the base-preserve level.
+    if (settings.preserveBaseMm > 0) {
+      cavity = scope.track(
+        cavity.trimByPlane(0, 0, 1, bounds.min.z + settings.preserveBaseMm)
+      );
+      if (cavity.isEmpty()) {
+        throw new OpError("שימור הבסיס גבוה מדי — לא נותר חלל", [
+          "הקטינו את עובי הבסיס לשימור",
+        ]);
+      }
+    }
 
-  const resultLayer = solidToResultLayer(result, {
-    nameHe: `${layer.name} — חלול`,
-    provenance: {
-      kind: "hollowResult",
-      descriptionHe: `חלול בעובי דופן ${settings.wallThicknessMm} מ״מ`,
-      sourceLayerIds: [layer.id],
-    },
-    materialSlotId: layer.materialSlotId,
+    const result = scope.track(solid.subtract(cavity));
+    if (result.status() !== "NoError" || result.isEmpty()) {
+      throw new OpError("החלול נכשל עקב גאומטריה מורכבת", [
+        "נסו עובי דופן שונה או פשטו את המודל",
+      ]);
+    }
+    const hollowVolume = result.volumeMm3();
+    const saved = Math.max(0, 1 - hollowVolume / originalVolume);
+    if (saved < 0.02) {
+      warningsHe.push("החלול חסך פחות מ-2% חומר — ייתכן שהמודל דק מדי לחלול");
+    }
+    warningsHe.push(
+      "מומלץ להוסיף חורי ניקוז לגוף חלול, במיוחד בהדפסת שרף (SLA)"
+    );
+
+    const resultLayer = solidToResultLayer(scope.keep(result), {
+      nameHe: `${layer.name} — חלול`,
+      provenance: {
+        kind: "hollowResult",
+        descriptionHe: `חלול בעובי דופן ${settings.wallThicknessMm} מ״מ`,
+        sourceLayerIds: [layer.id],
+      },
+      materialSlotId: layer.materialSlotId,
+    });
+    return {
+      layer: resultLayer,
+      originalVolumeMm3: originalVolume,
+      hollowVolumeMm3: hollowVolume,
+      savedFraction: saved,
+      warningsHe,
+    };
   });
-  return {
-    layer: resultLayer,
-    originalVolumeMm3: originalVolume,
-    hollowVolumeMm3: hollowVolume,
-    savedFraction: saved,
-    warningsHe,
-  };
 }
 
 export interface DrainOutcome {
@@ -184,7 +193,8 @@ function buildDrill(
 export async function performDrainHoles(
   document: DesignDocument,
   layer: ShapeLayer,
-  holes: DrainHoleDefinition[]
+  holes: DrainHoleDefinition[],
+  hooks: OpHooks = {}
 ): Promise<DrainOutcome> {
   if (holes.length === 0) throw new OpError("לא הוגדרו חורי ניקוז");
   for (const hole of holes) {
@@ -195,6 +205,8 @@ export async function performDrainHoles(
   }
 
   const kernel = await getGeometryKernel();
+  hooks.throwIfCancelled?.();
+  hooks.onProgress?.(0.15, "מכין את הגוף");
   let solid = await materializeWorldSolid(kernel, document, layer);
   if (!solid || solid.isEmpty()) {
     solid?.dispose();
@@ -204,7 +216,16 @@ export async function performDrainHoles(
   const warningsHe: string[] = [];
   const reachedCavity: boolean[] = [];
 
+  let holeIndex = 0;
   for (const hole of holes) {
+    // Safe per-hole cancel point: `solid` is the only live handle.
+    try {
+      hooks.throwIfCancelled?.();
+    } catch (err) {
+      solid.dispose();
+      throw err;
+    }
+    hooks.onProgress?.(0.2 + 0.7 * (holeIndex++ / holes.length), "קודח חור ניקוז");
     // Cavity-reach check on the CURRENT body: walking along the drill axis,
     // the first surface pair is the outer shell; a second entry surface
     // within the drill depth means the drill opens into an internal cavity.
