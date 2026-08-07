@@ -8,3 +8,22 @@
 body {
   font-family: var(--font-hebrew);
 }
+
+/*
+ * Touch ergonomics (V6 item 19): on coarse pointers every interactive
+ * control gets a finger-sized hit area. Layout keeps its visual density on
+ * mouse devices; only real touch hardware pays the extra space.
+ */
+@media (pointer: coarse) {
+  button,
+  select,
+  input[type="checkbox"],
+  input[type="radio"] {
+    min-height: 2.5rem;
+    min-width: 2.5rem;
+  }
+  input[type="number"],
+  input[type="text"] {
+    min-height: 2.5rem;
+  }
+}

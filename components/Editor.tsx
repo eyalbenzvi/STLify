@@ -301,6 +301,8 @@ function EditorInner() {
   const [exportOpen, setExportOpen] = useState(false);
   const [libraryOpen, setLibraryOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  /** Below lg the tool panel is a collapsible bottom sheet. */
+  const [panelOpen, setPanelOpen] = useState(true);
   const [keymap, setKeymap] = useState<Keymap>(() => loadKeymap());
   const [viewPreset, setViewPreset] = useState<{
     kind: "top" | "front" | "side" | "iso";
@@ -2663,8 +2665,13 @@ function EditorInner() {
       </div>
 
       <main className="flex min-h-0 flex-1 flex-col-reverse lg:flex-row">
-        {/* Panels (start side = right in RTL) */}
-        <aside className="max-h-[55dvh] w-full overflow-y-auto border-t border-slate-200 bg-white lg:max-h-none lg:w-[420px] lg:border-e lg:border-t-0">
+        {/* Panels (start side = right in RTL). Below lg the panel column is
+            a COLLAPSIBLE bottom sheet, so a phone can give the whole screen
+            to the viewport and pull the tools up only when needed. */}
+        <aside
+          data-testid="panel-drawer"
+          className={`${panelOpen ? "max-h-[55dvh]" : "hidden"} w-full overflow-y-auto border-t border-slate-200 bg-white lg:block lg:max-h-none lg:w-[420px] lg:border-e lg:border-t-0`}
+        >
           <Section title="יצירה">
             <CreatePanel
               busy={busy}
@@ -2912,6 +2919,17 @@ function EditorInner() {
 
         {/* 3D viewport */}
         <section className="relative min-h-[45dvh] flex-1">
+          {/* Phone/tablet: pull the tool sheet up or give the viewport the
+              whole screen. Hidden on lg, where the panel is a fixed column. */}
+          <button
+            type="button"
+            data-testid="panel-toggle"
+            className="absolute bottom-3 end-3 z-10 rounded-full border border-slate-300 bg-white/95 px-4 py-2 text-sm font-medium text-slate-700 shadow lg:hidden"
+            aria-expanded={panelOpen}
+            onClick={() => setPanelOpen((v) => !v)}
+          >
+            {panelOpen ? "הסתרת לוח הכלים ⌄" : "לוח הכלים ⌃"}
+          </button>
           <JobProgressOverlay progress={jobs.progress} onCancel={jobs.cancel} />
           <ErrorBoundary
             areaHe="תצוגה התלת־ממדית"

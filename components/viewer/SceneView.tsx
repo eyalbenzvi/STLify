@@ -474,6 +474,16 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
     gizmoMode && gizmoObject && gizmoLayer && !gizmoLayer.locked
   );
 
+  // Finger-sized gizmo on touch hardware: drei's default handles are tuned
+  // for a mouse cursor and are nearly unusable under a fingertip.
+  const coarsePointer = useMemo(
+    () =>
+      typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(pointer: coarse)").matches,
+    []
+  );
+
   const commitGizmo = useCallback(() => {
     if (!gizmoLayerId) return;
     const object = objects.get(gizmoLayerId);
@@ -521,7 +531,7 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
           // A drag mutates the object outside React; each change event asks
           // the demand frameloop for a repaint or the drag appears frozen.
           onChange={() => invalidate()}
-          size={0.8}
+          size={coarsePointer ? 1.35 : 0.8}
         />
       )}
 
@@ -803,6 +813,15 @@ export function SceneView(
         // Every change point calls invalidate(); see InvalidateOnUpdate.
         frameloop="demand"
         dpr={[1, 2]}
+        // Standard 3D-tool behaviour (and what makes touch workable): a
+        // click/tap on empty space clears the selection — but only in the
+        // selection/transform tools, never in pick modes where a miss is
+        // just a miss.
+        onPointerMissed={(event) => {
+          if (event.type !== "click") return;
+          if (!["select", "translate", "rotate", "scale"].includes(props.tool)) return;
+          props.onSelect([], false);
+        }}
       >
         <SceneContent {...props} />
       </Canvas>
