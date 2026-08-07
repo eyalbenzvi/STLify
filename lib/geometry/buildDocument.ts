@@ -114,6 +114,30 @@ export interface BuildDocumentOptions {
   useLayerCache?: boolean;
 }
 
+/**
+ * Elephant-foot compensation constants.
+ *
+ * A face counts as a WALL — something the inset can push inwards — only if
+ * its normal has enough horizontal component to give a direction to push
+ * along; a near-horizontal face has none. Two walls at a vertex count as the
+ * same wall when their horizontal directions are this nearly parallel, which
+ * is what keeps a cylinder's many facets from being mitered against each
+ * other while a box corner's two genuinely different walls still are.
+ */
+const MIN_WALL_HORIZONTAL_FRACTION = 0.05;
+const SAME_WALL_DIRECTION_DOT = 0.999;
+
+/** Floor on the compensation height, so a zero never divides the falloff. */
+const MIN_ELEPHANT_FOOT_HEIGHT_MM = 0.05;
+
+/**
+ * How the build's progress fraction is divided. Per-layer solids are the
+ * bulk of the work; the remainder covers setup before and the booleans,
+ * modifiers and world-space bake after.
+ */
+const LAYER_BUILD_PROGRESS_START = 0.05;
+const LAYER_BUILD_PROGRESS_SPAN = 0.55;
+
 export interface BuildStats {
   layersBuilt: number;
   layersFromCache: number;
@@ -430,14 +454,14 @@ function insetSlabWalls(
     const length = Math.hypot(nx, ny, nz);
     if (length < 1e-12) continue;
     // Near-horizontal faces have no in-plane direction to offset along.
-    if (horizontal / length < 0.05) continue;
+    if (horizontal / length < MIN_WALL_HORIZONTAL_FRACTION) continue;
     const dx = nx / horizontal;
     const dy = ny / horizontal;
     for (let k = 0; k < 3; k++) {
       const list = walls[mesh.indices[t * 3 + k]];
       let known = false;
       for (let i = 0; i < list.length; i += 2) {
-        if (list[i] * dx + list[i + 1] * dy > 0.999) {
+        if (list[i] * dx + list[i + 1] * dy > SAME_WALL_DIRECTION_DOT) {
           known = true;
           break;
         }
@@ -572,7 +596,10 @@ function applyElephantFoot(
   if (!calibration || calibration.elephantFootCompensationMm <= 0) {
     return { solid, failed: false };
   }
-  const height = Math.max(0.05, calibration.elephantFootHeightMm);
+  const height = Math.max(
+    MIN_ELEPHANT_FOOT_HEIGHT_MM,
+    calibration.elephantFootHeightMm
+  );
 
   const worldBounds = worldBoundsOf(solid, worldMatrix);
   // Nothing of this part is near the plate, so nothing is squashed.
@@ -726,7 +753,9 @@ export async function buildDocument(
       throw err;
     }
     onProgress(
-      0.05 + 0.55 * (layerIndex++ / Math.max(1, visibleLayers.length)),
+      LAYER_BUILD_PROGRESS_START +
+        LAYER_BUILD_PROGRESS_SPAN *
+          (layerIndex++ / Math.max(1, visibleLayers.length)),
       `בונה את השכבה "${layer.name}"`
     );
     if (layer.type === "hole") {

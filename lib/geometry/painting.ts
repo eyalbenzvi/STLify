@@ -36,6 +36,23 @@ import {
   type MeshData,
 } from "./meshData";
 
+/**
+ * How deep a paint region may reach as a fraction of the body's THINNEST
+ * dimension, with an absolute floor. Past roughly half the thickness the
+ * offset copy turns inside out, and the kernel reports NoError while doing
+ * it — this bound is what keeps the split honest.
+ */
+const MAX_PAINT_DEPTH_FRACTION = 0.45;
+const MIN_PAINT_DEPTH_MM = 0.05;
+
+/**
+ * Relative slack allowed when checking that a split conserved volume, with
+ * an absolute floor for very small bodies. Tight enough to catch an
+ * inside-out piece; loose enough for the kernel's own rounding.
+ */
+const VOLUME_CONSERVATION_TOLERANCE_FRACTION = 1e-3;
+const MIN_VOLUME_CONSERVATION_TOLERANCE_MM3 = 0.05;
+
 /** Depth a painted region reaches into the body, in mm. */
 export const DEFAULT_PAINT_DEPTH_MM = 0.8;
 
@@ -524,7 +541,10 @@ export function splitSolidByPaint(
     bounds.max.y - bounds.min.y,
     bounds.max.z - bounds.min.z
   );
-  const maxDepth = Math.max(0.05, thinnest * 0.45);
+  const maxDepth = Math.max(
+    MIN_PAINT_DEPTH_MM,
+    thinnest * MAX_PAINT_DEPTH_FRACTION
+  );
 
   const result: PaintedSolid[] = [];
   let remainder = solid;
@@ -575,7 +595,10 @@ export function splitSolidByPaint(
       const regionVolume = region.volumeMm3();
       const restVolume = rest.volumeMm3();
       const volumeAfter = regionVolume + restVolume;
-      const tolerance = Math.max(0.05, volumeBefore * 1e-3);
+      const tolerance = Math.max(
+        MIN_VOLUME_CONSERVATION_TOLERANCE_MM3,
+        volumeBefore * VOLUME_CONSERVATION_TOLERANCE_FRACTION
+      );
       const conserved =
         Number.isFinite(volumeAfter) &&
         regionVolume > 0 &&

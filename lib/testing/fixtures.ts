@@ -77,6 +77,24 @@ export function testHoleLayer(patch: Partial<HoleLayer> = {}): HoleLayer {
   };
 }
 
+/**
+ * A row of boxes along +X — what the leak tests and the benchmarks build to
+ * exercise the per-layer path with more than one layer in it.
+ */
+export function testBoxRow(
+  count: number,
+  idPrefix: string,
+  spacingMm = 30
+): PrimitiveLayer[] {
+  return Array.from({ length: count }, (_, i) =>
+    testBoxLayer({
+      id: `${idPrefix}${i}`,
+      name: `box ${i}`,
+      transform: { ...identityTransform(), x: i * spacingMm },
+    })
+  );
+}
+
 /** `testDocument` with its layers filled in — the most common shape. */
 export function testDocumentWith(
   layers: DesignLayer[],

@@ -15,13 +15,9 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { testBoxRow } from "@/lib/testing/fixtures";
 import * as THREE from "three";
-import {
-  defaultPrimitive,
-  identityTransform,
-  type DesignDocument,
-  type PrimitiveLayer,
-} from "@/types/design";
+import type { DesignDocument, PrimitiveLayer } from "@/types/design";
 import { MeshBvh } from "@/lib/geometry/bvh";
 import { buildDocument, clearLayerSolidCache } from "@/lib/geometry/buildDocument";
 import { emptyDocument } from "@/lib/geometry/documentTemplates";
@@ -96,17 +92,7 @@ describe("performance budgets", () => {
     const doc: DesignDocument = {
       ...emptyDocument(),
       baseMode: "baseless",
-      layers: Array.from({ length: 10 }, (_, i): PrimitiveLayer => ({
-        id: `bench_box_${i}`,
-        type: "primitive",
-        name: `box ${i}`,
-        visible: true,
-        locked: false,
-        materialSlotId: "slot1",
-        transform: { ...identityTransform(), x: i * 30 },
-        previewOpacity: 1,
-        ...defaultPrimitive("box"),
-      })),
+      layers: testBoxRow(10, "bench_box_"),
     };
 
     const t0 = performance.now();

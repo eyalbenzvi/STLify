@@ -9,12 +9,11 @@
  */
 
 import { beforeAll, describe, expect, it } from "vitest";
+import { testBoxRow } from "@/lib/testing/fixtures";
 import {
-  defaultPrimitive,
   identityTransform,
   type DesignDocument,
   type ImportedMeshLayer,
-  type PrimitiveLayer,
 } from "@/types/design";
 import { getGeometryKernel, liveSolidCount } from "../kernel";
 import { withSolidScope } from "../solidScope";
@@ -174,17 +173,7 @@ describe("operation pipelines leak nothing", () => {
     clearLayerSolidCache();
     const doc = emptyDocument();
     doc.baseMode = "baseless";
-    doc.layers = Array.from({ length: 5 }, (_, i): PrimitiveLayer => ({
-      id: `leak_box_${i}`,
-      type: "primitive",
-      name: `box ${i}`,
-      visible: true,
-      locked: false,
-      materialSlotId: "slot1",
-      transform: { ...identityTransform(), x: i * 30 },
-      previewOpacity: 1,
-      ...defaultPrimitive("box"),
-    }));
+    doc.layers = testBoxRow(5, "leak_box_");
 
     const baseline = liveSolidCount();
     await buildDocument(doc);
@@ -206,17 +195,7 @@ describe("operation pipelines leak nothing", () => {
     clearLayerSolidCache();
     const doc = emptyDocument();
     doc.baseMode = "baseless";
-    doc.layers = Array.from({ length: 5 }, (_, i): PrimitiveLayer => ({
-      id: `cancel_box_${i}`,
-      type: "primitive",
-      name: `box ${i}`,
-      visible: true,
-      locked: false,
-      materialSlotId: "slot1",
-      transform: { ...identityTransform(), x: i * 30 },
-      previewOpacity: 1,
-      ...defaultPrimitive("box"),
-    }));
+    doc.layers = testBoxRow(5, "cancel_box_");
 
     const baseline = liveSolidCount();
     let checks = 0;
