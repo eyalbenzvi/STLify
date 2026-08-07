@@ -24,6 +24,22 @@ export class GeneratorError extends Error {
 // Threads
 // ---------------------------------------------------------------------------
 
+/**
+ * Fit class, in the spirit of ISO 965 but calibrated for printing.
+ *
+ * A printed thread is not a machined one: layer stepping and elephant foot
+ * both add material, so the machinist's classes are all far too tight. These
+ * multiply the user's measured clearance instead of inventing absolute
+ * numbers, so a calibrated machine gets the right fit at every class.
+ */
+export type ThreadFitClass = "tight" | "normal" | "loose";
+
+export const THREAD_FIT_MULTIPLIER: Record<ThreadFitClass, number> = {
+  tight: 0.5,
+  normal: 1,
+  loose: 1.75,
+};
+
 export interface ThreadSettings {
   /** Nominal outer diameter, mm (M8 -> 8). */
   diameterMm: number;
@@ -37,6 +53,14 @@ export interface ThreadSettings {
    * on a printed bolt. Ignored for external threads.
    */
   clearanceMm: number;
+  /** Scales `clearanceMm`; defaults to "normal". */
+  fitClass?: ThreadFitClass;
+  /**
+   * Lead-in chamfer at both ends, mm. Without it the first thread catches on
+   * the mating part and cross-threads, which is the single most common
+   * complaint about printed fasteners.
+   */
+  chamferMm?: number;
   /** Facets per turn. */
   segments: number;
   /** Right-handed unless set. */
@@ -64,7 +88,10 @@ export function buildThread(kernel: GeometryKernel, settings: ThreadSettings): S
     throw new GeneratorError("הפסיעה גדולה מדי ביחס לקוטר ההברגה");
   }
 
-  const clearance = settings.internal ? Math.max(0, settings.clearanceMm) : 0;
+  const fitMultiplier = THREAD_FIT_MULTIPLIER[settings.fitClass ?? "normal"];
+  const clearance = settings.internal
+    ? Math.max(0, settings.clearanceMm) * fitMultiplier
+    : 0;
   const majorRadius = diameterMm / 2 + clearance / 2;
   // ISO metric: H = pitch * sqrt(3)/2, thread depth = 5H/8.
   const H = (pitchMm * Math.sqrt(3)) / 2;
@@ -122,7 +149,9 @@ export function buildThread(kernel: GeometryKernel, settings: ThreadSettings): S
     throw new GeneratorError("בניית ההברגה נכשלה — נסו פסיעה או קוטר אחרים");
   }
 
-  if (!settings.internal) return thread;
+  if (!settings.internal) {
+    return applyThreadChamfer(kernel, thread, settings, majorRadius, segments);
+  }
 
   // Internal threads are returned as a CUTTING TOOL: the caller subtracts
   // this from a blank to get a nut. Adding the clearance bore guarantees the
@@ -130,7 +159,62 @@ export function buildThread(kernel: GeometryKernel, settings: ThreadSettings): S
   const bore = kernel
     .cylinder(minorRadius, lengthMm + BOOLEAN_OVERLAP_MM * 2, segments)
     .translate(0, 0, -BOOLEAN_OVERLAP_MM);
-  return thread.union(bore);
+  // For a cutting tool the chamfer must FLARE outward, so the nut it carves
+  // gets a funnel at each end rather than a taper.
+  return applyThreadChamfer(kernel, thread.union(bore), settings, majorRadius, segments, true);
+}
+
+/**
+ * Cut (or add) a 45-degree lead-in at both ends of a thread.
+ *
+ * On a bolt this is a truncation: the corner is removed so the first turn
+ * engages instead of catching. On a nut cutter it is the opposite — the tool
+ * grows outward at the ends, carving a funnel that guides the bolt in.
+ */
+function applyThreadChamfer(
+  kernel: GeometryKernel,
+  thread: Solid,
+  settings: ThreadSettings,
+  majorRadius: number,
+  segments: number,
+  flare = false
+): Solid {
+  const chamfer = settings.chamferMm ?? Math.min(settings.pitchMm, majorRadius * 0.25);
+  if (!(chamfer > 0)) return thread;
+
+  const length = settings.lengthMm;
+  const wide = majorRadius + chamfer + BOOLEAN_OVERLAP_MM;
+
+  if (flare) {
+    // Two cones opening outward at each end, unioned into the cutter.
+    const bottom = kernel
+      .cone(wide, majorRadius, chamfer, segments)
+      .translate(0, 0, -BOOLEAN_OVERLAP_MM);
+    const top = kernel
+      .cone(majorRadius, wide, chamfer, segments)
+      .translate(0, 0, length - chamfer + BOOLEAN_OVERLAP_MM);
+    return thread.union(bottom).union(top);
+  }
+
+  // Bolt: subtract the ring OUTSIDE a cone at each end, which truncates the
+  // crests without touching the core.
+  const bottomRing = kernel
+    .cylinder(wide, chamfer + BOOLEAN_OVERLAP_MM, segments)
+    .translate(0, 0, -BOOLEAN_OVERLAP_MM)
+    .subtract(
+      kernel
+        .cone(majorRadius - chamfer, majorRadius, chamfer + BOOLEAN_OVERLAP_MM, segments)
+        .translate(0, 0, -BOOLEAN_OVERLAP_MM)
+    );
+  const topRing = kernel
+    .cylinder(wide, chamfer + BOOLEAN_OVERLAP_MM, segments)
+    .translate(0, 0, length - chamfer)
+    .subtract(
+      kernel
+        .cone(majorRadius, majorRadius - chamfer, chamfer + BOOLEAN_OVERLAP_MM, segments)
+        .translate(0, 0, length - chamfer)
+    );
+  return thread.subtract(bottomRing).subtract(topRing);
 }
 
 // ---------------------------------------------------------------------------

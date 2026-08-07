@@ -29,6 +29,7 @@ import type { DesignDocument, Measurement, Transform3D } from "@/types/design";
 import type { PrinterProfile } from "@/types/profiles";
 import type { BuiltPart } from "@/hooks/useDocumentBuilder";
 import { matrix4ToTransform, snapTransformNoise } from "@/lib/geometry/transform";
+import { activePaints } from "@/lib/geometry/painting";
 import type {
   EditorTool,
   OverlayMode,
@@ -478,6 +479,12 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
         />
       )}
 
+      <FacePaintOverlay
+        document={document}
+        parts={parts}
+        clippingPlanes={clippingPlanes}
+      />
+
       {faceSelection && (
         <FaceSelectionHighlight
           parts={parts}
@@ -512,6 +519,97 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
 
       <OrbitControls makeDefault enableDamping />
       <CameraFocus target={focusTarget ?? null} />
+    </>
+  );
+}
+
+/**
+ * Draws painted regions in their material's colour.
+ *
+ * The painted body stays ONE object until export, so the paint has to be
+ * shown as an overlay rather than by colouring separate parts — otherwise
+ * there is no feedback at all until the ZIP is opened. Same technique as the
+ * selection highlight: its own geometry, offset forward so it does not
+ * z-fight with the surface it covers.
+ */
+function FacePaintOverlay({
+  document,
+  parts,
+  clippingPlanes,
+}: {
+  document: DesignDocument;
+  parts: BuiltPart[];
+  clippingPlanes: THREE.Plane[];
+}) {
+  const regions = useMemo(() => {
+    const layerById = new Map(document.layers.map((l) => [l.id, l]));
+    const out: {
+      key: string;
+      colorHex: string;
+      geometry: THREE.BufferGeometry;
+      worldMatrix: THREE.Matrix4;
+    }[] = [];
+    for (const part of parts) {
+      const layer = layerById.get(part.primaryLayerId);
+      const source = part.localMesh;
+      const triangleCount = source.indices.length / 3;
+      for (const paint of activePaints(layer?.facePaint, triangleCount)) {
+        const slot = document.materialSlots.find((s) => s.id === paint.materialSlotId);
+        if (!slot) continue;
+        const positions = new Float32Array(paint.triangles.length * 9);
+        let cursor = 0;
+        for (const t of paint.triangles) {
+          for (let k = 0; k < 3; k++) {
+            const v = source.indices[t * 3 + k] * 3;
+            positions[cursor++] = source.positions[v];
+            positions[cursor++] = source.positions[v + 1];
+            positions[cursor++] = source.positions[v + 2];
+          }
+        }
+        if (cursor === 0) continue;
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute(
+          "position",
+          new THREE.BufferAttribute(positions.subarray(0, cursor), 3)
+        );
+        geometry.computeVertexNormals();
+        out.push({
+          key: `${part.id}:${paint.materialSlotId}`,
+          colorHex: slot.colorHex,
+          geometry,
+          worldMatrix: part.worldMatrix,
+        });
+      }
+    }
+    return out;
+  }, [document, parts]);
+
+  useEffect(
+    () => () => {
+      for (const region of regions) region.geometry.dispose();
+    },
+    [regions]
+  );
+
+  if (regions.length === 0) return null;
+  return (
+    <>
+      {regions.map((region) => (
+        <group key={region.key} matrixAutoUpdate={false} matrix={region.worldMatrix}>
+          <mesh geometry={region.geometry} renderOrder={1}>
+            <meshStandardMaterial
+              color={region.colorHex}
+              metalness={0.05}
+              roughness={0.55}
+              side={THREE.DoubleSide}
+              polygonOffset
+              polygonOffsetFactor={-1}
+              polygonOffsetUnits={-1}
+              clippingPlanes={clippingPlanes}
+            />
+          </mesh>
+        </group>
+      ))}
     </>
   );
 }

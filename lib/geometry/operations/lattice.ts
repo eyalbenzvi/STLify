@@ -25,6 +25,14 @@ export interface LatticeSettings {
   thicknessMm: number;
   /** Solid skin left on the outside of the part, mm. */
   shellThicknessMm: number;
+  /**
+   * Nozzle diameter of the target printer, mm. A strut thinner than roughly
+   * two extrusion widths cannot be printed as a wall: the slicer either drops
+   * it entirely — leaving a hollow part the user believes is reinforced — or
+   * prints it as a single fragile bead. Supplying this turns that silent
+   * failure into a warning.
+   */
+  nozzleDiameterMm?: number;
 }
 
 export interface LatticeOutcome {
@@ -142,6 +150,17 @@ export function latticeFill(
   }
 
   const warningsHe: string[] = [];
+
+  // A lattice the printer cannot resolve is worse than no lattice: the part
+  // looks reinforced in the model and comes out hollow.
+  const nozzle = settings.nozzleDiameterMm;
+  if (nozzle && nozzle > 0 && thicknessMm < nozzle * 2) {
+    warningsHe.push(
+      `עובי הסריג (${thicknessMm} מ״מ) דק מפעמיים קוטר הפיה (${nozzle} מ״מ) — ` +
+        `הסלייסר עלול לדלג עליו לגמרי. מומלץ לפחות ${(nozzle * 2).toFixed(1)} מ״מ.`
+    );
+  }
+
   const volumeBefore = solid.volumeMm3();
   const bounds = solid.boundingBox();
   const smallest = Math.min(

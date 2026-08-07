@@ -31,7 +31,13 @@ import type {
   Transform3D,
 } from "@/types/design";
 import { defaultPrimitive, isShapeLayer, newId, type PrimitiveKind } from "@/types/design";
-import { getPrintabilityProfile, getPrinterProfile, MATERIAL_PROFILES, USAGE_PROFILES } from "@/types/profiles";
+import {
+  getPrintabilityProfile,
+  getPrinterProfile,
+  MATERIAL_PROFILES,
+  USAGE_PROFILES,
+  type PrinterProfile,
+} from "@/types/profiles";
 import { useDocumentBuilder, type BuiltPart } from "@/hooks/useDocumentBuilder";
 import { createTemplateDocument, makeBaseLayer, makeHoleLayer, makeTextLayer, PRODUCT_TEMPLATES } from "@/lib/geometry/documentTemplates";
 import { getGeometryKernel } from "@/lib/geometry/kernel";
@@ -101,6 +107,7 @@ import {
 } from "@/lib/geometry/generators";
 import { downloadBlob } from "@/lib/export/stl";
 import { meshDataToBinaryStl } from "@/lib/export/stlData";
+import type { PrintablePart } from "@/lib/geometry/buildDocument";
 import { buildMultiPartZip } from "@/lib/export/package";
 import { buildThreeMf } from "@/lib/export/threeMF";
 import { DESIGN_FILE_EXTENSION, DesignFileError, serializeDesignFile } from "@/lib/serialization/designFile";
@@ -134,7 +141,27 @@ import {
 } from "@/components/dialogs/ImportDialogs";
 import { ExportDialog, type ExportKind } from "@/components/dialogs/ExportDialog";
 import { CreatePanel, type GeneratorKind } from "@/components/editor/CreatePanel";
-import { SubObjectPanel, type RegionInfo } from "@/components/editor/SubObjectPanel";
+import {
+  SubObjectPanel,
+  type PaintInfo,
+  type RegionInfo,
+} from "@/components/editor/SubObjectPanel";
+import {
+  activePaints,
+  DEFAULT_PAINT_DEPTH_MM,
+  hasStalePaint,
+  paintedTriangleSlots,
+  paintTriangles,
+  splitPartsByPaint,
+  unpaintTriangles,
+} from "@/lib/geometry/painting";
+import { CalibrationPanel, CustomPrinterPanel } from "@/components/editor/CalibrationPanel";
+import type { CalibrationSettings } from "@/lib/geometry/calibration";
+import {
+  analyzeBridging,
+  buildSupports,
+  DEFAULT_SUPPORT_SETTINGS,
+} from "@/lib/geometry/analysis/supports";
 import {
   buildAdjacency,
   growSelection,
@@ -215,7 +242,7 @@ function EditorInner() {
     useEditor();
   const build = useDocumentBuilder(doc);
   const jobs = useGeometryJobs();
-  const printer = getPrinterProfile(doc.printerProfileId);
+  const printer = getPrinterProfile(doc.printerProfileId, doc.customPrinters ?? []);
 
   // ---- dialog state ----------------------------------------------------
   const [message, setMessage] = useState<OpMessage | null>(null);
@@ -261,6 +288,8 @@ function EditorInner() {
   const [recovery, setRecovery] = useState<RecoverySnapshot | null>(null);
   const [editingModifierId, setEditingModifierId] = useState<string | null>(null);
   const [pushPullMm, setPushPullMm] = useState(2);
+  const [paintSlotId, setPaintSlotId] = useState<string | null>(null);
+  const [paintDepthMm, setPaintDepthMm] = useState(DEFAULT_PAINT_DEPTH_MM);
   const [revolveOpen, setRevolveOpen] = useState(false);
   const [embossOpen, setEmbossOpen] = useState(false);
 
@@ -1216,6 +1245,67 @@ function EditorInner() {
     }
   }, [doc, showError]);
 
+  // ---- Wave C: calibration, supports, bridging --------------------------------
+
+  const handleCalibrationChange = useCallback(
+    (calibration: CalibrationSettings) => {
+      applyDocument({ ...doc, calibration }, "כיול מדפסת");
+    },
+    [doc, applyDocument]
+  );
+
+  const handleCustomPrintersChange = useCallback(
+    (customPrinters: PrinterProfile[]) => {
+      applyDocument({ ...doc, customPrinters }, "מדפסות מותאמות");
+    },
+    [doc, applyDocument]
+  );
+
+  const handleGenerateSupports = useCallback(() => {
+    const part = selectedParts[0] ?? build.parts[0];
+    if (!part) return;
+    void runOp("יצירת תמיכות", async () => {
+      const kernel = await getGeometryKernel();
+      const profile = getPrintabilityProfile(doc.printabilityProfileId);
+      const maxOverhangDeg =
+        doc.customPrintability?.maxOverhangDeg ?? profile.maxOverhangDeg;
+      const { solid, result } = buildSupports(kernel, part.worldMesh, {
+        ...DEFAULT_SUPPORT_SETTINGS,
+        maxOverhangDeg,
+      });
+      if (!solid) {
+        setMessage({ titleHe: "תמיכות", bodyHe: result.summaryHe, kind: "info" });
+        return;
+      }
+      const layer = generatorToLayer(
+        solid,
+        `${part.nameHe} — תמיכות`,
+        doc.materialSlots[0]?.id ?? "slot1",
+        result.summaryHe
+      );
+      applyDocument({ ...doc, layers: [...doc.layers, layer] }, "יצירת תמיכות");
+      dispatch({ type: "ui/select", selection: [layer.id] });
+      setMessage({ titleHe: "תמיכות נוצרו", bodyHe: result.summaryHe, kind: "success" });
+    });
+  }, [selectedParts, build.parts, doc, runOp, applyDocument, dispatch]);
+
+  const handleCheckBridging = useCallback(() => {
+    const part = selectedParts[0] ?? build.parts[0];
+    if (!part) return;
+    void runOp("בדיקת גישורים", async () => {
+      const report = analyzeBridging(part.worldMesh);
+      setMessage({
+        titleHe: "בדיקת גישורים",
+        bodyHe:
+          report.spans.length === 0
+            ? report.summaryHe
+            : `${report.summaryHe}\n\nגישור נדרש כאשר יש חומר ללא תמיכה מתחתיו. עד 5 מ״מ המדפסת מגשרת ללא בעיה; מעל 20 מ״מ סביר שהחוט יישבר.`,
+        kind: report.longestMm > 20 ? "error" : "info",
+      });
+      if (report.spans[0]) setFocusTarget({ ...report.spans[0].center });
+    });
+  }, [selectedParts, build.parts, runOp]);
+
   const handleReparent = useCallback(
     (childId: string, parentId: string | null) => {
       if (childId === parentId) return;
@@ -1419,6 +1509,91 @@ function EditorInner() {
     });
   }, [state.ui.faceSelection, doc.layers, runRegionOp]);
 
+  // ---- V5: per-face material painting ---------------------------------------
+
+  /**
+   * Painting is metadata, not geometry: it records which material each
+   * triangle belongs to and leaves the body alone. The separation into
+   * per-colour printable parts happens in the export handler.
+   */
+  const paintTargetLayer = useMemo(
+    () => (faceSelection ? doc.layers.find((l) => l.id === faceSelection.layerId) ?? null : null),
+    [faceSelection, doc.layers]
+  );
+
+  const paintTriangleCount = faceSelectionPart
+    ? faceSelectionPart.localMesh.indices.length / 3
+    : 0;
+
+  // Default to the SECOND slot: painting with the body's own colour is a
+  // no-op, and the whole point of the tool is contrast.
+  const resolvedPaintSlotId =
+    paintSlotId && doc.materialSlots.some((s) => s.id === paintSlotId)
+      ? paintSlotId
+      : (doc.materialSlots[1]?.id ?? doc.materialSlots[0]?.id ?? "slot1");
+
+  const paintInfo: PaintInfo | null = useMemo(() => {
+    if (!paintTargetLayer || !faceSelectionPart) return null;
+    const active = activePaints(paintTargetLayer.facePaint, paintTriangleCount);
+    const owners = paintedTriangleSlots(active);
+    const selected = faceSelection?.triangles ?? [];
+    return {
+      countBySlot: active.map((p) => ({
+        slotId: p.materialSlotId,
+        triangles: p.triangles.length,
+      })),
+      stale: hasStalePaint(paintTargetLayer.facePaint, paintTriangleCount),
+      selectionPainted: selected.length > 0 && selected.some((t) => owners.has(t)),
+    };
+  }, [paintTargetLayer, faceSelectionPart, paintTriangleCount, faceSelection]);
+
+  const handlePaintRegion = useCallback(() => {
+    const sel = state.ui.faceSelection;
+    if (!sel || sel.triangles.length === 0 || !paintTargetLayer) return;
+    if (paintTargetLayer.locked) return;
+    updateLayer(
+      paintTargetLayer.id,
+      {
+        facePaint: paintTriangles(
+          paintTargetLayer.facePaint,
+          resolvedPaintSlotId,
+          sel.triangles,
+          paintTriangleCount,
+          paintDepthMm
+        ),
+      },
+      "צביעת אזור"
+    );
+  }, [
+    state.ui.faceSelection,
+    paintTargetLayer,
+    resolvedPaintSlotId,
+    paintTriangleCount,
+    paintDepthMm,
+    updateLayer,
+  ]);
+
+  const handleUnpaintRegion = useCallback(() => {
+    const sel = state.ui.faceSelection;
+    if (!sel || !paintTargetLayer || paintTargetLayer.locked) return;
+    updateLayer(
+      paintTargetLayer.id,
+      {
+        facePaint: unpaintTriangles(
+          paintTargetLayer.facePaint,
+          sel.triangles,
+          paintTriangleCount
+        ),
+      },
+      "הסרת צבע מאזור"
+    );
+  }, [state.ui.faceSelection, paintTargetLayer, paintTriangleCount, updateLayer]);
+
+  const handleClearPaint = useCallback(() => {
+    if (!paintTargetLayer || paintTargetLayer.locked) return;
+    updateLayer(paintTargetLayer.id, { facePaint: [] }, "ניקוי צביעה");
+  }, [paintTargetLayer, updateLayer]);
+
   // ---- V4: parameters, modifiers, history, memory, recovery ------------------
 
   const parameterTable = useMemo(
@@ -1599,13 +1774,31 @@ function EditorInner() {
           return;
         }
         if (build.parts.length === 0) throw new OpError("אין חלקים לייצוא");
+
+        // Painted regions become their own printable bodies — but only in the
+        // formats that can carry more than one material. A single merged STL
+        // has nowhere to put the second colour, so splitting it there would
+        // just add seams to a file nobody can print in two colours anyway.
+        let parts: PrintablePart[] = build.parts;
+        if (kind !== "stl") {
+          const split = await splitPartsByPaint(doc, build.parts);
+          parts = split.parts;
+          if (split.warningsHe.length > 0) {
+            setMessage({
+              titleHe: "הפרדת אזורים צבועים",
+              bodyHe: split.warningsHe.join("\n"),
+              kind: "info",
+            });
+          }
+        }
+
         if (kind === "threemf") {
           const usage = USAGE_PROFILES.find((u) => u.id === doc.usageProfileId);
           const material =
             MATERIAL_PROFILES.find((m) => m.id === usage?.suggestedMaterialId) ??
             MATERIAL_PROFILES[0];
           const blob = buildThreeMf(
-            build.parts.map((part) => {
+            parts.map((part) => {
               const slot = doc.materialSlots.find((s) => s.id === part.materialSlotId);
               return {
                 name: part.nameHe,
@@ -1645,7 +1838,7 @@ function EditorInner() {
         }
         // ZIP of separate parts.
         const zip = await buildMultiPartZip(
-          build.parts.map((part, index) => ({
+          parts.map((part, index) => ({
             fileBaseName: `${fileName}-${index + 1}-${part.nameHe}`,
             nameHe: part.nameHe,
             mesh: part.worldMesh,
@@ -1666,7 +1859,7 @@ function EditorInner() {
         downloadBlob(zip, `${fileName}.zip`);
       });
     },
-    [doc, build.parts, runOp]
+    [doc, build.parts, runOp, setMessage]
   );
 
   // ---- layers / mode -----------------------------------------------------------
@@ -2106,6 +2299,8 @@ function EditorInner() {
               onInspectMesh={handleOpenInspector}
               onCheckInterference={handleCheckInterference}
               onArrangePlate={handleArrangePlate}
+              onGenerateSupports={handleGenerateSupports}
+              onCheckBridging={handleCheckBridging}
               onRevolve={() => setRevolveOpen(true)}
               onEmboss={() => setEmbossOpen(true)}
               canRevolve={
@@ -2127,6 +2322,21 @@ function EditorInner() {
               />
             </Section>
           )}
+
+          <Section title="כיול מדפסת">
+            <CalibrationPanel
+              calibration={doc.calibration}
+              onChange={handleCalibrationChange}
+              onGenerateCoupon={() => setGeneratorKind("toleranceTest")}
+            />
+            <div className="mt-2 border-t border-slate-200 pt-2">
+              <p className="mb-1.5 text-xs font-bold text-slate-500">מדפסות מותאמות</p>
+              <CustomPrinterPanel
+                printers={doc.customPrinters ?? []}
+                onChange={handleCustomPrintersChange}
+              />
+            </div>
+          </Section>
 
           <Section title="פרמטרים">
             <ParametersPanel
@@ -2167,6 +2377,15 @@ function EditorInner() {
               onSplit={handleRegionSplit}
               onSelectAll={handleSelectAllFaces}
               onClear={() => dispatch({ type: "ui/setFaceSelection", selection: null })}
+              materialSlots={doc.materialSlots}
+              paintSlotId={resolvedPaintSlotId}
+              paintDepthMm={paintDepthMm}
+              paint={paintInfo}
+              onSetPaintSlot={setPaintSlotId}
+              onSetPaintDepth={setPaintDepthMm}
+              onPaint={handlePaintRegion}
+              onUnpaint={handleUnpaintRegion}
+              onClearPaint={handleClearPaint}
             />
           </Section>
 

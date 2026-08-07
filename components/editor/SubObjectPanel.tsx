@@ -13,6 +13,7 @@
  */
 
 import type { FaceGrowMode } from "./store";
+import type { MaterialSlot } from "@/types/design";
 import { NumberField } from "@/components/ui/NumberField";
 import { ToggleGroup } from "@/components/ui/ToggleGroup";
 
@@ -20,6 +21,16 @@ export interface RegionInfo {
   triangleCount: number;
   areaMm2: number;
   planar: boolean;
+}
+
+/** What is already painted on the selected body. */
+export interface PaintInfo {
+  /** materialSlotId → number of triangles painted with it. */
+  countBySlot: { slotId: string; triangles: number }[];
+  /** True when the body was rebuilt and the stored paint no longer applies. */
+  stale: boolean;
+  /** True when every selected triangle already carries a paint. */
+  selectionPainted: boolean;
 }
 
 export interface SubObjectPanelProps {
@@ -30,6 +41,11 @@ export interface SubObjectPanelProps {
   region: RegionInfo | null;
   busy: boolean;
   pushPullMm: number;
+  /** Slots available for painting. */
+  materialSlots: MaterialSlot[];
+  paintSlotId: string;
+  paintDepthMm: number;
+  paint: PaintInfo | null;
   onToggleActive: () => void;
   onSetGrowMode: (mode: FaceGrowMode) => void;
   onSetGrowAngle: (degrees: number) => void;
@@ -40,6 +56,11 @@ export interface SubObjectPanelProps {
   onSplit: () => void;
   onSelectAll: () => void;
   onClear: () => void;
+  onSetPaintSlot: (slotId: string) => void;
+  onSetPaintDepth: (mm: number) => void;
+  onPaint: () => void;
+  onUnpaint: () => void;
+  onClearPaint: () => void;
 }
 
 function ActionButton({
@@ -189,7 +210,129 @@ export function SubObjectPanel(props: SubObjectPanelProps) {
               />
             </div>
           </div>
+
+          <PaintSection {...props} hasRegion={hasRegion} />
         </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Painting a region with a material.
+ *
+ * The paint is metadata — the body stays one object while modelling — so this
+ * section says out loud what happens at export, otherwise "I painted it and
+ * nothing changed" reads as a bug.
+ */
+function PaintSection({
+  materialSlots,
+  paintSlotId,
+  paintDepthMm,
+  paint,
+  busy,
+  hasRegion,
+  onSetPaintSlot,
+  onSetPaintDepth,
+  onPaint,
+  onUnpaint,
+  onClearPaint,
+}: SubObjectPanelProps & { hasRegion: boolean }) {
+  const painted = paint?.countBySlot ?? [];
+  const totalPainted = painted.reduce((sum, entry) => sum + entry.triangles, 0);
+
+  return (
+    <div>
+      <p className="mb-1.5 text-xs font-bold text-slate-500">צביעת אזור בחומר</p>
+      <p className="mb-2 text-[11px] leading-snug text-slate-400">
+        הצביעה אינה משנה את הגוף. בייצוא כל אזור צבוע מופרד לקובץ נפרד עם
+        החומר שלו, כך שאפשר להדפיס בשני צבעים.
+      </p>
+
+      <div
+        role="radiogroup"
+        aria-label="חומר לצביעה"
+        className="mb-2 flex flex-wrap gap-1"
+      >
+        {materialSlots.map((slot) => (
+          <button
+            key={slot.id}
+            type="button"
+            role="radio"
+            aria-checked={slot.id === paintSlotId}
+            title={slot.nameHe}
+            onClick={() => onSetPaintSlot(slot.id)}
+            className={`flex items-center gap-1 rounded-md border px-1.5 py-1 text-[11px] transition-colors ${
+              slot.id === paintSlotId
+                ? "border-blue-500 bg-blue-50 text-blue-700"
+                : "border-slate-300 bg-white text-slate-600 hover:bg-slate-50"
+            }`}
+          >
+            <span
+              aria-hidden
+              className="inline-block h-3 w-3 rounded-sm border border-slate-300"
+              style={{ backgroundColor: slot.colorHex }}
+            />
+            {slot.nameHe}
+          </button>
+        ))}
+      </div>
+
+      <NumberField
+        label="עומק צביעה"
+        value={paintDepthMm}
+        min={0.2}
+        max={20}
+        step={0.2}
+        unit="מ״מ"
+        onChange={onSetPaintDepth}
+      />
+      <p className="mb-2 text-[11px] leading-snug text-slate-400">
+        כמה עמוק החומר הצבוע נכנס לתוך הגוף. שתי שכבות (0.4–0.8 מ״מ) מספיקות
+        לכיסוי אטום.
+      </p>
+
+      <div className="flex flex-wrap gap-1">
+        <ActionButton
+          label="צבע בחירה"
+          title="משייך את המשולשים הנבחרים לחומר שנבחר"
+          disabled={!hasRegion || busy}
+          onClick={onPaint}
+        />
+        <ActionButton
+          label="הסר צבע מבחירה"
+          disabled={!hasRegion || busy || !paint?.selectionPainted}
+          onClick={onUnpaint}
+        />
+        <ActionButton
+          label="נקה את כל הצביעה"
+          disabled={busy || totalPainted === 0}
+          onClick={onClearPaint}
+        />
+      </div>
+
+      {totalPainted > 0 && (
+        <div className="mt-2 flex flex-col gap-0.5 rounded-md bg-slate-50 p-2 text-[11px] text-slate-600">
+          {painted.map((entry) => {
+            const slot = materialSlots.find((s) => s.id === entry.slotId);
+            return (
+              <div key={entry.slotId} className="flex items-center gap-1">
+                <span
+                  aria-hidden
+                  className="inline-block h-2.5 w-2.5 rounded-sm border border-slate-300"
+                  style={{ backgroundColor: slot?.colorHex ?? "#888" }}
+                />
+                {slot?.nameHe ?? entry.slotId}: {entry.triangles} משולשים
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {paint?.stale && (
+        <p className="mt-2 text-[11px] leading-snug text-amber-700">
+          הגוף השתנה מאז הצביעה, ולכן הצביעה הישנה בוטלה. צבעו מחדש.
+        </p>
       )}
     </div>
   );

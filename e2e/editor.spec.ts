@@ -7,6 +7,7 @@
  * anything.
  */
 
+import { readFile } from "node:fs/promises";
 import { expect, test } from "@playwright/test";
 import {
   addFirstPrimitive,
@@ -92,7 +93,9 @@ test.describe("creation and editing", () => {
     await openEditor(page);
     const before = await readDimensions(page);
     await page.getByRole("button", { name: "גלגל שיניים" }).click();
-    await page.getByRole("button", { name: "צור" }).click();
+    // Scoped to the dialog and exact: the Wave C panels added "צור תמיכות"
+    // and "צור מבחן סבולות", so a substring match is now ambiguous.
+    await page.getByRole("dialog").getByRole("button", { name: "צור", exact: true }).click();
     await waitForModelChange(page, before);
     await expect(page.locator("body")).toContainText(/גלגל שיניים \d+Z/);
     await expectNoFailure(page);
@@ -104,7 +107,7 @@ test.describe("creation and editing", () => {
     await addPrimitive(page, "תיבה");
     const before = await readDimensions(page);
     await page.getByRole("button", { name: "מערך עותקים" }).click();
-    await page.getByRole("button", { name: "צור" }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "צור", exact: true }).click();
     await waitForModelChange(page, before);
     await expectNoFailure(page);
   });
@@ -129,6 +132,46 @@ test.describe("sub-object editing", () => {
     const before = await readDimensions(page);
     await page.getByRole("button", { name: "הזז פאה" }).click();
     await waitForModelChange(page, before);
+    await expectNoFailure(page);
+    assertSilent();
+  });
+
+  test("a face can be painted and the paint separates at export", async ({ page }) => {
+    const assertSilent = watchForErrors(page);
+    await openEditor(page);
+    await startBlank(page);
+    await addFirstPrimitive(page, "תיבה");
+
+    await page.getByRole("button", { name: "הפעל בחירת פאות" }).click();
+    await clickViewportCenter(page);
+    await expect(page.locator("body")).toContainText(/נבחרו \d+ משולשים/);
+
+    const before = await readDimensions(page);
+    await page.getByRole("button", { name: "צבע בחירה" }).click();
+    // The per-slot readout proves the paint was recorded on the layer...
+    await expect(page.locator("body")).toContainText(/צבע משני: \d+ משולשים/);
+    // ...and the body must NOT have changed shape: paint is metadata.
+    expect(await readDimensions(page)).toBe(before);
+
+    // At export the painted region becomes its own printable file. One body
+    // on the plate must therefore produce TWO STLs plus the README.
+    await page.getByRole("button", { name: "ייצוא ⬇" }).click();
+    const dialog = page.getByRole("dialog");
+    await dialog.getByText("ZIP עם STL נפרד לכל חלק/צבע", { exact: false }).click();
+    const download = page.waitForEvent("download", { timeout: 90_000 });
+    await dialog.getByRole("button", { name: "ייצוא", exact: true }).click();
+    const file = await download;
+    expect(file.suggestedFilename()).toMatch(/\.zip$/i);
+
+    const zipPath = await file.path();
+    const bytes = await readFile(zipPath);
+    // Local file headers, one per entry: two parts + README.
+    const entries = bytes.toString("latin1").split("PK\x03\x04").length - 1;
+    expect(entries).toBe(3);
+    // The painted part is named after its material slot, so the person at the
+    // printer knows which file gets which filament.
+    expect(bytes.includes(Buffer.from("צבע משני", "utf8"))).toBe(true);
+
     await expectNoFailure(page);
     assertSilent();
   });

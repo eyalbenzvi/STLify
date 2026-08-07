@@ -27,6 +27,7 @@ import type {
   TextLayer,
 } from "@/types/design";
 import { sketchToContours } from "./sketch";
+import { compensatedHoleDiameterMm, type CalibrationSettings } from "./calibration";
 import { loadFont } from "./fonts";
 import type { Contour, GeometryKernel, Solid } from "./kernel";
 import { getMesh } from "./meshStore";
@@ -390,9 +391,16 @@ export function buildPrimitiveSolid(
 export function buildHoleCutter(
   kernel: GeometryKernel,
   layer: HoleLayer,
-  spanMm: number
+  spanMm: number,
+  calibration?: CalibrationSettings
 ): Solid {
-  const radius = layer.diameterMm / 2;
+  // A printed hole comes out undersized. Enlarging the CUTTER is what makes
+  // the printed hole measure what the user typed; asking them to oversize
+  // every diameter by hand is how screws end up not fitting.
+  const effectiveDiameter = calibration
+    ? compensatedHoleDiameterMm(calibration, layer.diameterMm)
+    : layer.diameterMm;
+  const radius = effectiveDiameter / 2;
   if (layer.depthMode === "through") {
     return kernel.cylinder(radius, spanMm * 2).translate(0, 0, -spanMm);
   }

@@ -12,10 +12,13 @@
 import type { FontId, TextAlign } from "@/lib/geometry/types";
 import type { Modifier } from "@/lib/geometry/modifiers";
 import type { ParameterDefinition } from "@/lib/geometry/expression";
+import type { CalibrationSettings } from "@/lib/geometry/calibration";
+import type { PrinterProfile } from "@/types/profiles";
 
 // Re-exported so UI code can import the domain model from one place.
 export type { Modifier } from "@/lib/geometry/modifiers";
 export type { ParameterDefinition } from "@/lib/geometry/expression";
+export type { CalibrationSettings } from "@/lib/geometry/calibration";
 
 /** Schema version written into portable design files. */
 export const DESIGN_SCHEMA_VERSION = 3;
@@ -121,6 +124,12 @@ export interface LayerCommon {
   locked: boolean;
   /** Id of the material slot used for preview + multi-part export colors. */
   materialSlotId: string;
+  /**
+   * Regions of this layer's body painted with a material other than the
+   * layer's own. See lib/geometry/painting.ts — the regions are separated
+   * into their own printable parts at export.
+   */
+  facePaint?: FacePaint[];
   transform: Transform3D;
   /** Preview-only opacity (1 = opaque). Never affects exported geometry. */
   previewOpacity: number;
@@ -234,6 +243,31 @@ export interface MeshProvenance {
   descriptionHe?: string;
   /** Ids of the source layers for derived results. */
   sourceLayerIds?: string[];
+}
+
+/**
+ * Per-face material assignment.
+ *
+ * Material was a per-LAYER property, so a two-colour print meant splitting
+ * the body into two layers by hand. Painting regions records the material per
+ * triangle instead, and the export pipeline separates the painted regions
+ * into their own parts.
+ */
+export interface FacePaint {
+  materialSlotId: string;
+  /** Triangle indices into the layer's BUILT body (localMesh order). */
+  triangles: number[];
+  /**
+   * Triangle count of the body the region was picked on. Indices only mean
+   * anything for that mesh, so paint recorded against a different one is
+   * discarded rather than applied to unrelated faces.
+   */
+  meshTriangleCount: number;
+  /**
+   * How deep the painted region reaches into the body when it is separated
+   * for a multi-material print (mm).
+   */
+  depthMm: number;
 }
 
 export interface ImportedMeshLayer extends LayerCommon {
@@ -402,6 +436,18 @@ export interface DesignDocument {
    * document into a product family.
    */
   parameters?: ParameterDefinition[];
+  /**
+   * Measured printer behaviour: one calibrated clearance plus the hole and
+   * first-layer corrections. Every fit in the document derives from this, so
+   * calibrating once fixes connectors, inlays, enclosures and threads
+   * together.
+   */
+  calibration?: CalibrationSettings;
+  /**
+   * User-defined printers, stored in the document so a design carries the
+   * machine it was made for. Looked up before the built-in profiles.
+   */
+  customPrinters?: PrinterProfile[];
 }
 
 /** User-editable overrides on top of a printability profile. */

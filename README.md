@@ -1,10 +1,11 @@
-# PrintCraft STL Studio — V4
+# PrintCraft STL Studio — V5
 
 A browser-only studio for designing genuinely 3D-printable models — text,
 SVG artwork, image silhouettes/reliefs and imported STL files — with a
 Hebrew, right-to-left UI. V3 added a layer-based 3D editor and print
-preparation tools; V4 adds real modelling — creating geometry from nothing,
-reshaping it, and repairing broken meshes.
+preparation tools; V4 added real modelling — creating geometry from nothing,
+reshaping it, and repairing broken meshes. V5 connects that engine to the
+user, puts a regression net under it, and makes the output actually print.
 
 Everything runs locally in the browser. There is **no AI, no server-side
 generation, no accounts and no persistence**: the active design exists only
@@ -24,6 +25,72 @@ npm run typecheck  # tsc --noEmit
 ```
 
 Open http://localhost:3000. A sample name-plate design is preloaded.
+
+## V5 features
+
+V5 came out of a three-expert review (senior frontend, 3D printing, design
+engineering) whose governing finding was that the geometry engine had run
+well ahead of the product: roughly a third of what existed could not be
+reached by a user, and one subsystem — the geometry worker — had been built
+but never called. The work is grouped in three waves; `docs/V5-PLAN.md` is
+the plan they were executed against.
+
+### Wave A — make what exists reachable
+
+- **Primitive and sketch properties**: a created cube could not be resized,
+  because nothing rendered its parameters. `PrimitiveProps` maps each kind to
+  the parameters it actually reads, so the panel never offers a field the
+  shape ignores.
+- **The geometry worker is now called.** Fillet, shell, lattice, voxel
+  remesh, repair and remesh run off the main thread with live progress and a
+  cancel button. Where a worker cannot be created the operation still runs
+  in-process and the overlay says so rather than pretending.
+- **Sub-object editing UI**: face picking in the viewport with grow modes
+  (single triangle / whole face / similar normal / whole body), push-pull,
+  local smoothing, region delete and region split.
+- **Error boundary**: a throw in the canvas or a panel shows a recovery card
+  with an emergency design download, not a blank page.
+- **Hierarchy, pivot and revolve**: re-parent from the layer list, edit the
+  pivot a layer rotates and scales around, revolve a sketch or SVG profile.
+- **Curved emboss dialog**: wrap or project a text/SVG layer onto a body.
+
+### Wave B — keep it from breaking
+
+- **UI regression suite** (Playwright, `e2e/`): sixteen journeys driven in a
+  real browser. Each asserts a consequence in the geometry pipeline, not a
+  DOM state — that is the failure mode unit tests structurally cannot see.
+- **Editor decomposition**: import and analysis handling moved into
+  `hooks/useImportHandlers.ts` and `hooks/useAnalysisRunner.ts`.
+- **Accessibility**: labelled number fields, radio-group semantics on toggle
+  groups, headed sections, and a real focus trap in modals.
+- **Binding validation**: an expression bound to a field that does not exist
+  is reported instead of silently ignored.
+
+### Wave C — make prints succeed
+
+- **Printer calibration**: print the tolerance coupon once, measure which
+  hole fits, enter the number. Every fit in the document derives from it —
+  sliding, close and press fits, holes, inlays, connectors, enclosures and
+  threads — instead of each guessing separately.
+- **Hole compensation and elephant-foot compensation**: a printed hole comes
+  out undersized and a first layer squashes outward; both are corrected in
+  the model so the printed part measures what was designed.
+- **Support generation**: conical pillars under overhangs, wide at the base
+  and narrow at the tip so they snap off.
+- **Bridging analysis**: unsupported horizontal spans are found and reported
+  across their SHORT direction — that is the distance the printer actually
+  has to bridge.
+- **Custom printers**: define your own machine; it travels inside the design
+  file, so a design carries the printer it was made for.
+- **Per-face material painting**: paint regions of a body with a material
+  slot. The paint is metadata — the body stays one editable object — and at
+  export each painted region is separated into its own watertight part, so a
+  two-colour print is actually producible. The pieces reassemble exactly into
+  the original: nothing is lost or double-counted.
+- **Lattice vs nozzle check**: struts thinner than two nozzle widths are
+  refused with a reason.
+- **Thread chamfer and fit class**: a lead-in chamfer so a nut starts, and
+  6H/6g/loose classes driving the clearance.
 
 ## V4 features
 
@@ -217,22 +284,21 @@ interfaces so it can be swapped without touching the pipeline.
 
 - Niqqud / combining marks and full bidi nesting are not supported in text
   layout; kerning uses the `kern` table only.
-- Geometry runs on the main thread (no Web Workers yet): very heavy
-  operations (hollow on complex meshes) show a busy indicator and may pause
-  the UI briefly; complexity caps refuse pathological inputs with a clear
+- Heavy geometry runs in a Web Worker with progress and cancel. Where the
+  worker cannot start, the operation falls back to the main thread and the
+  overlay says so; complexity caps refuse pathological inputs with a clear
   Hebrew message.
 - Hollow/thicken simplify very dense meshes before the Minkowski step, so
   the effective wall thickness may deviate slightly on complex models (a
   warning says so).
 - Orientation/support analysis is a transparent heuristic, not slicer
   output, and the UI says so everywhere it appears.
-- No 3MF export (no tested implementation existed); dovetail connectors
-  assemble by sliding sideways (the UI explains this).
+- Dovetail connectors assemble by sliding sideways (the UI explains this).
 
-### Remaining V4 caveats
+### Remaining caveats
 
-All thirty planned features are implemented. Two carry honest limits worth
-repeating:
+All thirty V4 features and all three V5 waves are implemented. Four carry
+honest limits worth repeating:
 
 - **Fillet remains global, not per-edge.** Sub-object selection now exists,
   but Manifold still has no edge-select fillet operator, so rounding is
@@ -242,3 +308,10 @@ repeating:
   covers unary operations on one body. Multi-body operations produce a
   different SET of layers rather than a different shape for one layer, so
   they are not expressible as a modifier.
+- **Face paint is index-based.** Painted regions are recorded as triangle
+  indices into the layer's built body, fingerprinted by that body's triangle
+  count. Editing the layer into a different shape therefore discards its
+  paint — with a message — rather than colouring unrelated faces.
+- **`Editor.tsx` is still large** (2,677 lines). Wave B moved import and
+  analysis handling out, but the operation handlers share a dense web of
+  state that would need lifting into the store before they can follow.

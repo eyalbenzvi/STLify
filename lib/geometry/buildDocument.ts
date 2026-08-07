@@ -40,6 +40,7 @@ import {
 } from "./meshData";
 import { matrix4ToManifoldMat4, transformToMatrix4 } from "./transform";
 import { resolveParameters, resolveBinding } from "./expression";
+import { clearanceForFit, elephantFootInsetAtHeight } from "./calibration";
 import { applyModifiers } from "./modifiers";
 import {
   buildHoleCutter,
@@ -182,6 +183,11 @@ export function effectiveCombineMode(
 
 /** Printing clearance used for inlay pockets, mm. */
 function inlayClearanceMm(document: DesignDocument): number {
+  // A calibrated machine overrides the profile's guess: the whole point of
+  // measuring is that the measurement wins.
+  if (document.calibration) {
+    return clearanceForFit(document.calibration, "sliding");
+  }
   return (
     document.customPrintability?.clearanceMm ??
     getPrintabilityProfile(document.printabilityProfileId).clearanceMm
@@ -231,9 +237,56 @@ function resolveLayer<T extends ShapeLayer>(layer: T, parameters: ReadonlyMap<st
 
 interface PartBody {
   primary: ShapeLayer;
-  solid: Solid; // in the primary layer's local frame
+  /** In the primary layer's local frame. Reassigned by post-processing. */
+  solid: Solid;
   layerIds: string[];
   nameHe: string;
+}
+
+/**
+ * Shrink the first layers of a part inward.
+ *
+ * "Elephant foot" is the bulge left when the nozzle squashes the opening
+ * layers against the bed: the part comes out oversized at its base and will
+ * not seat flush in a pocket or against a mating face. Insetting those layers
+ * in the MODEL cancels it, and doing it here — after the part is finished —
+ * means it applies to every part however it was built.
+ *
+ * The vertices move inward along the XY direction away from the part's own
+ * centre, fading to nothing at the compensation height, so no ledge is left
+ * where the correction stops.
+ */
+function applyElephantFoot(
+  kernel: GeometryKernel,
+  solid: Solid,
+  document: DesignDocument,
+  worldMatrix: THREE.Matrix4
+): Solid {
+  const calibration = document.calibration;
+  if (!calibration || calibration.elephantFootCompensationMm <= 0) return solid;
+
+  // The correction is defined against the BUILD PLATE, so the part's height
+  // above it has to be measured in world space.
+  const worldZOffset = new THREE.Vector3().setFromMatrixPosition(worldMatrix).z;
+  const bounds = solid.boundingBox();
+  const centreX = (bounds.min.x + bounds.max.x) / 2;
+  const centreY = (bounds.min.y + bounds.max.y) / 2;
+
+  // Vertices must exist near the bed for the inset to have anything to move.
+  const height = Math.max(0.05, calibration.elephantFootHeightMm);
+  const refined = solid.refineToLength(height / 2);
+
+  return refined.warp((p) => {
+    const inset = elephantFootInsetAtHeight(calibration, p.z + worldZOffset);
+    if (inset <= 0) return p;
+    const dx = p.x - centreX;
+    const dy = p.y - centreY;
+    const distance = Math.hypot(dx, dy);
+    if (distance < 1e-6) return p;
+    const scale = Math.max(0, (distance - inset) / distance);
+    return { x: centreX + dx * scale, y: centreY + dy * scale, z: p.z };
+  });
+  void kernel;
 }
 
 function bodyToPart(document: DesignDocument, body: PartBody): PrintablePart {
@@ -449,6 +502,25 @@ export async function buildDocument(
 
   const parts: PrintablePart[] = [];
   for (const body of bodies) {
+    // First-layer compensation is applied to the finished body, so it covers
+    // every part regardless of how it was built.
+    if (document.calibration && document.calibration.elephantFootCompensationMm > 0) {
+      try {
+        body.solid = applyElephantFoot(
+          kernel,
+          body.solid,
+          document,
+          layerWorldMatrix(document, body.primary)
+        );
+      } catch {
+        issues.push({
+          code: "calibration/elephant-foot-failed",
+          severity: "warning",
+          titleHe: `פיצוי ״רגל פיל״ נכשל בחלק "${body.nameHe}"`,
+          detailHe: "החלק נבנה ללא הפיצוי. נסו ערך פיצוי קטן יותר.",
+        });
+      }
+    }
     const part = bodyToPart(document, body);
     body.solid.dispose();
     if (part.stats.triangleCount > 0) {
@@ -505,7 +577,7 @@ function applyHoles(
     for (const body of bodies) {
       const bodyWorldInv = layerWorldMatrix(document, body.primary).invert();
       const local = bodyWorldInv.multiply(holeWorld);
-      const cutter = buildHoleCutter(kernel, hole, span * 3).transform(
+      const cutter = buildHoleCutter(kernel, hole, span * 3, document.calibration).transform(
         matrix4ToManifoldMat4(local)
       );
       body.solid = body.solid.subtract(cutter);

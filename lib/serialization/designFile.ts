@@ -13,8 +13,10 @@
 
 import type {
   BaseMode,
+  CalibrationSettings,
   DesignDocument,
   DesignLayer,
+  FacePaint,
   MaterialSlot,
   PortableDesignFile,
   PortableMesh,
@@ -29,6 +31,7 @@ import {
   identityTransform,
   newId,
 } from "@/types/design";
+import type { PrinterProfile } from "@/types/profiles";
 import type { Modifier, ModifierKind } from "@/lib/geometry/modifiers";
 import { defaultModifier } from "@/lib/geometry/modifiers";
 import type { ParameterDefinition } from "@/lib/geometry/expression";
@@ -400,6 +403,7 @@ function sanitizeLayer(
     materialSlotId: boundedString(raw.materialSlotId, "slot1", 40),
     transform: sanitizeTransform(raw.transform),
     previewOpacity: Math.max(0.05, Math.min(finiteNumber(raw.previewOpacity, 1), 1)),
+    facePaint: sanitizeFacePaint(raw.facePaint),
   };
   const combine = COMBINE_MODES.has(String(raw.combine))
     ? (String(raw.combine) as "raised" | "engraved" | "inlay" | "standalone")
@@ -548,6 +552,91 @@ function sanitizeLayer(
     default:
       return null;
   }
+}
+
+/**
+ * Painted regions.
+ *
+ * Every entry carries the triangle count of the body it was painted on, so a
+ * file whose geometry no longer matches simply loses the paint at build time
+ * rather than colouring random faces. Malformed indices are dropped here;
+ * indices that merely point past the body are handled later, by the same
+ * fingerprint check.
+ */
+function sanitizeFacePaint(value: unknown): FacePaint[] | undefined {
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  const out: FacePaint[] = [];
+  for (const raw of value.slice(0, 16)) {
+    if (!isRecord(raw) || !Array.isArray(raw.triangles)) continue;
+    const meshTriangleCount = Math.max(
+      0,
+      Math.round(finiteNumber(raw.meshTriangleCount, 0))
+    );
+    if (meshTriangleCount === 0) continue;
+    const triangles: number[] = [];
+    const seen = new Set<number>();
+    for (const entry of raw.triangles) {
+      const index = typeof entry === "number" ? Math.round(entry) : NaN;
+      if (!Number.isFinite(index) || index < 0 || index >= meshTriangleCount) continue;
+      if (seen.has(index)) continue;
+      seen.add(index);
+      triangles.push(index);
+    }
+    if (triangles.length === 0) continue;
+    out.push({
+      materialSlotId: boundedString(raw.materialSlotId, "slot1", 40),
+      triangles: triangles.sort((a, b) => a - b),
+      meshTriangleCount,
+      depthMm: Math.max(0.05, Math.min(finiteNumber(raw.depthMm, 0.8), 100)),
+    });
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+/** Measured printer behaviour. Absent means "not calibrated", not "zero". */
+function sanitizeCalibration(value: unknown): CalibrationSettings | undefined {
+  if (!isRecord(value)) return undefined;
+  return {
+    measuredClearanceMm: Math.max(0, Math.min(finiteNumber(value.measuredClearanceMm, 0.2), 5)),
+    holeCompensationMm: Math.max(0, Math.min(finiteNumber(value.holeCompensationMm, 0), 5)),
+    elephantFootCompensationMm: Math.max(
+      0,
+      Math.min(finiteNumber(value.elephantFootCompensationMm, 0), 5)
+    ),
+    elephantFootHeightMm: Math.max(
+      0.05,
+      Math.min(finiteNumber(value.elephantFootHeightMm, 0.6), 20)
+    ),
+  };
+}
+
+/**
+ * User-defined printers. They travel inside the design so a file opened on
+ * another machine still checks against the machine it was made for.
+ */
+function sanitizeCustomPrinters(value: unknown): PrinterProfile[] | undefined {
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  const out: PrinterProfile[] = [];
+  for (const raw of value.slice(0, 20)) {
+    if (!isRecord(raw)) continue;
+    const volume = isRecord(raw.buildVolumeMm) ? raw.buildVolumeMm : {};
+    out.push({
+      id: boundedString(raw.id, `custom_${out.length + 1}`, 60),
+      nameHe: boundedString(raw.nameHe, `מדפסת ${out.length + 1}`, 80),
+      technology: raw.technology === "sla" ? "sla" : "fdm",
+      buildVolumeMm: {
+        x: Math.max(1, Math.min(finiteNumber(volume.x, 220), 5000)),
+        y: Math.max(1, Math.min(finiteNumber(volume.y, 220), 5000)),
+        z: Math.max(1, Math.min(finiteNumber(volume.z, 250), 5000)),
+      },
+      nozzleDiameterMm: Math.max(0.05, Math.min(finiteNumber(raw.nozzleDiameterMm, 0.4), 5)),
+      defaultLayerHeightMm: Math.max(
+        0.01,
+        Math.min(finiteNumber(raw.defaultLayerHeightMm, 0.2), 2)
+      ),
+    });
+  }
+  return out.length > 0 ? out : undefined;
 }
 
 function sanitizeMaterialSlots(value: unknown): MaterialSlot[] {
@@ -733,6 +822,8 @@ export function importDesignFile(jsonText: string): DesignFileImportResult {
         ? boundedString(rawDoc.templateId, "", 60) || null
         : null,
     parameters: sanitizeParameters(rawDoc.parameters, warningsHe),
+    calibration: sanitizeCalibration(rawDoc.calibration),
+    customPrinters: sanitizeCustomPrinters(rawDoc.customPrinters),
   };
 
   if (document.layers.length === 0) {

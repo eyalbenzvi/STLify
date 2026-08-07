@@ -178,3 +178,74 @@ describe("design file validation", () => {
     expect(warningsHe.some((w) => w.includes("רשת"))).toBe(true);
   });
 });
+
+describe("wave C fields survive a round-trip", () => {
+  it("keeps calibration, custom printers and face paint", () => {
+    const doc = emptyDocument();
+    doc.layers = [makeTextLayer({ content: "צבע", combine: "standalone" })];
+    doc.layers[0].facePaint = [
+      { materialSlotId: "slot2", triangles: [4, 2, 2, 0], meshTriangleCount: 12, depthMm: 1.2 },
+    ];
+    doc.calibration = {
+      measuredClearanceMm: 0.35,
+      holeCompensationMm: 0.2,
+      elephantFootCompensationMm: 0.15,
+      elephantFootHeightMm: 0.8,
+    };
+    doc.customPrinters = [
+      {
+        id: "custom_1",
+        nameHe: "המדפסת שלי",
+        technology: "fdm",
+        buildVolumeMm: { x: 256, y: 256, z: 256 },
+        nozzleDiameterMm: 0.6,
+        defaultLayerHeightMm: 0.28,
+      },
+    ];
+
+    const { document } = importDesignFile(serializeDesignFile(doc));
+    expect(document.calibration?.measuredClearanceMm).toBeCloseTo(0.35, 6);
+    expect(document.calibration?.elephantFootCompensationMm).toBeCloseTo(0.15, 6);
+    expect(document.customPrinters?.[0].buildVolumeMm.x).toBe(256);
+    expect(document.customPrinters?.[0].nozzleDiameterMm).toBeCloseTo(0.6, 6);
+    const paint = document.layers[0].facePaint;
+    expect(paint).toHaveLength(1);
+    // Duplicates collapse and the list comes back sorted, so the export split
+    // never carves the same triangle twice.
+    expect(paint?.[0].triangles).toEqual([0, 2, 4]);
+    expect(paint?.[0].depthMm).toBeCloseTo(1.2, 6);
+  });
+
+  it("rejects paint indices that cannot belong to the recorded body", () => {
+    const doc = emptyDocument();
+    doc.layers = [makeTextLayer({ content: "צבע", combine: "standalone" })];
+    doc.layers[0].facePaint = [
+      { materialSlotId: "slot2", triangles: [0, 99, -3], meshTriangleCount: 12, depthMm: 0.8 },
+    ];
+    const { document } = importDesignFile(serializeDesignFile(doc));
+    expect(document.layers[0].facePaint?.[0].triangles).toEqual([0]);
+  });
+
+  it("drops paint with no body fingerprint rather than guessing one", () => {
+    const json = JSON.stringify({
+      format: "formadesign",
+      schemaVersion: 3,
+      document: {
+        baseMode: "baseless",
+        layers: [
+          {
+            type: "text",
+            name: "טקסט",
+            content: "א",
+            combine: "standalone",
+            facePaint: [{ materialSlotId: "slot2", triangles: [0, 1, 2] }],
+          },
+        ],
+        materialSlots: [],
+      },
+      meshes: [],
+    });
+    const { document } = importDesignFile(json);
+    expect(document.layers[0].facePaint).toBeUndefined();
+  });
+});

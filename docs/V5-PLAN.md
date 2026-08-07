@@ -44,3 +44,27 @@ workflow genuinely lacks one (Wave C).
 Every item ships with tests that assert a measurable consequence — geometry
 against analytic values, or a real browser journey. `npm test`, `npm run lint`,
 `npm run typecheck` and `npm run build` must all pass at the end of each wave.
+
+## Outcome
+
+All three waves are implemented. Two notes where the result differs from the
+plan, recorded rather than quietly dropped:
+
+- **B1 fell short of its target.** `Editor.tsx` reached 2,458 lines at the
+  end of Wave B (from 2,839) and finished at 2,677 once Wave C added
+  calibration, supports, bridging and painting to it — nowhere near "well
+  under 1200". Import and analysis handling moved out cleanly; the operation
+  handlers share a dense web of state that would have to be lifted into the
+  store before they can follow, which is a larger change than this wave
+  allowed for. The file is still growing, so this is the first thing to fix
+  next.
+- **C4 splits at export, not at build.** The plan named `buildDocument.ts`,
+  which would have made every rebuild carve the painted regions out of the
+  body. That is wasted work while modelling and — worse — it changes the
+  triangle indices the paint is recorded against, so the paint would
+  invalidate itself on the very next rebuild. The split therefore runs in the
+  export path, and the viewport shows the paint as a coloured overlay.
+
+Verification at the end of Wave C: 403 unit tests, 16 Playwright journeys,
+`eslint` clean (9 pre-existing hook-dependency warnings), `tsc --noEmit`
+clean, `next build` clean.

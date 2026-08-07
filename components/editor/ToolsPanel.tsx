@@ -56,6 +56,8 @@ export interface ToolsPanelProps {
   onArrangePlate: () => void;
   onRevolve: () => void;
   onEmboss: () => void;
+  onGenerateSupports: () => void;
+  onCheckBridging: () => void;
   /** True when the selection is a profile that can be revolved. */
   canRevolve: boolean;
   /** Number of printable parts currently in the document. */
@@ -365,6 +367,25 @@ export function ToolsPanel(props: ToolsPanelProps) {
             title="פורס את כל החלקים על משטח ההדפסה ללא חפיפה"
             disabled={partCount < 2 || busy}
             onClick={props.onArrangePlate}
+          />
+        </div>
+      </div>
+
+      {/* Print preparation */}
+      <div>
+        <p className="mb-1.5 text-xs font-bold text-slate-500">הכנה להדפסה</p>
+        <div className="flex flex-wrap gap-1">
+          <ToolButton
+            label="צור תמיכות"
+            title="עמודים חרוטיים מתחת למשטחים תלויים — בסיס רחב, קצה דק להסרה קלה"
+            disabled={partCount === 0 || busy}
+            onClick={props.onGenerateSupports}
+          />
+          <ToolButton
+            label="בדיקת גישורים"
+            title="מאתר מקטעים אופקיים ללא תמיכה מתחתם"
+            disabled={partCount === 0 || busy}
+            onClick={props.onCheckBridging}
           />
         </div>
       </div>
