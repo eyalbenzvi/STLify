@@ -11,7 +11,7 @@
  */
 
 import type { MeshData } from "../meshData";
-import { signedVolume } from "./topology";
+import { signedMeshVolume } from "../meshData";
 
 export interface MeshComponent {
   mesh: MeshData;
@@ -95,7 +95,7 @@ export function splitComponents(mesh: MeshData): MeshComponent[] {
     }
     components.push({
       mesh: component,
-      volumeMm3: Math.abs(signedVolume(component)),
+      volumeMm3: Math.abs(signedMeshVolume(component)),
       bounds: {
         min: { x: minX, y: minY, z: minZ },
         max: { x: maxX, y: maxY, z: maxZ },

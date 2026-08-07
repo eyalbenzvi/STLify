@@ -43,9 +43,6 @@ export interface Transform3D {
   scaleZ: number;
 }
 
-/** Gizmo/numeric-entry coordinate space. World = build-plate axes. */
-export type TransformSpace = "world" | "local";
-
 export function identityTransform(): Transform3D {
   return {
     x: 0,
@@ -504,14 +501,6 @@ export interface CutPlaneDefinition {
   rotationY: number;
 }
 
-export interface SplitOperation {
-  layerId: string;
-  plane: CutPlaneDefinition;
-  keep: "top" | "bottom" | "both";
-  /** Caps are inherent to manifold cutting; false trims without closing. */
-  cap: boolean;
-}
-
 export type ConnectorType = "pin" | "key" | "dovetail" | "magnetPocket";
 
 export interface ConnectorDefinition {
@@ -582,18 +571,6 @@ export interface Measurement {
   valueMm: number;
 }
 
-/** How many points the user must pick for each measurement kind. */
-export function measurementPointCount(kind: MeasurementKind): number {
-  if (kind === "thickness") return 1;
-  if (kind === "radius") return 3;
-  return 2;
-}
-
-/** Unit suffix shown next to a measurement's value. */
-export function measurementUnit(kind: MeasurementKind): string {
-  return kind === "angle" ? "°" : "מ״מ";
-}
-
 // ---------------------------------------------------------------------------
 // Validation / analysis results
 // ---------------------------------------------------------------------------
@@ -609,24 +586,6 @@ export interface ModelIssue {
   actionHe?: string;
   /** World-space location to highlight, when known. */
   location?: { x: number; y: number; z: number };
-}
-
-export interface ModelValidationResult {
-  ok: boolean;
-  watertight: boolean;
-  issues: ModelIssue[];
-  triangleCount: number;
-  volumeMm3: number;
-  surfaceAreaMm2: number;
-  dimensionsMm: { x: number; y: number; z: number };
-}
-
-export interface RepairResult {
-  attempted: boolean;
-  succeeded: boolean;
-  messageHe: string;
-  /** Mesh-store id of the repaired mesh when succeeded. */
-  meshId: string | null;
 }
 
 // ---------------------------------------------------------------------------

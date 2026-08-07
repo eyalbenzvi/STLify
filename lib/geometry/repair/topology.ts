@@ -12,7 +12,7 @@
  * and every edge would look like a boundary edge otherwise.
  */
 
-import type { MeshData } from "../meshData";
+import { signedMeshVolume, triangleArea, type MeshData } from "../meshData";
 
 /** A directed edge encoded as a single number for Map keys. */
 type EdgeKey = number;
@@ -66,42 +66,6 @@ export interface TopologyReport {
   signedVolumeMm3: number;
   /** True when the mesh is closed, manifold and consistently wound. */
   isManifold: boolean;
-}
-
-function triangleArea(
-  p: Float32Array,
-  ia: number,
-  ib: number,
-  ic: number
-): number {
-  const a = ia * 3;
-  const b = ib * 3;
-  const c = ic * 3;
-  const ux = p[b] - p[a];
-  const uy = p[b + 1] - p[a + 1];
-  const uz = p[b + 2] - p[a + 2];
-  const vx = p[c] - p[a];
-  const vy = p[c + 1] - p[a + 1];
-  const vz = p[c + 2] - p[a + 2];
-  return Math.hypot(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx) / 2;
-}
-
-/** Signed volume of the closed surface (positive = outward-facing normals). */
-export function signedVolume(mesh: MeshData): number {
-  const p = mesh.positions;
-  const idx = mesh.indices;
-  let volume = 0;
-  for (let i = 0; i < idx.length; i += 3) {
-    const a = idx[i] * 3;
-    const b = idx[i + 1] * 3;
-    const c = idx[i + 2] * 3;
-    volume +=
-      (p[a] * (p[b + 1] * p[c + 2] - p[b + 2] * p[c + 1]) +
-        p[a + 1] * (p[b + 2] * p[c] - p[b] * p[c + 2]) +
-        p[a + 2] * (p[b] * p[c + 1] - p[b + 1] * p[c])) /
-      6;
-  }
-  return volume;
 }
 
 /**
@@ -256,7 +220,7 @@ export function analyzeTopology(mesh: MeshData): TopologyReport {
 
   const boundaryLoops = traceBoundaryLoops(boundaryEdges, mesh.positions);
   const componentCount = countComponents(mesh);
-  const volume = signedVolume(mesh);
+  const volume = signedMeshVolume(mesh);
 
   return {
     vertexCount,

@@ -9,8 +9,8 @@
 
 import { describe, expect, it } from "vitest";
 import { getGeometryKernel } from "../../kernel";
-import type { MeshData } from "../../meshData";
-import { analyzeTopology, signedVolume } from "../../repair/topology";
+import { signedMeshVolume, type MeshData } from "../../meshData";
+import { analyzeTopology } from "../../repair/topology";
 import {
   buildAdjacency,
   growSelection,
@@ -320,7 +320,7 @@ describe("delete region", () => {
     const report = analyzeTopology(result.mesh);
     expect(report.boundaryEdgeCount).toBe(0);
     // The cap sits back in the same plane, so the cube is restored.
-    expect(Math.abs(signedVolume(result.mesh))).toBeCloseTo(8000, 1);
+    expect(Math.abs(signedMeshVolume(result.mesh))).toBeCloseTo(8000, 1);
   });
 
   it("leaves the hole open when capping is off", () => {
@@ -352,8 +352,8 @@ describe("split by region", () => {
     expect(analyzeTopology(regionMesh).boundaryEdgeCount).toBe(0);
     expect(analyzeTopology(remainderMesh).boundaryEdgeCount).toBe(0);
     // The patch is flat, so it encloses no volume; the remainder keeps it all.
-    expect(Math.abs(signedVolume(regionMesh))).toBeLessThan(1);
-    expect(Math.abs(signedVolume(remainderMesh))).toBeCloseTo(8000, 1);
+    expect(Math.abs(signedMeshVolume(regionMesh))).toBeLessThan(1);
+    expect(Math.abs(signedMeshVolume(remainderMesh))).toBeCloseTo(8000, 1);
     // Each half carries only its own vertices.
     expect(regionMesh.positions.length / 3).toBeLessThan(mesh.positions.length / 3);
   });
@@ -370,9 +370,9 @@ describe("split by region", () => {
     expect(analyzeTopology(regionMesh).boundaryEdgeCount).toBe(0);
     expect(analyzeTopology(remainderMesh).boundaryEdgeCount).toBe(0);
     // A curved cap DOES enclose volume once sealed with a flat patch.
-    expect(Math.abs(signedVolume(regionMesh))).toBeGreaterThan(0);
+    expect(Math.abs(signedMeshVolume(regionMesh))).toBeGreaterThan(0);
     const total =
-      Math.abs(signedVolume(regionMesh)) + Math.abs(signedVolume(remainderMesh));
+      Math.abs(signedMeshVolume(regionMesh)) + Math.abs(signedMeshVolume(remainderMesh));
     const original = (4 / 3) * Math.PI * 1000;
     expect(total).toBeGreaterThan(original * 0.9);
     expect(total).toBeLessThan(original * 1.1);

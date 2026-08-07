@@ -112,7 +112,7 @@ import {
   buildToleranceTest,
   GeneratorError,
 } from "@/lib/geometry/generators";
-import { downloadBlob } from "@/lib/export/stl";
+import { downloadBlob } from "@/lib/export/download";
 import { meshDataToBinaryStl } from "@/lib/export/stlData";
 import type { PrintablePart } from "@/lib/geometry/buildDocument";
 import { buildMultiPartZip } from "@/lib/export/package";

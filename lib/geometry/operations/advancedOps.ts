@@ -26,7 +26,6 @@ import {
   type TaperSettings,
   type TwistSettings,
 } from "./deform";
-import { roundEdges, shellSolid, type FilletSettings, type ShellSettings } from "./fillet";
 import {
   applyEmbossToTarget,
   projectContoursOntoSurface,
@@ -34,7 +33,6 @@ import {
   type EmbossMode,
 } from "./emboss";
 import { layerContours } from "../solids";
-import { latticeFill, type LatticeSettings } from "./lattice";
 import {
   assertValidResult,
   materializeWorldSolid,
@@ -57,57 +55,6 @@ async function sourceSolid(document: DesignDocument, layer: ShapeLayer) {
     throw new OpError(`לשכבה "${layer.name}" אין גוף לעבד`);
   }
   return { kernel, solid };
-}
-
-/** Fillet or chamfer every edge of the chosen kind. */
-export async function applyFillet(
-  document: DesignDocument,
-  layer: ShapeLayer,
-  settings: FilletSettings
-): Promise<AdvancedOpOutcome> {
-  const { kernel, solid } = await sourceSolid(document, layer);
-  const outcome = roundEdges(kernel, solid, settings);
-  assertValidResult(outcome.solid, "עיגול קצוות");
-  const styleHe = settings.style === "fillet" ? "עיגול" : "שיפוע";
-  return {
-    layer: solidToResultLayer(outcome.solid, {
-      nameHe: `${layer.name} — ${styleHe} ${settings.sizeMm} מ״מ`,
-      provenance: {
-        kind: "smoothResult",
-        descriptionHe: `${styleHe} קצוות ברדיוס ${settings.sizeMm} מ״מ`,
-        sourceLayerIds: [layer.id],
-      },
-      materialSlotId: layer.materialSlotId,
-    }),
-    warningsHe: outcome.warningsHe,
-    volumeBeforeMm3: outcome.volumeBeforeMm3,
-    volumeAfterMm3: outcome.volumeAfterMm3,
-  };
-}
-
-/** Hollow with an optional opening in one face. */
-export async function applyShell(
-  document: DesignDocument,
-  layer: ShapeLayer,
-  settings: ShellSettings
-): Promise<AdvancedOpOutcome> {
-  const { kernel, solid } = await sourceSolid(document, layer);
-  const outcome = shellSolid(kernel, solid, settings);
-  assertValidResult(outcome.solid, "חילול עם פתח");
-  return {
-    layer: solidToResultLayer(outcome.solid, {
-      nameHe: `${layer.name} — קליפה ${settings.wallThicknessMm} מ״מ`,
-      provenance: {
-        kind: "hollowResult",
-        descriptionHe: `קליפה בעובי ${settings.wallThicknessMm} מ״מ`,
-        sourceLayerIds: [layer.id],
-      },
-      materialSlotId: layer.materialSlotId,
-    }),
-    warningsHe: outcome.warningsHe,
-    volumeBeforeMm3: outcome.volumeBeforeMm3,
-    volumeAfterMm3: outcome.volumeAfterMm3,
-  };
 }
 
 export type DeformKind = "twist" | "taper" | "bend" | "stretch" | "ffd";
@@ -216,38 +163,6 @@ export function generatorToLayer(
     provenance: { kind, descriptionHe },
     materialSlotId,
   });
-}
-
-/** Fill a body's interior with a lattice. */
-export async function applyLattice(
-  document: DesignDocument,
-  layer: ShapeLayer,
-  settings: LatticeSettings
-): Promise<AdvancedOpOutcome & { savedFraction: number }> {
-  const { kernel, solid } = await sourceSolid(document, layer);
-  const outcome = latticeFill(kernel, solid, settings);
-  assertValidResult(outcome.solid, "מילוי סריג");
-  const kindHe =
-    settings.kind === "gyroid"
-      ? "ג׳ירואיד"
-      : settings.kind === "schwarzP"
-        ? "שוורץ־P"
-        : "חלת דבש";
-  return {
-    layer: solidToResultLayer(outcome.solid, {
-      nameHe: `${layer.name} — סריג ${kindHe}`,
-      provenance: {
-        kind: "hollowResult",
-        descriptionHe: `מילוי סריג ${kindHe}, תא ${settings.cellSizeMm} מ״מ`,
-        sourceLayerIds: [layer.id],
-      },
-      materialSlotId: layer.materialSlotId,
-    }),
-    warningsHe: outcome.warningsHe,
-    volumeBeforeMm3: outcome.volumeBeforeMm3,
-    volumeAfterMm3: outcome.volumeAfterMm3,
-    savedFraction: outcome.savedFraction,
-  };
 }
 
 // ---------------------------------------------------------------------------

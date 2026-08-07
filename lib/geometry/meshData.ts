@@ -103,8 +103,61 @@ export function transformMeshData(mesh: MeshData, matrix: THREE.Matrix4): MeshDa
   return { positions: out, indices };
 }
 
-/** Exact volume for closed meshes (signed tetrahedron sum, abs). */
-export function meshDataVolume(mesh: MeshData): number {
+// ---------------------------------------------------------------------------
+// Triangle primitives
+//
+// The single home for the per-triangle arithmetic every mesh module needs.
+// All three take VERTEX indices (not the ×3 float offsets) so callers never
+// have to remember which convention a helper wants.
+// ---------------------------------------------------------------------------
+
+/**
+ * Cross product of the triangle's two edge vectors (b−a) × (c−a). Its
+ * direction is the face normal; its length is twice the triangle's area.
+ * Written into `out` so hot loops allocate nothing.
+ */
+export function triangleCross(
+  // ArrayLike, not Float32Array: some callers work in Float64 world space.
+  positions: ArrayLike<number>,
+  ia: number,
+  ib: number,
+  ic: number,
+  out: [number, number, number] = [0, 0, 0]
+): [number, number, number] {
+  const a = ia * 3;
+  const b = ib * 3;
+  const c = ic * 3;
+  const ux = positions[b] - positions[a];
+  const uy = positions[b + 1] - positions[a + 1];
+  const uz = positions[b + 2] - positions[a + 2];
+  const vx = positions[c] - positions[a];
+  const vy = positions[c + 1] - positions[a + 1];
+  const vz = positions[c + 2] - positions[a + 2];
+  out[0] = uy * vz - uz * vy;
+  out[1] = uz * vx - ux * vz;
+  out[2] = ux * vy - uy * vx;
+  return out;
+}
+
+const scratchCross: [number, number, number] = [0, 0, 0];
+
+/** Area of a single triangle, mm². */
+export function triangleArea(
+  positions: ArrayLike<number>,
+  ia: number,
+  ib: number,
+  ic: number
+): number {
+  const [x, y, z] = triangleCross(positions, ia, ib, ic, scratchCross);
+  return Math.hypot(x, y, z) / 2;
+}
+
+/**
+ * Signed volume of the surface: the sum of tetrahedra from the origin.
+ * Exact for closed meshes; the SIGN says which way the surface faces
+ * (positive = outward-facing normals), so an inside-out mesh is detectable.
+ */
+export function signedMeshVolume(mesh: MeshData): number {
   const p = mesh.positions;
   const idx = mesh.indices;
   let volume = 0;
@@ -118,25 +171,20 @@ export function meshDataVolume(mesh: MeshData): number {
         p[a + 2] * (p[b] * p[c + 1] - p[b + 1] * p[c])) /
       6;
   }
-  return Math.abs(volume);
+  return volume;
+}
+
+/** Exact volume for closed meshes, independent of overall orientation. */
+export function meshDataVolume(mesh: MeshData): number {
+  return Math.abs(signedMeshVolume(mesh));
 }
 
 /** Total surface area of the mesh. */
 export function meshDataSurfaceArea(mesh: MeshData): number {
-  const p = mesh.positions;
   const idx = mesh.indices;
   let area = 0;
   for (let i = 0; i < idx.length; i += 3) {
-    const a = idx[i] * 3;
-    const b = idx[i + 1] * 3;
-    const c = idx[i + 2] * 3;
-    const ux = p[b] - p[a],
-      uy = p[b + 1] - p[a + 1],
-      uz = p[b + 2] - p[a + 2];
-    const vx = p[c] - p[a],
-      vy = p[c + 1] - p[a + 1],
-      vz = p[c + 2] - p[a + 2];
-    area += Math.hypot(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx) / 2;
+    area += triangleArea(mesh.positions, idx[i], idx[i + 1], idx[i + 2]);
   }
   return area;
 }

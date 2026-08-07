@@ -7,11 +7,11 @@
 
 import { describe, expect, it } from "vitest";
 import { getGeometryKernel } from "../../kernel";
-import type { MeshData } from "../../meshData";
+import { signedMeshVolume, type MeshData } from "../../meshData";
 import { cleanupComponents, splitComponents } from "../cleanup";
 import { diagnoseMesh, repairMesh } from "../diagnose";
 import { findSelfIntersections, trianglesIntersect } from "../selfIntersection";
-import { analyzeTopology, signedVolume } from "../topology";
+import { analyzeTopology } from "../topology";
 import { voxelRemesh } from "../voxelRemesh";
 
 function cube(s = 10, offset = { x: 0, y: 0, z: 0 }): MeshData {
@@ -146,7 +146,7 @@ describe("repairMesh", () => {
     expect(analyzeTopology(fixed).boundaryEdgeCount).toBe(0);
     expect(report.stages.some((s) => s.stage === "fillHoles" && s.changed)).toBe(true);
     // The repaired cube must still be a 10mm cube.
-    expect(Math.abs(signedVolume(fixed))).toBeCloseTo(1000, 1);
+    expect(Math.abs(signedMeshVolume(fixed))).toBeCloseTo(1000, 1);
   });
 
   it("fixes mixed winding", async () => {
@@ -159,7 +159,7 @@ describe("repairMesh", () => {
     }
     const report = await repairMesh({ positions: mesh.positions, indices });
     expect(report.succeeded).toBe(true);
-    expect(signedVolume(report.mesh as MeshData)).toBeGreaterThan(0);
+    expect(signedMeshVolume(report.mesh as MeshData)).toBeGreaterThan(0);
   });
 
   it("reports honestly when every stage is disabled and repair is impossible", async () => {

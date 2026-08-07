@@ -3,7 +3,7 @@
  * centroids and vertex-connected components — all pure over MeshData.
  */
 
-import type { MeshData } from "../meshData";
+import { triangleCross, type MeshData } from "../meshData";
 
 export interface TriangleAccessors {
   count: number;
@@ -27,18 +27,8 @@ export function triangleAccessors(mesh: MeshData): TriangleAccessors {
     if (p[i] > meshMaxZ) meshMaxZ = p[i];
   }
 
-  const cross = (t: number): [number, number, number] => {
-    const a = idx[t * 3] * 3;
-    const b = idx[t * 3 + 1] * 3;
-    const c = idx[t * 3 + 2] * 3;
-    const ux = p[b] - p[a],
-      uy = p[b + 1] - p[a + 1],
-      uz = p[b + 2] - p[a + 2];
-    const vx = p[c] - p[a],
-      vy = p[c + 1] - p[a + 1],
-      vz = p[c + 2] - p[a + 2];
-    return [uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx];
-  };
+  const cross = (t: number): [number, number, number] =>
+    triangleCross(p, idx[t * 3], idx[t * 3 + 1], idx[t * 3 + 2]);
 
   return {
     count,

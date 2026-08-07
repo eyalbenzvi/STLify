@@ -13,9 +13,9 @@ import {
   removeDegenerateTriangles,
   removeDuplicateTriangles,
   removeUnusedVertices,
-  signedVolume,
   splitNonManifoldVertices,
 } from "../topology";
+import { signedMeshVolume } from "../../meshData";
 import { fillHoles } from "../holeFill";
 
 /** A welded unit cube of side `s` centred on the origin: 8 verts, 12 tris. */
@@ -133,10 +133,10 @@ describe("orientConsistently", () => {
     const inverted = { positions: mesh.positions, indices };
     // Consistently wound, but pointing the wrong way.
     expect(analyzeTopology(inverted).inconsistentEdgeCount).toBe(0);
-    expect(signedVolume(inverted)).toBeCloseTo(-1000, 5);
+    expect(signedMeshVolume(inverted)).toBeCloseTo(-1000, 5);
 
     const { mesh: fixed } = orientConsistently(inverted);
-    expect(signedVolume(fixed)).toBeCloseTo(1000, 5);
+    expect(signedMeshVolume(fixed)).toBeCloseTo(1000, 5);
   });
 
   it("leaves an already-correct mesh untouched", () => {

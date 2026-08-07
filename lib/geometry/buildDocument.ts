@@ -37,6 +37,7 @@ import {
   meshDataSurfaceArea,
   meshDataVolume,
   transformMeshData,
+  triangleCross,
   type MeshData,
 } from "./meshData";
 import { matrix4ToManifoldMat4, transformToMatrix4 } from "./transform";
@@ -416,19 +417,15 @@ function insetSlabWalls(
   // vertex has two nearly-parallel facets and must not be mitered between
   // them, while a box corner has two genuinely different walls and must.
   const walls: number[][] = Array.from({ length: vertexCount }, () => []);
+  const cross: [number, number, number] = [0, 0, 0];
   for (let t = 0; t < triangleCount; t++) {
-    const a = mesh.indices[t * 3] * 3;
-    const b = mesh.indices[t * 3 + 1] * 3;
-    const c = mesh.indices[t * 3 + 2] * 3;
-    const ux = world[b] - world[a];
-    const uy = world[b + 1] - world[a + 1];
-    const uz = world[b + 2] - world[a + 2];
-    const vx = world[c] - world[a];
-    const vy = world[c + 1] - world[a + 1];
-    const vz = world[c + 2] - world[a + 2];
-    const nz = ux * vy - uy * vx;
-    const nx = uy * vz - uz * vy;
-    const ny = uz * vx - ux * vz;
+    const [nx, ny, nz] = triangleCross(
+      world,
+      mesh.indices[t * 3],
+      mesh.indices[t * 3 + 1],
+      mesh.indices[t * 3 + 2],
+      cross
+    );
     const horizontal = Math.hypot(nx, ny);
     const length = Math.hypot(nx, ny, nz);
     if (length < 1e-12) continue;
