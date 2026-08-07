@@ -106,6 +106,98 @@ export interface DocumentBuildResult {
 export interface BuildDocumentOptions {
   onProgress?: (fraction: number, labelHe: string) => void;
   throwIfCancelled?: () => void;
+  /** Filled in when provided: how many layers were rebuilt vs served from cache. */
+  stats?: BuildStats;
+  /** Disable the per-layer solid cache (comparison tests). Default: enabled. */
+  useLayerCache?: boolean;
+}
+
+export interface BuildStats {
+  layersBuilt: number;
+  layersFromCache: number;
+}
+
+// ---------------------------------------------------------------------------
+// Per-layer solid cache (incremental rebuilds)
+// ---------------------------------------------------------------------------
+
+/**
+ * Cache of the DERIVED per-layer solids, keyed by layer id.
+ *
+ * The expensive part of a rebuild is per layer: glyph contouring, extrusion,
+ * kernel loading of imported meshes, and the modifier stack. All of that is
+ * a pure function of the layer's RESOLVED content — not of its transform
+ * (solids are built in the layer's local frame; placement happens at
+ * assembly) and not of the other layers. So a solid can be reused as long
+ * as the content hash matches, and only the layers the edit touched are
+ * rebuilt; assembly (booleans, holes, elephant foot) always reruns because
+ * it genuinely depends on multiple layers.
+ *
+ * Manifold's memory model is what makes the bookkeeping strict: assembly
+ * CONSUMES the solids it is given, so the cache hands out `duplicate()`
+ * handles and never exposes the stored one. (duplicate() is a cheap extra
+ * handle to shared geometry — disposing one side never invalidates the
+ * other.) Invalidated and orphaned entries are disposed explicitly.
+ *
+ * Lives per thread (module state): the worker keeps it across builds, which
+ * is exactly where incremental rebuilds pay off.
+ */
+interface LayerCacheEntry {
+  hash: string;
+  solid: Solid;
+  /** Modifier warnings emitted when the solid was built — re-reported on hits. */
+  issues: ModelIssue[];
+}
+
+const layerSolidCache = new Map<string, LayerCacheEntry>();
+
+/** Dispose and forget every cached layer solid (tests, memory pressure). */
+export function clearLayerSolidCache(): void {
+  for (const entry of layerSolidCache.values()) entry.solid.dispose();
+  layerSolidCache.clear();
+}
+
+/** JSON.stringify with sorted object keys, so hashes are order-stable. */
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "u";
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  const keys = Object.keys(value as Record<string, unknown>).sort();
+  return `{${keys
+    .map((k) => `${JSON.stringify(k)}:${stableStringify((value as Record<string, unknown>)[k])}`)
+    .join(",")}}`;
+}
+
+/**
+ * Content hash of everything the layer's LOCAL solid depends on. The
+ * transform and name are deliberately excluded (they do not change the local
+ * geometry); the resolved layer is used so parameter/binding changes
+ * propagate; nozzle diameter feeds the lattice modifier's safety check.
+ */
+function layerContentHash(
+  resolvedLayer: ShapeLayer,
+  effectiveCombine: EffectiveCombine,
+  nozzleDiameterMm: number
+): string {
+  // Excluded on purpose: transform, pivot and parentId only place the solid
+  // (assembly-stage); name/locked/previewOpacity/facePaint are not geometry.
+  const {
+    transform,
+    pivot,
+    parentId,
+    name,
+    locked,
+    previewOpacity,
+    facePaint,
+    ...content
+  } = resolvedLayer as ShapeLayer & Record<string, unknown>;
+  void transform;
+  void pivot;
+  void parentId;
+  void name;
+  void locked;
+  void previewOpacity;
+  void facePaint;
+  return stableStringify({ content, effectiveCombine, nozzleDiameterMm });
 }
 
 export function findBaseLayer(document: DesignDocument): BaseLayer | null {
@@ -589,6 +681,21 @@ export async function buildDocument(
   const holes: HoleLayer[] = [];
   const onProgress = options.onProgress ?? (() => undefined);
   const cancelPoint = () => options.throwIfCancelled?.();
+  const useCache = options.useLayerCache !== false;
+  const nozzleDiameterMm = documentNozzleDiameterMm(document);
+
+  // Entries whose layer no longer exists can never be reused — free their
+  // WASM memory now. (A concurrent cancelled build holds its own duplicate
+  // handles, so disposing the cache's handle here is safe.)
+  if (useCache) {
+    const liveIds = new Set(document.layers.map((l) => l.id));
+    for (const [id, entry] of layerSolidCache) {
+      if (!liveIds.has(id)) {
+        entry.solid.dispose();
+        layerSolidCache.delete(id);
+      }
+    }
+  }
 
   interface BuiltShape {
     layer: ShapeLayer;
@@ -635,30 +742,57 @@ export async function buildDocument(
     if (!isShapeLayer(layer)) continue;
     const effectiveCombine = effectiveCombineMode(document, layer);
     try {
-      const solid = await buildShapeLayerSolid(kernel, resolveLayer(layer, parameters), effectiveCombine);
+      const resolved = resolveLayer(layer, parameters);
+      const hash = useCache
+        ? layerContentHash(resolved, effectiveCombine, nozzleDiameterMm)
+        : null;
+      if (hash) {
+        const cached = layerSolidCache.get(layer.id);
+        if (cached && cached.hash === hash) {
+          // Hand out a DUPLICATE — assembly consumes what it is given, and
+          // the stored handle must survive for the next build.
+          issues.push(...cached.issues);
+          built.push({ layer, solid: cached.solid.duplicate(), effectiveCombine });
+          if (options.stats) options.stats.layersFromCache++;
+          continue;
+        }
+      }
+
+      const solid = await buildShapeLayerSolid(kernel, resolved, effectiveCombine);
+      if (options.stats) options.stats.layersBuilt++;
       if (!solid) continue;
       // Apply the re-editable modifier stack. Failures are reported as
       // issues but never abort the build: the document is rebuilt on every
       // keystroke, and a momentarily invalid parameter should surface a
       // message rather than blank the viewport.
       const stack = layer.modifiers ?? [];
-      if (stack.length === 0) {
-        built.push({ layer, solid, effectiveCombine });
-        continue;
+      let finalSolid = solid;
+      const layerIssues: ModelIssue[] = [];
+      if (stack.length > 0) {
+        const applied = applyModifiers(kernel, solid, stack, { nozzleDiameterMm });
+        for (const errorHe of applied.errorsHe) {
+          layerIssues.push({
+            code: "modifier/failed",
+            severity: "warning",
+            titleHe: `מודיפייר בשכבה "${layer.name}" נכשל`,
+            detailHe: errorHe,
+            actionHe: "שנו את הפרמטרים של המודיפייר או כבו אותו",
+          });
+        }
+        finalSolid = applied.solid;
       }
-      const applied = applyModifiers(kernel, solid, stack, {
-        nozzleDiameterMm: documentNozzleDiameterMm(document),
-      });
-      for (const errorHe of applied.errorsHe) {
-        issues.push({
-          code: "modifier/failed",
-          severity: "warning",
-          titleHe: `מודיפייר בשכבה "${layer.name}" נכשל`,
-          detailHe: errorHe,
-          actionHe: "שנו את הפרמטרים של המודיפייר או כבו אותו",
+      issues.push(...layerIssues);
+      if (hash) {
+        // Cache the finished solid; modifier warnings are cached WITH it so
+        // a cache hit re-reports them instead of silently clearing them.
+        layerSolidCache.get(layer.id)?.solid.dispose();
+        layerSolidCache.set(layer.id, {
+          hash,
+          solid: finalSolid.duplicate(),
+          issues: layerIssues,
         });
       }
-      built.push({ layer, solid: applied.solid, effectiveCombine });
+      built.push({ layer, solid: finalSolid, effectiveCombine });
     } catch (err) {
       issues.push(issueForLayerFailure(layer, err));
     }
