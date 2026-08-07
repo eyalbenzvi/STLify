@@ -198,16 +198,22 @@ export function buildSupports(
   const gap = Math.max(0, settings.contactGapMm);
 
   const solids: Solid[] = [];
-  for (const pillar of pillars) {
-    const height = pillar.top.z - pillar.baseZMm - gap;
-    if (height <= 0.1) continue;
-    // Cone: wide at the bottom for stability, narrow at the tip so it snaps
-    // off cleanly and leaves minimal witness marks.
-    solids.push(
-      kernel
-        .cone(baseRadius, tipRadius, height, 16)
-        .translate(pillar.top.x, pillar.top.y, pillar.baseZMm)
-    );
+  try {
+    for (const pillar of pillars) {
+      const height = pillar.top.z - pillar.baseZMm - gap;
+      if (height <= 0.1) continue;
+      // Cone: wide at the bottom for stability, narrow at the tip so it snaps
+      // off cleanly and leaves minimal witness marks.
+      solids.push(
+        kernel
+          .cone(baseRadius, tipRadius, height, 16)
+          .translate(pillar.top.x, pillar.top.y, pillar.baseZMm)
+      );
+    }
+  } catch (err) {
+    // `unionAll` has not taken ownership yet, so these are ours to free.
+    for (const s of solids) s.dispose();
+    throw err;
   }
 
   if (solids.length === 0) {
@@ -293,20 +299,26 @@ export function analyzeBridging(
     // Nothing below means the span is unsupported here.
     if (findSurfaceBelow(bvh, mesh, { x: cx, y: cy, z: cz }) > 0.05) continue;
 
+    // Merge BEFORE measuring, not after. Every triangle of one physical
+    // bridge used to pay for up to 400 BVH probes only to be folded into a
+    // span that was already found — which is why a 17k-triangle model took a
+    // quarter of a second to report the same two bridges as a 36-triangle
+    // one. The radius comes from the span already on record, and never
+    // shrinks below the reporting threshold, so a short bridge stays one
+    // finding instead of fragmenting into many.
+    const covered = spans.find(
+      (s) =>
+        Math.abs(s.center.z - cz) < 0.5 &&
+        Math.hypot(s.center.x - cx, s.center.y - cy) < Math.max(s.lengthMm / 2, minSpan)
+    );
+    if (covered) continue;
+
     // Measure how far the unsupported region runs in X and in Y.
     const runX = measureUnsupportedRun(bvh, mesh, cx, cy, cz, step, true);
     const runY = measureUnsupportedRun(bvh, mesh, cx, cy, cz, step, false);
     const length = Math.min(runX, runY);
     if (length < minSpan) continue;
 
-    // Merge with a nearby span rather than reporting every triangle.
-    const nearby = spans.find(
-      (s) => Math.hypot(s.center.x - cx, s.center.y - cy) < length / 2 && Math.abs(s.center.z - cz) < 0.5
-    );
-    if (nearby) {
-      if (length > nearby.lengthMm) nearby.lengthMm = length;
-      continue;
-    }
     spans.push({ center: { x: cx, y: cy, z: cz }, lengthMm: length });
   }
 

@@ -31,7 +31,7 @@ import {
   identityTransform,
   newId,
 } from "@/types/design";
-import type { PrinterProfile } from "@/types/profiles";
+import { PRINTER_PROFILES, type PrinterProfile } from "@/types/profiles";
 import type { Modifier, ModifierKind } from "@/lib/geometry/modifiers";
 import { defaultModifier } from "@/lib/geometry/modifiers";
 import type { ParameterDefinition } from "@/lib/geometry/expression";
@@ -44,6 +44,9 @@ const APP_VERSION = "3.0.0";
 const MAX_MESH_BYTES = 120 * 1024 * 1024;
 /** Warn when embedded meshes exceed this many triangles in total. */
 const WARN_TOTAL_TRIANGLES = 800_000;
+/** Cap on painted-region bookkeeping in one file. */
+const MAX_PAINT_REGIONS = 16;
+const MAX_PAINT_TRIANGLES = 2_000_000;
 
 export class DesignFileError extends Error {
   constructor(readonly messageHe: string) {
@@ -565,37 +568,58 @@ function sanitizeLayer(
  */
 function sanitizeFacePaint(value: unknown): FacePaint[] | undefined {
   if (!Array.isArray(value) || value.length === 0) return undefined;
-  const out: FacePaint[] = [];
-  for (const raw of value.slice(0, 16)) {
+  // One entry per slot, merged: two entries naming the same material would
+  // cut the body twice at export and collide as React keys in the overlay.
+  const bySlot = new Map<string, FacePaint>();
+  let totalIndices = 0;
+  for (const raw of value.slice(0, MAX_PAINT_REGIONS)) {
     if (!isRecord(raw) || !Array.isArray(raw.triangles)) continue;
     const meshTriangleCount = Math.max(
       0,
       Math.round(finiteNumber(raw.meshTriangleCount, 0))
     );
-    if (meshTriangleCount === 0) continue;
-    const triangles: number[] = [];
-    const seen = new Set<number>();
-    for (const entry of raw.triangles) {
-      const index = typeof entry === "number" ? Math.round(entry) : NaN;
+    // Without a fingerprint the indices cannot be checked against anything,
+    // and an absurd one is a way to smuggle in a huge allocation.
+    if (meshTriangleCount === 0 || meshTriangleCount > MAX_PAINT_TRIANGLES) continue;
+    const slotId = boundedString(raw.materialSlotId, "slot1", 40);
+    const entry = bySlot.get(slotId);
+    const seen = new Set<number>(entry?.triangles ?? []);
+    const triangles: number[] = entry ? [...entry.triangles] : [];
+    for (const value of raw.triangles) {
+      const index = typeof value === "number" ? Math.round(value) : NaN;
       if (!Number.isFinite(index) || index < 0 || index >= meshTriangleCount) continue;
       if (seen.has(index)) continue;
+      if (++totalIndices > MAX_PAINT_TRIANGLES) {
+        throw new DesignFileError("קובץ העיצוב מכיל כמות חריגה של סימוני צבע");
+      }
       seen.add(index);
       triangles.push(index);
     }
     if (triangles.length === 0) continue;
-    out.push({
-      materialSlotId: boundedString(raw.materialSlotId, "slot1", 40),
+    const depthMm = Math.max(0.05, Math.min(finiteNumber(raw.depthMm, 0.8), 100));
+    bySlot.set(slotId, {
+      materialSlotId: slotId,
       triangles: triangles.sort((a, b) => a - b),
       meshTriangleCount,
-      depthMm: Math.max(0.05, Math.min(finiteNumber(raw.depthMm, 0.8), 100)),
+      depthMm: entry ? Math.max(entry.depthMm, depthMm) : depthMm,
     });
   }
-  return out.length > 0 ? out : undefined;
+  return bySlot.size > 0 ? [...bySlot.values()] : undefined;
 }
 
 /** Measured printer behaviour. Absent means "not calibrated", not "zero". */
 function sanitizeCalibration(value: unknown): CalibrationSettings | undefined {
   if (!isRecord(value)) return undefined;
+  // An empty object must NOT materialise a calibration: doing so silently
+  // switches the feature on at its defaults, and a calibrated document
+  // enlarges every hole cutter. Absence has to survive the round trip.
+  const known = [
+    "measuredClearanceMm",
+    "holeCompensationMm",
+    "elephantFootCompensationMm",
+    "elephantFootHeightMm",
+  ];
+  if (!known.some((key) => typeof value[key] === "number")) return undefined;
   return {
     measuredClearanceMm: Math.max(0, Math.min(finiteNumber(value.measuredClearanceMm, 0.2), 5)),
     holeCompensationMm: Math.max(0, Math.min(finiteNumber(value.holeCompensationMm, 0), 5)),
@@ -617,11 +641,18 @@ function sanitizeCalibration(value: unknown): CalibrationSettings | undefined {
 function sanitizeCustomPrinters(value: unknown): PrinterProfile[] | undefined {
   if (!Array.isArray(value) || value.length === 0) return undefined;
   const out: PrinterProfile[] = [];
+  const taken = new Set(PRINTER_PROFILES.map((p) => p.id));
   for (const raw of value.slice(0, 20)) {
     if (!isRecord(raw)) continue;
     const volume = isRecord(raw.buildVolumeMm) ? raw.buildVolumeMm : {};
+    // Custom printers are looked up BEFORE the built-ins, so a file claiming
+    // id "genericFdm220" would quietly redefine a stock profile — including
+    // shrinking its build volume to nothing.
+    let id = boundedString(raw.id, `custom_${out.length + 1}`, 60);
+    while (taken.has(id)) id = `custom_${id}`;
+    taken.add(id);
     out.push({
-      id: boundedString(raw.id, `custom_${out.length + 1}`, 60),
+      id,
       nameHe: boundedString(raw.nameHe, `מדפסת ${out.length + 1}`, 80),
       technology: raw.technology === "sla" ? "sla" : "fdm",
       buildVolumeMm: {

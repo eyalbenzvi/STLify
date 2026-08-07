@@ -615,6 +615,24 @@ export function GeneratorDialog({
             {field("pitchMm", "פסיעה", 1.25, 0.2, 20, 0.05)}
             {field("lengthMm", "אורך", 20, 1, 300, 1)}
             {field("clearanceMm", "מרווח (לאום בלבד)", 0.4, 0, 2, 0.05)}
+            <ToggleGroup
+              label="מחלקת התאמה"
+              value={String(params.fitClass ?? "normal")}
+              options={[
+                { value: "tight", label: "הדוקה" },
+                { value: "normal", label: "רגילה" },
+                { value: "loose", label: "רפויה" },
+              ]}
+              onChange={(v) => set("fitClass", v)}
+            />
+            <p className="text-[11px] leading-snug text-slate-400">
+              מכפילה את המרווח: הדוקה ×0.5, רגילה ×1, רפויה ×1.75. חלה על
+              הברגה פנימית בלבד.
+            </p>
+            {field("chamferMm", "שיפוע כניסה", 0.6, 0, 3, 0.1)}
+            <p className="text-[11px] leading-snug text-slate-400">
+              קטימה בשני הקצוות, כדי שהאום יתפוס ישר ולא ייתקע בחוט הראשון.
+            </p>
             <label className="flex items-center justify-between text-sm">
               <span className="text-slate-600">הברגה פנימית (אום)</span>
               <input

@@ -16,6 +16,8 @@
  * between a screw that fits and one that does not.
  */
 
+import { getPrinterProfile, type PrinterProfile } from "@/types/profiles";
+
 export interface CalibrationSettings {
   /**
    * Measured clearance for a sliding fit, mm. Taken from the tolerance
@@ -126,4 +128,26 @@ export function describeCalibration(calibration: CalibrationSettings): string {
     parts.push(`פיצוי רגל פיל ${calibration.elephantFootCompensationMm} מ״מ`);
   }
   return parts.join(" · ");
+}
+
+/**
+ * The nozzle this document will be printed with, in mm.
+ *
+ * Several checks need it (lattice struts, minimum feature size) and each was
+ * reaching for a different source — or, in the lattice's case, for an
+ * optional field nobody ever filled in, which made the check dead code. The
+ * order is: an explicit override, then the selected printer (custom printers
+ * included), then the FDM default.
+ */
+export function documentNozzleDiameterMm(document: {
+  printerProfileId: string;
+  customPrinters?: readonly PrinterProfile[];
+  customPrintability?: { nozzleDiameterMm?: number } | null;
+}): number {
+  const override = document.customPrintability?.nozzleDiameterMm;
+  if (override && override > 0) return override;
+  const printer = getPrinterProfile(document.printerProfileId, document.customPrinters ?? []);
+  return printer.nozzleDiameterMm && printer.nozzleDiameterMm > 0
+    ? printer.nozzleDiameterMm
+    : 0.4;
 }

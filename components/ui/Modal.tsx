@@ -24,7 +24,18 @@ export interface ModalProps {
 
 export function Modal({ title, open, onClose, children, footer, wide }: ModalProps) {
   const ref = useRef<HTMLDivElement>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
   const previouslyFocused = useRef<HTMLElement | null>(null);
+
+  // Every call site passes an inline arrow, so `onClose` has a new identity on
+  // every parent render. Depending on it re-ran the whole effect — cleanup
+  // included — on each debounced rebuild, which pulled focus out of whatever
+  // the user was typing in and dropped it on the ✕ button. The handler is
+  // therefore reached through a ref and the effect keyed on `open` alone.
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  });
 
   useEffect(() => {
     if (!open) return;
@@ -42,7 +53,7 @@ export function Modal({ title, open, onClose, children, footer, wide }: ModalPro
 
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        onClose();
+        onCloseRef.current();
         return;
       }
       if (e.key !== "Tab") return;
@@ -66,9 +77,13 @@ export function Modal({ title, open, onClose, children, footer, wide }: ModalPro
     };
 
     window.addEventListener("keydown", onKey);
-    // Prefer the first real control; fall back to the dialog itself.
+    // Prefer the first real control. The ✕ button is first in the DOM, so
+    // taking items[0] blindly always landed there — technically inside the
+    // dialog, but it puts "cancel" under the first keypress of anyone who
+    // opens a dialog and starts typing.
     const items = focusable();
-    (items[0] ?? ref.current)?.focus();
+    const preferred = items.find((el) => el !== closeRef.current) ?? items[0];
+    (preferred ?? ref.current)?.focus();
 
     return () => {
       window.removeEventListener("keydown", onKey);
@@ -76,7 +91,7 @@ export function Modal({ title, open, onClose, children, footer, wide }: ModalPro
       // a teleport: the user resumes exactly where they were.
       previouslyFocused.current?.focus?.();
     };
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open) return null;
 
@@ -98,6 +113,7 @@ export function Modal({ title, open, onClose, children, footer, wide }: ModalPro
         <div className="mb-3 flex items-center justify-between">
           <h2 className="text-base font-bold text-slate-800">{title}</h2>
           <button
+            ref={closeRef}
             type="button"
             aria-label="סגירה"
             className="rounded px-2 py-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600"

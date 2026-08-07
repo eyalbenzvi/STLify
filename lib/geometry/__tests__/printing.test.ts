@@ -13,6 +13,7 @@ import {
   compensatedHoleDiameterMm,
   DEFAULT_CALIBRATION,
   describeCalibration,
+  documentNozzleDiameterMm,
   elephantFootInsetAtHeight,
   type CalibrationSettings,
 } from "../calibration";
@@ -454,5 +455,138 @@ describe("calibration in the build pipeline", () => {
       layers: [boxLayer()],
     });
     expect(b.parts[0].stats.volumeMm3).toBeCloseTo(a.parts[0].stats.volumeMm3, 3);
+  });
+});
+
+/**
+ * Regressions from the external code review.
+ *
+ * The elephant-foot correction shipped in a form that was both ruinously
+ * expensive and wrong for any part that was not sitting flat: it refined the
+ * WHOLE body so the warp had vertices to move, and it read the part's height
+ * above the bed from the translation component of the world matrix alone.
+ */
+describe("elephant foot regressions", () => {
+  function doc(
+    overrides: Partial<DesignLayer> = {},
+    compensationMm = 0.2
+  ): DesignDocument {
+    return {
+      schemaVersion: 3,
+      baseMode: "baseless",
+      layers: [
+        {
+          id: "box",
+          type: "primitive",
+          name: "תיבה",
+          visible: true,
+          locked: false,
+          materialSlotId: "slot1",
+          transform: identityTransform(),
+          previewOpacity: 1,
+          ...defaultPrimitive("box"),
+          widthMm: 20,
+          depthMm: 20,
+          heightMm: 20,
+          ...overrides,
+        } as DesignLayer,
+      ],
+      materialSlots: [{ id: "slot1", nameHe: "חומר", colorHex: "#888888" }],
+      printerProfileId: "genericFdm220",
+      printabilityProfileId: "fdmPla",
+      customPrintability: null,
+      usageProfileId: null,
+      templateId: null,
+      calibration:
+        compensationMm > 0
+          ? {
+              measuredClearanceMm: 0.2,
+              holeCompensationMm: 0,
+              elephantFootCompensationMm: compensationMm,
+              elephantFootHeightMm: 0.6,
+            }
+          : undefined,
+    } as DesignDocument;
+  }
+
+  it("does not multiply the triangle count of the part", async () => {
+    const plain = await buildDocument(doc({}, 0));
+    const compensated = await buildDocument(doc());
+    expect(plain.parts[0].stats.triangleCount).toBe(12);
+    // Refining the whole body to half the compensation height took this to
+    // 65,292 — on every debounced rebuild, on the main thread.
+    expect(compensated.parts[0].stats.triangleCount).toBeLessThan(64);
+    // ...and it still has to actually do something.
+    expect(compensated.parts[0].stats.volumeMm3).toBeLessThan(
+      plain.parts[0].stats.volumeMm3
+    );
+  });
+
+  it("corrects a part standing on its side exactly as it does a flat one", async () => {
+    // Rotated 90 degrees about X and lifted so its face genuinely rests on
+    // the plate. Reading only the matrix translation missed this entirely.
+    const flat = await buildDocument(doc());
+    const standing = await buildDocument(
+      doc({ transform: { ...identityTransform(), rotationX: 90, z: 10 } })
+    );
+    const standingPlain = await buildDocument(
+      doc({ transform: { ...identityTransform(), rotationX: 90, z: 10 } }, 0)
+    );
+    expect(standing.parts[0].stats.volumeMm3).toBeLessThan(
+      standingPlain.parts[0].stats.volumeMm3
+    );
+    expect(standing.parts[0].stats.volumeMm3).toBeCloseTo(
+      flat.parts[0].stats.volumeMm3,
+      3
+    );
+  });
+
+  it("leaves a part that is not on the plate completely alone", async () => {
+    const floating = await buildDocument(
+      doc({ transform: { ...identityTransform(), z: 50 } })
+    );
+    const plain = await buildDocument(
+      doc({ transform: { ...identityTransform(), z: 50 } }, 0)
+    );
+    expect(floating.parts[0].stats.triangleCount).toBe(12);
+    expect(floating.parts[0].stats.volumeMm3).toBeCloseTo(
+      plain.parts[0].stats.volumeMm3,
+      6
+    );
+  });
+});
+
+describe("nozzle resolution", () => {
+  it("prefers an explicit override, then the printer, then the FDM default", () => {
+    expect(
+      documentNozzleDiameterMm({
+        printerProfileId: "genericFdm220",
+        customPrintability: { nozzleDiameterMm: 0.8 },
+      })
+    ).toBeCloseTo(0.8, 6);
+
+    // A custom printer stored in the document is a real machine and must win
+    // over the default — this is what makes the lattice check reflect the
+    // machine the design actually targets.
+    expect(
+      documentNozzleDiameterMm({
+        printerProfileId: "mine",
+        customPrinters: [
+          {
+            id: "mine",
+            nameHe: "שלי",
+            technology: "fdm",
+            buildVolumeMm: { x: 200, y: 200, z: 200 },
+            nozzleDiameterMm: 0.6,
+            defaultLayerHeightMm: 0.2,
+          },
+        ],
+        customPrintability: null,
+      })
+    ).toBeCloseTo(0.6, 6);
+
+    expect(
+      documentNozzleDiameterMm({ printerProfileId: "genericFdm220" })
+    ).toBeGreaterThan(0);
   });
 });

@@ -151,10 +151,17 @@ export interface ModifierApplyResult {
  *
  * Consumes `solid` and returns a new one.
  */
+/** Document facts the modifiers need but cannot read for themselves. */
+export interface ModifierContext {
+  /** Drives the lattice's printability check. */
+  nozzleDiameterMm?: number;
+}
+
 export function applyModifiers(
   kernel: GeometryKernel,
   solid: Solid,
-  modifiers: readonly Modifier[]
+  modifiers: readonly Modifier[],
+  context: ModifierContext = {}
 ): ModifierApplyResult {
   const warningsHe: string[] = [];
   const errorsHe: string[] = [];
@@ -166,7 +173,7 @@ export function applyModifiers(
     // failure would otherwise leave nothing to continue from.
     const fallback = current.duplicate();
     try {
-      current = applyOne(kernel, current, modifier, warningsHe);
+      current = applyOne(kernel, current, modifier, warningsHe, context);
       if (current.status() !== "NoError" || current.isEmpty()) {
         const status = current.status();
         current.dispose();
@@ -194,7 +201,8 @@ function applyOne(
   kernel: GeometryKernel,
   solid: Solid,
   modifier: Modifier,
-  warningsHe: string[]
+  warningsHe: string[],
+  context: ModifierContext
 ): Solid {
   switch (modifier.kind) {
     case "fillet": {
@@ -237,6 +245,7 @@ function applyOne(
         cellSizeMm: modifier.cellSizeMm,
         thicknessMm: modifier.thicknessMm,
         shellThicknessMm: modifier.shellThicknessMm,
+        nozzleDiameterMm: context.nozzleDiameterMm,
       });
       warningsHe.push(...outcome.warningsHe);
       return outcome.solid;

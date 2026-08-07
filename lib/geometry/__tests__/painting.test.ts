@@ -270,3 +270,180 @@ describe("export split", () => {
     expect(split.parts).toHaveLength(1);
   });
 });
+
+/**
+ * Regressions from the external code review.
+ *
+ * Each of these shipped in the first version of the feature and was found by
+ * an auditor rather than by the tests above — so each one is pinned here with
+ * the measurement that exposes it.
+ */
+describe("paint regressions", () => {
+  /** Indices of every triangle lying entirely on the plane z = height. */
+  function topFace(mesh: { positions: Float32Array; indices: Uint32Array }, height: number) {
+    const out: number[] = [];
+    for (let t = 0; t < meshDataTriangleCount(mesh); t++) {
+      let onTop = true;
+      for (let k = 0; k < 3; k++) {
+        if (Math.abs(mesh.positions[mesh.indices[t * 3 + k] * 3 + 2] - height) > 1e-6) {
+          onTop = false;
+          break;
+        }
+      }
+      if (onTop) out.push(t);
+    }
+    return out;
+  }
+
+  it("bounds a paint depth that would turn the shell inside out", async () => {
+    const kernel = await getGeometryKernel();
+    // A 2mm plate painted 6mm deep: the offset copy would pass through the
+    // bottom face and the shell would come back with NEGATIVE volume, which
+    // the kernel reports as NoError because it validates topology only.
+    const plate = kernel.box(40, 20, 2, false);
+    const mesh = plate.toMeshData();
+    const warningsHe: string[] = [];
+    const pieces = splitSolidByPaint(
+      kernel,
+      plate,
+      mesh,
+      [paint("red", topFace(mesh, 2), meshDataTriangleCount(mesh), 6)],
+      warningsHe
+    );
+
+    expect(warningsHe.some((w) => w.includes("עומק הצביעה הוקטן"))).toBe(true);
+    // Still a real two-way split, not a collapse into one body.
+    expect(pieces).toHaveLength(2);
+    const painted = pieces.find((p) => p.materialSlotId === "red")!;
+    const body = pieces.find((p) => p.materialSlotId === null)!;
+    expect(painted.solid.volumeMm3()).toBeGreaterThan(0);
+    expect(body.solid.volumeMm3()).toBeGreaterThan(0);
+    expect(painted.solid.volumeMm3() + body.solid.volumeMm3()).toBeCloseTo(1600, 1);
+    for (const piece of pieces) piece.solid.dispose();
+  });
+
+  it("merges two paint entries that name the same material", () => {
+    // Two entries for one slot cut the body twice, collide as React keys and
+    // export as two files wanting the same filament.
+    const merged = activePaints(
+      [paint("red", [0, 1], 12, 0.8), paint("red", [1, 5], 12, 1.4)],
+      12
+    );
+    expect(merged).toHaveLength(1);
+    expect(merged[0].triangles).toEqual([0, 1, 5]);
+    expect(merged[0].depthMm).toBeCloseTo(1.4, 6);
+  });
+});
+
+describe("export split regressions", () => {
+  function doc(layers: DesignLayer[]): DesignDocument {
+    return {
+      schemaVersion: 3,
+      baseMode: "baseless",
+      layers,
+      materialSlots: [
+        { id: "slot1", nameHe: "גוף", colorHex: "#2f6feb" },
+        { id: "slot2", nameHe: "כיתוב", colorHex: "#e0483e" },
+      ],
+      printerProfileId: "genericFdm220",
+      printabilityProfileId: "fdmPla",
+      customPrintability: null,
+      usageProfileId: null,
+      templateId: null,
+    } as DesignDocument;
+  }
+
+  function plate(facePaint?: FacePaint[]): DesignLayer {
+    return {
+      id: "plate",
+      type: "primitive",
+      name: "לוחית",
+      visible: true,
+      locked: false,
+      materialSlotId: "slot1",
+      transform: identityTransform(),
+      previewOpacity: 1,
+      facePaint,
+      ...defaultPrimitive("box"),
+      widthMm: 40,
+      depthMm: 20,
+      heightMm: 2,
+    } as DesignLayer;
+  }
+
+  /**
+   * A thin-WALLED body. The depth bound is derived from the bounding box, so
+   * a 1mm wall inside a 40mm envelope is the case where a legal depth can
+   * still swallow the whole part.
+   */
+  function tube(facePaint?: FacePaint[]): DesignLayer {
+    return {
+      id: "tube",
+      type: "primitive",
+      name: "צינור",
+      visible: true,
+      locked: false,
+      materialSlotId: "slot1",
+      transform: identityTransform(),
+      previewOpacity: 1,
+      facePaint,
+      ...defaultPrimitive("tube"),
+      radiusMm: 20,
+      radius2Mm: 19,
+      heightMm: 20,
+    } as DesignLayer;
+  }
+
+  it("refuses a split that would not add back up to the body", async () => {
+    // A 1mm wall inside a 40mm envelope: the depth bound is derived from the
+    // bounding box, so 9mm of paint is "legal" and yet passes clean through
+    // the wall. The resulting shell self-intersects in a way the kernel
+    // accepts silently, and the split invented material — 2,446mm3 of tube
+    // came back as 7,102mm3 of parts.
+    const plain = await buildDocument(doc([tube()]));
+    const mesh = plain.parts[0].localMesh;
+    const count = meshDataTriangleCount(mesh);
+    const originalVolume = plain.parts[0].stats.volumeMm3;
+
+    const document = doc([
+      tube([
+        {
+          materialSlotId: "slot2",
+          triangles: Array.from({ length: count }, (_, i) => i),
+          meshTriangleCount: count,
+          depthMm: 9,
+        },
+      ]),
+    ]);
+    const build = await buildDocument(document);
+    const split = await splitPartsByPaint(document, build.parts);
+
+    const total = split.parts.reduce((sum, p) => sum + p.stats.volumeMm3, 0);
+    expect(total).toBeCloseTo(originalVolume, 1);
+    // Refused rather than silently wrong, and the user is told why.
+    expect(split.parts).toHaveLength(1);
+    expect(split.warningsHe.some((w) => w.includes("הפרדה נקייה"))).toBe(true);
+  });
+
+  it("warns at export when the body outgrew its paint", async () => {
+    const document = doc([
+      plate([
+        { materialSlotId: "slot2", triangles: [0, 1], meshTriangleCount: 99999, depthMm: 1 },
+      ]),
+    ]);
+    const build = await buildDocument(document);
+    const split = await splitPartsByPaint(document, build.parts);
+    expect(split.parts).toHaveLength(1);
+    expect(split.warningsHe.some((w) => w.includes("בוטלה"))).toBe(true);
+  });
+
+  it("reports stale paint as a build issue, not only at export", async () => {
+    const document = doc([
+      plate([
+        { materialSlotId: "slot2", triangles: [0], meshTriangleCount: 99999, depthMm: 1 },
+      ]),
+    ]);
+    const build = await buildDocument(document);
+    expect(build.issues.some((i) => i.code === "paint/stale")).toBe(true);
+  });
+});

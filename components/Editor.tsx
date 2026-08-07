@@ -102,6 +102,7 @@ import {
   buildLivingHinge,
   buildSnapFit,
   buildThread,
+  type ThreadFitClass,
   buildToleranceTest,
   GeneratorError,
 } from "@/lib/geometry/generators";
@@ -156,7 +157,11 @@ import {
   unpaintTriangles,
 } from "@/lib/geometry/painting";
 import { CalibrationPanel, CustomPrinterPanel } from "@/components/editor/CalibrationPanel";
-import type { CalibrationSettings } from "@/lib/geometry/calibration";
+import {
+  clearanceForFit,
+  documentNozzleDiameterMm,
+  type CalibrationSettings,
+} from "@/lib/geometry/calibration";
 import {
   analyzeBridging,
   buildSupports,
@@ -870,12 +875,21 @@ function EditorInner() {
         switch (kind) {
           case "thread": {
             const internal = bool("internal", false);
+            const rawFit = params.fitClass;
+            const fitClass: ThreadFitClass =
+              rawFit === "tight" || rawFit === "loose" ? rawFit : "normal";
             const solid = buildThread(kernel, {
               diameterMm: num("diameterMm", 8),
               pitchMm: num("pitchMm", 1.25),
               lengthMm: num("lengthMm", 20),
               internal,
-              clearanceMm: num("clearanceMm", 0.4),
+              // A calibrated machine knows its own clearance; the dialog's
+              // default is only a guess for a machine nobody measured.
+              clearanceMm: doc.calibration
+                ? clearanceForFit(doc.calibration, "sliding")
+                : num("clearanceMm", 0.4),
+              fitClass,
+              chamferMm: num("chamferMm", 0.6),
               segments: 48,
             });
             layers.push(
@@ -1045,7 +1059,16 @@ function EditorInner() {
       if (!layer) return;
       void runOp("מילוי סריג", async () => {
         const mesh = await layerToWorldMesh(doc, layer);
-        const result = await jobs.run("latticeFill", { mesh, settings }, "מילוי סריג");
+        // The printability check is only real if the nozzle reaches it; the
+        // dialog cannot know which printer the document targets.
+        const result = await jobs.run(
+          "latticeFill",
+          {
+            mesh,
+            settings: { ...settings, nozzleDiameterMm: documentNozzleDiameterMm(doc) },
+          },
+          "מילוי סריג"
+        );
         if (!result) return;
         const resultLayer = await meshToResultLayer(result.mesh, {
           nameHe: `${layer.name} — סריג`,

@@ -40,7 +40,13 @@ import {
 } from "./meshData";
 import { matrix4ToManifoldMat4, transformToMatrix4 } from "./transform";
 import { resolveParameters, resolveBinding } from "./expression";
-import { clearanceForFit, elephantFootInsetAtHeight } from "./calibration";
+import {
+  clearanceForFit,
+  documentNozzleDiameterMm,
+  elephantFootInsetAtHeight,
+} from "./calibration";
+// Type-only in the other direction, so this is not a runtime cycle.
+import { hasStalePaint } from "./painting";
 import { applyModifiers } from "./modifiers";
 import {
   buildHoleCutter,
@@ -243,6 +249,16 @@ interface PartBody {
   nameHe: string;
 }
 
+/** World-space bounds of a solid held in `worldMatrix`'s local frame. */
+function worldBoundsOf(solid: Solid, worldMatrix: THREE.Matrix4): THREE.Box3 {
+  const local = solid.boundingBox();
+  const box = new THREE.Box3(
+    new THREE.Vector3(local.min.x, local.min.y, local.min.z),
+    new THREE.Vector3(local.max.x, local.max.y, local.max.z)
+  );
+  return box.applyMatrix4(worldMatrix);
+}
+
 /**
  * Shrink the first layers of a part inward.
  *
@@ -252,41 +268,102 @@ interface PartBody {
  * in the MODEL cancels it, and doing it here — after the part is finished —
  * means it applies to every part however it was built.
  *
- * The vertices move inward along the XY direction away from the part's own
- * centre, fading to nothing at the compensation height, so no ledge is left
- * where the correction stops.
+ * Three things this has to get right, each of which was wrong in the first
+ * version:
+ *
+ *  1. **Only the affected band is touched.** Refining the whole part so the
+ *     warp has vertices to move took a 12-triangle cube to 65,292 triangles —
+ *     on every debounced rebuild. The part is instead SPLIT at the
+ *     compensation height and only the bottom slab is deformed.
+ *  2. **No refinement is needed at all.** The split guarantees vertices at
+ *     z = 0 and at the compensation height, and the inset fades linearly
+ *     between them, so linear interpolation across the side walls is already
+ *     exact. Refining only added triangles, never accuracy.
+ *  3. **The bed is a WORLD plane.** Reading the world height from the
+ *     matrix's translation alone ignored rotation, so a part stood on its
+ *     side got the correction on a vertical face in its middle — or, when it
+ *     was also lifted, no correction at all. Every vertex is now taken to
+ *     world space, inset there, and brought back.
+ *
+ * Never throws and never consumes `solid` on failure: the caller keeps a live
+ * handle either way.
  */
 function applyElephantFoot(
   kernel: GeometryKernel,
   solid: Solid,
   document: DesignDocument,
   worldMatrix: THREE.Matrix4
-): Solid {
+): { solid: Solid; failed: boolean } {
   const calibration = document.calibration;
-  if (!calibration || calibration.elephantFootCompensationMm <= 0) return solid;
-
-  // The correction is defined against the BUILD PLATE, so the part's height
-  // above it has to be measured in world space.
-  const worldZOffset = new THREE.Vector3().setFromMatrixPosition(worldMatrix).z;
-  const bounds = solid.boundingBox();
-  const centreX = (bounds.min.x + bounds.max.x) / 2;
-  const centreY = (bounds.min.y + bounds.max.y) / 2;
-
-  // Vertices must exist near the bed for the inset to have anything to move.
+  if (!calibration || calibration.elephantFootCompensationMm <= 0) {
+    return { solid, failed: false };
+  }
   const height = Math.max(0.05, calibration.elephantFootHeightMm);
-  const refined = solid.refineToLength(height / 2);
 
-  return refined.warp((p) => {
-    const inset = elephantFootInsetAtHeight(calibration, p.z + worldZOffset);
-    if (inset <= 0) return p;
-    const dx = p.x - centreX;
-    const dy = p.y - centreY;
-    const distance = Math.hypot(dx, dy);
-    if (distance < 1e-6) return p;
-    const scale = Math.max(0, (distance - inset) / distance);
-    return { x: centreX + dx * scale, y: centreY + dy * scale, z: p.z };
-  });
-  void kernel;
+  const worldBounds = worldBoundsOf(solid, worldMatrix);
+  // Nothing of this part is near the plate, so nothing is squashed.
+  if (worldBounds.min.z >= height) return { solid, failed: false };
+
+  const centreX = (worldBounds.min.x + worldBounds.max.x) / 2;
+  const centreY = (worldBounds.min.y + worldBounds.max.y) / 2;
+  const toWorld = worldMatrix;
+  const toLocal = worldMatrix.clone().invert();
+  const point = new THREE.Vector3();
+
+  const insetInWorld = (p: { x: number; y: number; z: number }) => {
+    point.set(p.x, p.y, p.z).applyMatrix4(toWorld);
+    const inset = elephantFootInsetAtHeight(calibration, point.z);
+    if (inset > 0) {
+      const dx = point.x - centreX;
+      const dy = point.y - centreY;
+      const distance = Math.hypot(dx, dy);
+      if (distance >= 1e-6) {
+        const scale = Math.max(0, (distance - inset) / distance);
+        point.set(centreX + dx * scale, centreY + dy * scale, point.z);
+      }
+    }
+    point.applyMatrix4(toLocal);
+    return { x: point.x, y: point.y, z: point.z };
+  };
+
+  // Work on a duplicate so a mid-way kernel failure cannot leave the caller
+  // holding a consumed handle — `refine`/`warp`/`split` all consume.
+  const working = solid.duplicate();
+  let bottom: Solid | null = null;
+  let top: Solid | null = null;
+  try {
+    // A world-space slab from below the part up to the compensation height,
+    // expressed in the part's own frame so it can cut the local solid.
+    const size = new THREE.Vector3();
+    worldBounds.getSize(size);
+    const pad = Math.max(size.x, size.y, 10) + 10;
+    const floor = worldBounds.min.z - 1;
+    const span = pad * 2;
+    const slab = kernel
+      .box(span, span, height - floor, false)
+      .translate(centreX - pad, centreY - pad, floor)
+      .transform(matrix4ToManifoldMat4(toLocal));
+    [bottom, top] = working.splitBySolid(slab);
+    if (bottom.isEmpty()) {
+      bottom.dispose();
+      top.dispose();
+      return { solid, failed: false };
+    }
+    const warped = bottom.warp(insetInWorld);
+    bottom = null;
+    const merged = top.isEmpty() ? (top.dispose(), warped) : warped.union(top);
+    top = null;
+    if (merged.status() !== "NoError" || merged.isEmpty()) {
+      merged.dispose();
+      return { solid, failed: true };
+    }
+    solid.dispose();
+    return { solid: merged, failed: false };
+  } catch {
+    bottom?.dispose();
+    top?.dispose();
+    return { solid, failed: true };
+  }
 }
 
 function bodyToPart(document: DesignDocument, body: PartBody): PrintablePart {
@@ -381,7 +458,9 @@ export async function buildDocument(
         built.push({ layer, solid, effectiveCombine });
         continue;
       }
-      const applied = applyModifiers(kernel, solid, stack);
+      const applied = applyModifiers(kernel, solid, stack, {
+        nozzleDiameterMm: documentNozzleDiameterMm(document),
+      });
       for (const errorHe of applied.errorsHe) {
         issues.push({
           code: "modifier/failed",
@@ -505,14 +584,14 @@ export async function buildDocument(
     // First-layer compensation is applied to the finished body, so it covers
     // every part regardless of how it was built.
     if (document.calibration && document.calibration.elephantFootCompensationMm > 0) {
-      try {
-        body.solid = applyElephantFoot(
-          kernel,
-          body.solid,
-          document,
-          layerWorldMatrix(document, body.primary)
-        );
-      } catch {
+      const compensated = applyElephantFoot(
+        kernel,
+        body.solid,
+        document,
+        layerWorldMatrix(document, body.primary)
+      );
+      body.solid = compensated.solid;
+      if (compensated.failed) {
         issues.push({
           code: "calibration/elephant-foot-failed",
           severity: "warning",
@@ -522,6 +601,19 @@ export async function buildDocument(
       }
     }
     const part = bodyToPart(document, body);
+    // Painted regions are recorded against a specific body. Say so here, at
+    // the point the mismatch becomes real, rather than leaving the user to
+    // discover the missing colour when the ZIP comes out single-coloured.
+    if (hasStalePaint(body.primary.facePaint, part.stats.triangleCount)) {
+      issues.push({
+        code: "paint/stale",
+        severity: "warning",
+        titleHe: `הצביעה בשכבה "${body.primary.name}" בוטלה`,
+        detailHe:
+          "הגוף השתנה מאז שנצבע, ולכן סימוני הצבע כבר אינם מתאימים לפאות שלו.",
+        actionHe: "צבעו את האזורים מחדש במצב בחירת פאות",
+      });
+    }
     body.solid.dispose();
     if (part.stats.triangleCount > 0) {
       parts.push(part);

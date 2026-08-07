@@ -14,7 +14,7 @@
  */
 
 import type { CalibrationSettings } from "@/types/design";
-import type { PrinterProfile } from "@/types/profiles";
+import { makeCustomPrinter, type PrinterProfile } from "@/types/profiles";
 import { clearanceForFit, DEFAULT_CALIBRATION } from "@/lib/geometry/calibration";
 import { NumberField } from "@/components/ui/NumberField";
 
@@ -186,14 +186,15 @@ export function CustomPrinterPanel({ printers, onChange }: CustomPrinterPanelPro
         onClick={() =>
           onChange([
             ...printers,
-            {
+            // Through the factory, so the "resin printers have no nozzle"
+            // rule and the dimension floors apply here too.
+            makeCustomPrinter({
               id: `custom_${printers.length + 1}_${Math.random().toString(36).slice(2, 8)}`,
               nameHe: `המדפסת שלי ${printers.length + 1}`,
-              technology: "fdm",
               buildVolumeMm: { x: 220, y: 220, z: 250 },
               nozzleDiameterMm: 0.4,
               defaultLayerHeightMm: 0.2,
-            },
+            }),
           ])
         }
       >

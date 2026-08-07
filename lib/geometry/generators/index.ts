@@ -179,7 +179,12 @@ function applyThreadChamfer(
   segments: number,
   flare = false
 ): Solid {
-  const chamfer = settings.chamferMm ?? Math.min(settings.pitchMm, majorRadius * 0.25);
+  // Bounded against the thread itself: a chamfer wider than the radius, or
+  // longer than half the thread, would build a cone with a negative radius or
+  // eat the whole part. Now that the dialog exposes the field, both are one
+  // keystroke away.
+  const requested = settings.chamferMm ?? Math.min(settings.pitchMm, majorRadius * 0.25);
+  const chamfer = Math.min(requested, majorRadius * 0.45, settings.lengthMm * 0.4);
   if (!(chamfer > 0)) return thread;
 
   const length = settings.lengthMm;

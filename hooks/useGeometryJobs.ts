@@ -90,8 +90,14 @@ export function useGeometryJobs(): UseGeometryJobs {
         if (err instanceof JobCancelledError) return null;
         throw err;
       } finally {
-        if (controllerRef.current === controller) controllerRef.current = null;
-        setProgress(null);
+        // Both lines belong INSIDE the guard. A superseded job's rejection
+        // settles a microtask after the new job has already set its own
+        // progress, so clearing unconditionally hid the overlay — and flipped
+        // `busy` to false — while the replacement was still running.
+        if (controllerRef.current === controller) {
+          controllerRef.current = null;
+          setProgress(null);
+        }
       }
     },
     []

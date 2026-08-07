@@ -5,6 +5,7 @@
 
 import { beforeEach, describe, expect, it } from "vitest";
 import { identityTransform } from "@/types/design";
+import { getPrinterProfile } from "@/types/profiles";
 import {
   createTemplateDocument,
   emptyDocument,
@@ -246,6 +247,111 @@ describe("wave C fields survive a round-trip", () => {
       meshes: [],
     });
     const { document } = importDesignFile(json);
+    expect(document.layers[0].facePaint).toBeUndefined();
+  });
+});
+
+describe("hostile input to the wave C fields", () => {
+  function fileWith(document: Record<string, unknown>): string {
+    return JSON.stringify({
+      format: "formadesign",
+      schemaVersion: 3,
+      document: { baseMode: "baseless", layers: [], materialSlots: [], ...document },
+      meshes: [],
+    });
+  }
+
+  it("does not switch calibration on from an empty object", () => {
+    // Materialising the defaults here silently enlarges every hole cutter in
+    // the document. "Not calibrated" has to survive the round trip.
+    const { document } = importDesignFile(fileWith({ calibration: {} }));
+    expect(document.calibration).toBeUndefined();
+  });
+
+  it("keeps a calibration that names at least one real value", () => {
+    const { document } = importDesignFile(
+      fileWith({ calibration: { measuredClearanceMm: 0.35 } })
+    );
+    expect(document.calibration?.measuredClearanceMm).toBeCloseTo(0.35, 6);
+  });
+
+  it("refuses to let a custom printer impersonate a built-in one", () => {
+    // Custom printers are looked up first, so this would redefine the stock
+    // profile — here shrinking its build volume to nothing.
+    const { document } = importDesignFile(
+      fileWith({
+        customPrinters: [
+          { id: "genericFdm220", nameHe: "זדוני", buildVolumeMm: { x: 1, y: 1, z: 1 } },
+        ],
+      })
+    );
+    expect(document.customPrinters?.[0].id).not.toBe("genericFdm220");
+    expect(getPrinterProfile("genericFdm220", document.customPrinters).buildVolumeMm.x)
+      .toBeGreaterThan(100);
+  });
+
+  it("merges paint entries that claim the same material slot", () => {
+    const { document } = importDesignFile(
+      fileWith({
+        layers: [
+          {
+            type: "text",
+            name: "טקסט",
+            content: "א",
+            combine: "standalone",
+            facePaint: [
+              { materialSlotId: "slot2", triangles: [0, 1], meshTriangleCount: 12, depthMm: 0.8 },
+              { materialSlotId: "slot2", triangles: [1, 5], meshTriangleCount: 12, depthMm: 1.4 },
+            ],
+          },
+        ],
+      })
+    );
+    const paint = document.layers[0].facePaint;
+    expect(paint).toHaveLength(1);
+    expect(paint?.[0].triangles).toEqual([0, 1, 5]);
+  });
+
+  it("rejects a file that tries to allocate a huge paint region", () => {
+    const triangles = Array.from({ length: 300_000 }, (_, i) => i);
+    expect(() =>
+      importDesignFile(
+        fileWith({
+          layers: [
+            {
+              type: "text",
+              name: "טקסט",
+              content: "א",
+              combine: "standalone",
+              facePaint: Array.from({ length: 16 }, (_, k) => ({
+                materialSlotId: `slot${k}`,
+                triangles,
+                meshTriangleCount: 300_000,
+                depthMm: 1,
+              })),
+            },
+          ],
+        })
+      )
+    ).toThrow(DesignFileError);
+  });
+
+  it("drops paint whose fingerprint is absurd", () => {
+    const { document } = importDesignFile(
+      fileWith({
+        layers: [
+          {
+            type: "text",
+            name: "טקסט",
+            content: "א",
+            combine: "standalone",
+            facePaint: [
+              { materialSlotId: "slot2", triangles: [0], meshTriangleCount: 1e12, depthMm: 1 },
+            ],
+          },
+        ],
+      })
+    );
     expect(document.layers[0].facePaint).toBeUndefined();
   });
 });

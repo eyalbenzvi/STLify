@@ -112,9 +112,25 @@ export function activePaints(
   meshTriangleCount: number
 ): FacePaint[] {
   if (!existing || existing.length === 0) return [];
-  return existing
-    .filter((p) => p.meshTriangleCount === meshTriangleCount && p.triangles.length > 0)
-    .map((p) => ({ ...p, triangles: [...p.triangles] }));
+  // Merged by slot, because everything downstream assumes one entry per
+  // material: two entries for the same slot cut the body twice (the second
+  // cut finds nothing and warns), collide as React keys in the overlay, and
+  // export as two files wanting the same filament.
+  const bySlot = new Map<string, FacePaint>();
+  for (const paint of existing) {
+    if (paint.meshTriangleCount !== meshTriangleCount) continue;
+    if (paint.triangles.length === 0) continue;
+    const existingEntry = bySlot.get(paint.materialSlotId);
+    if (!existingEntry) {
+      bySlot.set(paint.materialSlotId, { ...paint, triangles: [...paint.triangles] });
+      continue;
+    }
+    const union = new Set(existingEntry.triangles);
+    for (const t of paint.triangles) union.add(t);
+    existingEntry.triangles = [...union].sort((a, b) => a - b);
+    existingEntry.depthMm = Math.max(existingEntry.depthMm, paint.depthMm);
+  }
+  return [...bySlot.values()];
 }
 
 /** True when paint exists but no longer matches the body it was painted on. */
@@ -309,36 +325,98 @@ export function splitSolidByPaint(
   const active = activePaints(paints, mesh.indices.length / 3);
   if (active.length === 0) return [{ materialSlotId: null, solid }];
 
+  // A paint depth deeper than the body turns the offset copy inside out: the
+  // shell comes back with NEGATIVE volume and a clean `NoError` status,
+  // because the kernel validates topology and never geometry. Bounding the
+  // depth by the body's own thinnest dimension is what keeps the split
+  // honest, and the user is told rather than silently overridden.
+  const bounds = solid.boundingBox();
+  const thinnest = Math.min(
+    bounds.max.x - bounds.min.x,
+    bounds.max.y - bounds.min.y,
+    bounds.max.z - bounds.min.z
+  );
+  const maxDepth = Math.max(0.05, thinnest * 0.45);
+
   const result: PaintedSolid[] = [];
   let remainder = solid;
-  for (const paint of active) {
-    const shellMesh = buildPaintShellMesh(
-      mesh,
-      new Set(paint.triangles),
-      paint.depthMm || DEFAULT_PAINT_DEPTH_MM
-    );
-    if (!shellMesh) {
-      warningsHe.push(`אזור צבוע ריק דולג (${paint.materialSlotId})`);
-      continue;
-    }
-    const { solid: shell, status } = kernel.fromMeshData(shellMesh);
-    if (status !== "NoError") {
-      shell.dispose();
-      warningsHe.push(
-        `הפרדת האזור הצבוע נכשלה (${status}) — נסו עומק צביעה קטן יותר או אזור פשוט יותר`
-      );
-      continue;
-    }
-    const [region, rest] = remainder.splitBySolid(shell);
-    if (region.isEmpty() || region.status() !== "NoError") {
-      // Put the material back rather than dropping it on the floor.
-      region.dispose();
+  try {
+    for (const paint of active) {
+      const requested = paint.depthMm || DEFAULT_PAINT_DEPTH_MM;
+      const depth = Math.min(requested, maxDepth);
+      if (depth < requested - 1e-9) {
+        warningsHe.push(
+          `עומק הצביעה הוקטן מ-${requested.toFixed(1)} ל-${depth.toFixed(2)} מ״מ — ` +
+            `עומק גדול מעובי הגוף היה יוצר גוף הפוך`
+        );
+      }
+
+      const shellMesh = buildPaintShellMesh(mesh, new Set(paint.triangles), depth);
+      if (!shellMesh) {
+        warningsHe.push(`אזור צבוע ריק דולג (${paint.materialSlotId})`);
+        continue;
+      }
+      const { solid: shell, status } = kernel.fromMeshData(shellMesh);
+      // A non-positive volume means the offset copy crossed through the
+      // original surface. Such a shell cuts unpredictably, so it is refused.
+      if (status !== "NoError" || shell.volumeMm3() <= 0) {
+        const reason = status !== "NoError" ? status : "נפח לא חוקי";
+        shell.dispose();
+        warningsHe.push(
+          `הפרדת האזור הצבוע נכשלה (${reason}) — נסו עומק צביעה קטן יותר או אזור פשוט יותר`
+        );
+        continue;
+      }
+      // Keep a way back. `splitBySolid` consumes its input, so without this
+      // there is nothing to fall back to when the cut turns out to be bad.
+      const volumeBefore = remainder.volumeMm3();
+      const backup = remainder.duplicate();
+      const [region, rest] = remainder.splitBySolid(shell);
+
+      // The invariant this whole feature rests on: the pieces must add back
+      // up to what they were cut from, and each must be a real body. A
+      // boolean split guarantees that only for a well-formed cutter, and a
+      // shell can self-intersect in ways the kernel accepts silently.
+      //
+      // A 1 mm-walled tube painted 9 mm deep is the case that proves both
+      // checks are needed: the remainder came back INSIDE OUT, at
+      // −2,327 mm³, with status NoError. The sum still balanced — the
+      // negative cancelled the excess — so only the per-piece sign catches
+      // it, and mesh-level volume (which integrates to +2,327) hid it all
+      // the way to a 7,102 mm³ export of a 2,446 mm³ body.
+      const regionVolume = region.volumeMm3();
+      const restVolume = rest.volumeMm3();
+      const volumeAfter = regionVolume + restVolume;
+      const tolerance = Math.max(0.05, volumeBefore * 1e-3);
+      const conserved =
+        Number.isFinite(volumeAfter) &&
+        regionVolume > 0 &&
+        restVolume >= 0 &&
+        Math.abs(volumeAfter - volumeBefore) <= tolerance;
+
+      if (!conserved || region.isEmpty() || region.status() !== "NoError") {
+        region.dispose();
+        rest.dispose();
+        // Put the material back rather than dropping it on the floor.
+        remainder = backup;
+        warningsHe.push(
+          conserved
+            ? "אזור צבוע לא הפיק גוף — נשאר כחלק מהגוף הראשי"
+            : "אזור צבוע לא ניתן להפרדה נקייה (עומק גדול מדי ביחס לדופן) — נשאר כחלק מהגוף הראשי"
+        );
+        continue;
+      }
+      backup.dispose();
+      result.push({ materialSlotId: paint.materialSlotId, solid: region });
       remainder = rest;
-      warningsHe.push("אזור צבוע לא הפיק גוף — נשאר כחלק מהגוף הראשי");
-      continue;
     }
-    result.push({ materialSlotId: paint.materialSlotId, solid: region });
-    remainder = rest;
+  } catch (err) {
+    // Every solid still in flight belongs to this function; nothing outside
+    // holds a handle, so failing without freeing them leaks WASM memory on
+    // every export attempt.
+    remainder.dispose();
+    for (const piece of result) piece.solid.dispose();
+    throw err;
   }
 
   if (!remainder.isEmpty()) {
@@ -358,22 +436,32 @@ export interface PaintSplitResult {
   warningsHe: string[];
 }
 
-/** A printable part rebuilt from a mesh, sharing the source part's placement. */
+/**
+ * A printable part rebuilt from a mesh, sharing the source part's placement.
+ *
+ * Built field by field rather than by spreading `source`: the callers pass
+ * `BuiltPart`s, whose extra `geometry` handle is disposed by the next
+ * rebuild, and copying it here would hand every derived piece a dead GPU
+ * resource. `issues` is likewise reset — they described the whole body.
+ */
 function derivePart(
   source: PrintablePart,
   localMesh: MeshData,
   suffix: string,
   nameHe: string,
-  materialSlotId: string
+  materialSlotId: string,
+  watertight: boolean
 ): PrintablePart {
   const worldMesh = transformMeshData(localMesh, source.worldMatrix);
   const bounds = meshDataBounds(worldMesh);
   return {
-    ...source,
     id: `${source.id}${suffix}`,
     nameHe,
+    primaryLayerId: source.primaryLayerId,
+    layerIds: source.layerIds,
     materialSlotId,
     localMesh,
+    worldMatrix: source.worldMatrix,
     worldMesh,
     stats: {
       triangleCount: localMesh.indices.length / 3,
@@ -385,8 +473,9 @@ function derivePart(
         z: bounds.max.z - bounds.min.z,
       },
       bounds,
-      watertight: true,
+      watertight,
     },
+    issues: [],
   };
 }
 
@@ -406,7 +495,11 @@ export async function splitPartsByPaint(
   const slots = slotById(document);
   const anyPaint = parts.some((part) => {
     const layer = layerById.get(part.primaryLayerId);
-    return activePaints(layer?.facePaint, part.localMesh.indices.length / 3).length > 0;
+    const count = part.localMesh.indices.length / 3;
+    return (
+      activePaints(layer?.facePaint, count).length > 0 ||
+      hasStalePaint(layer?.facePaint, count)
+    );
   });
   if (!anyPaint) return { parts: [...parts], warningsHe: [] };
 
@@ -416,8 +509,17 @@ export async function splitPartsByPaint(
 
   for (const part of parts) {
     const layer = layerById.get(part.primaryLayerId);
-    const paints = activePaints(layer?.facePaint, part.localMesh.indices.length / 3);
+    const triangleCount = part.localMesh.indices.length / 3;
+    const paints = activePaints(layer?.facePaint, triangleCount);
     if (paints.length === 0) {
+      // Say it here too. The build reports it as a document issue, but a user
+      // who goes straight from editing to Export would otherwise get a
+      // single-colour ZIP with no explanation of the missing colour.
+      if (hasStalePaint(layer?.facePaint, triangleCount)) {
+        warningsHe.push(
+          `הצביעה בשכבה "${layer?.name ?? part.nameHe}" בוטלה — הגוף השתנה מאז שנצבע`
+        );
+      }
       out.push(part);
       continue;
     }
@@ -444,15 +546,26 @@ export async function splitPartsByPaint(
       continue;
     }
 
-    if (pieces.length <= 1) {
-      for (const piece of pieces) piece.solid.dispose();
-      out.push(part);
-      continue;
+    // One piece means the paint did not divide the body. That is legitimate
+    // when a region covers the whole thing — but the piece then carries the
+    // PAINTED material, and emitting the untouched part would hand the user a
+    // single file in the wrong colour with nothing said about it.
+    if (pieces.length === 1) {
+      const only = pieces[0];
+      if (only.materialSlotId === null) {
+        only.solid.dispose();
+        out.push(part);
+        continue;
+      }
+      warningsHe.push(
+        `האזור הצבוע מכסה את כל החלק "${part.nameHe}" — הוא ייוצא כחלק אחד בחומר הצבוע`
+      );
     }
 
     let index = 0;
     for (const piece of pieces) {
       const mesh = piece.solid.toMeshData();
+      const watertight = piece.solid.status() === "NoError" && !piece.solid.isEmpty();
       piece.solid.dispose();
       if (mesh.indices.length === 0) continue;
       const slot = piece.materialSlotId ? slots.get(piece.materialSlotId) : null;
@@ -464,7 +577,8 @@ export async function splitPartsByPaint(
           piece.materialSlotId
             ? `${part.nameHe} — ${slot?.nameHe ?? "צבע"}`
             : `${part.nameHe} — גוף`,
-          piece.materialSlotId ?? part.materialSlotId
+          piece.materialSlotId ?? part.materialSlotId,
+          watertight
         )
       );
     }

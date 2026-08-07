@@ -65,7 +65,7 @@ export function useDocumentBuilder(document: DesignDocument): DocumentBuilderSta
         }));
         return;
       }
-      void buildDocument(document).then((result) => {
+      buildDocument(document).then((result) => {
         if (generation !== generationRef.current) return;
         const parts: BuiltPart[] = result.parts.map((part) => ({
           ...part,
@@ -80,6 +80,31 @@ export function useDocumentBuilder(document: DesignDocument): DocumentBuilderSta
           buildResult: result,
           validation,
           buildId: prev.buildId + 1,
+        }));
+      })
+      // buildDocument catches per-layer and per-body failures itself, so a
+      // rejection here means the pipeline broke in a way it did not expect.
+      // Without this the editor simply stayed on "building" forever and the
+      // only trace was an unhandled rejection in the console.
+      .catch((err: unknown) => {
+        if (generation !== generationRef.current) return;
+        setState((prev) => ({
+          ...prev,
+          status: "error",
+          buildResult: {
+            status: "error",
+            parts: [],
+            issues: [
+              {
+                code: "document/build-crashed",
+                severity: "critical",
+                titleHe: "בניית המודל נעצרה בשגיאה",
+                detailHe: err instanceof Error ? err.message : String(err),
+                actionHe: "בטלו את הפעולה האחרונה או שנו את הפרמטרים",
+              },
+            ],
+          },
+          validation,
         }));
       });
     }, DEBOUNCE_MS);

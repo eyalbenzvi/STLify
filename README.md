@@ -86,11 +86,18 @@ the plan they were executed against.
   slot. The paint is metadata — the body stays one editable object — and at
   export each painted region is separated into its own watertight part, so a
   two-colour print is actually producible. The pieces reassemble exactly into
-  the original: nothing is lost or double-counted.
-- **Lattice vs nozzle check**: struts thinner than two nozzle widths are
-  refused with a reason.
-- **Thread chamfer and fit class**: a lead-in chamfer so a nut starts, and
-  6H/6g/loose classes driving the clearance.
+  the original: nothing is lost or double-counted. The paint depth is bounded
+  by the body's own thinnest dimension — a deeper region would turn the
+  offset copy inside out — and the user is told when that bound applies.
+- **Lattice vs nozzle check**: struts thinner than two nozzle widths raise a
+  warning naming the minimum the selected printer can actually resolve. It is
+  a warning rather than a refusal because a slicer set to a smaller extrusion
+  width can still print them; the nozzle comes from the document's printer,
+  so the check reflects the machine the design targets.
+- **Thread chamfer and fit class**: a lead-in chamfer at both ends so a nut
+  starts straight instead of cross-threading, and tight / normal / loose fit
+  classes (x0.5 / x1 / x1.75) scaling the clearance — which itself comes from
+  the calibration when the document has one.
 
 ## V4 features
 
