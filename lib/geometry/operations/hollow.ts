@@ -20,7 +20,7 @@ import type {
 import * as THREE from "three";
 import { getGeometryKernel, type GeometryKernel, type Solid } from "../kernel";
 import { matrix4ToManifoldMat4 } from "../transform";
-import { materializeWorldSolid, OpError, solidToResultLayer } from "./layerOps";
+import { materializeWorldSolid, OpError, solidToResultLayer, type OpHooks } from "./layerOps";
 
 /** Triangle budget for the erosion proxy (keeps minkowski tractable). */
 const EROSION_PROXY_MAX_TRIS = 6000;
@@ -70,12 +70,15 @@ function computeCavity(
 export async function performHollow(
   document: DesignDocument,
   layer: ShapeLayer,
-  settings: HollowSettings
+  settings: HollowSettings,
+  hooks: OpHooks = {}
 ): Promise<HollowOutcome> {
   if (settings.wallThicknessMm < 0.5) {
     throw new OpError("עובי דופן מינימלי לחלול הוא 0.5 מ״מ");
   }
   const kernel = await getGeometryKernel();
+  hooks.throwIfCancelled?.();
+  hooks.onProgress?.(0.15, "מכין את הגוף");
   const solid = await materializeWorldSolid(kernel, document, layer);
   if (!solid || solid.isEmpty()) {
     solid?.dispose();
@@ -86,6 +89,16 @@ export async function performHollow(
   const originalVolume = solid.volumeMm3();
   const bounds = solid.boundingBox();
 
+  // Last safe cancel point before the Minkowski erosion (the expensive,
+  // uninterruptible stage).
+  try {
+    hooks.throwIfCancelled?.();
+  } catch (err) {
+    solid.dispose();
+    throw err;
+  }
+  hooks.onProgress?.(0.35, "מחשב את החלל הפנימי");
+
   let cavity: Solid | null;
   try {
     cavity = computeCavity(kernel, solid, settings.wallThicknessMm, warningsHe);
@@ -93,6 +106,7 @@ export async function performHollow(
     solid.dispose();
     throw err;
   }
+  hooks.onProgress?.(0.75, "מחסר את החלל מהגוף");
   if (!cavity) {
     solid.dispose();
     throw new OpError("עובי הדופן גדול מדי — לא נותר חלל פנימי", [
@@ -184,7 +198,8 @@ function buildDrill(
 export async function performDrainHoles(
   document: DesignDocument,
   layer: ShapeLayer,
-  holes: DrainHoleDefinition[]
+  holes: DrainHoleDefinition[],
+  hooks: OpHooks = {}
 ): Promise<DrainOutcome> {
   if (holes.length === 0) throw new OpError("לא הוגדרו חורי ניקוז");
   for (const hole of holes) {
@@ -195,6 +210,8 @@ export async function performDrainHoles(
   }
 
   const kernel = await getGeometryKernel();
+  hooks.throwIfCancelled?.();
+  hooks.onProgress?.(0.15, "מכין את הגוף");
   let solid = await materializeWorldSolid(kernel, document, layer);
   if (!solid || solid.isEmpty()) {
     solid?.dispose();
@@ -204,7 +221,16 @@ export async function performDrainHoles(
   const warningsHe: string[] = [];
   const reachedCavity: boolean[] = [];
 
+  let holeIndex = 0;
   for (const hole of holes) {
+    // Safe per-hole cancel point: `solid` is the only live handle.
+    try {
+      hooks.throwIfCancelled?.();
+    } catch (err) {
+      solid.dispose();
+      throw err;
+    }
+    hooks.onProgress?.(0.2 + 0.7 * (holeIndex++ / holes.length), "קודח חור ניקוז");
     // Cavity-reach check on the CURRENT body: walking along the drill axis,
     // the first surface pair is the outer shell; a second entry surface
     // within the drill depth means the drill opens into an internal cavity.

@@ -12,11 +12,25 @@
  * `runGeometryJob` picks whichever is available (see ./client.ts).
  */
 
-import type { DesignDocument, ModelIssue } from "@/types/design";
+import type {
+  BooleanOperation,
+  DesignDocument,
+  DrainHoleDefinition,
+  HollowSettings,
+  ImportedMeshLayer,
+  ModelIssue,
+  ShapeLayer,
+} from "@/types/design";
+import { isShapeLayer } from "@/types/design";
 import { getGeometryKernel } from "../kernel";
 import { buildDocument, type DocumentBuildStatus, type PrintablePart } from "../buildDocument";
-import { storeMesh } from "../meshStore";
+import { getMesh, storeMesh } from "../meshStore";
 import type { MeshData } from "../meshData";
+import { performBoolean } from "../operations/booleans";
+import { performDrainHoles, performHollow } from "../operations/hollow";
+import { performThicken } from "../operations/meshRefine";
+import { analyzeThickness, type ThicknessAnalysis } from "../analysis/thickness";
+import { buildSupports, type SupportGenerationResult, type SupportSettings } from "../analysis/supports";
 import { cleanupComponents } from "../repair/cleanup";
 import { diagnoseMesh, repairMesh, type RepairOptions } from "../repair/diagnose";
 import { voxelRemesh } from "../repair/voxelRemesh";
@@ -57,7 +71,79 @@ export interface BuildDocumentJobResult {
   parts: WirePrintablePart[];
 }
 
+/**
+ * Wire form of an operation that produced a new ImportedMeshLayer: the layer
+ * references its mesh by id, and `resultMesh` carries the payload so the
+ * main thread can store it under the same id (the worker's store and the
+ * main store are separate).
+ */
+export interface DocOpJobResult {
+  layer: ImportedMeshLayer;
+  resultMesh: MeshData;
+  warningsHe: string[];
+}
+
+/** Payload core shared by the document-level operation jobs. */
+interface DocOpPayloadBase {
+  document: DesignDocument;
+  /** Mesh payloads the executing side may not have yet (see meshSync.ts). */
+  meshes: { id: string; mesh: MeshData }[];
+}
+
+/** Resolve layer ids to shape layers or fail with a clear message. */
+function shapeLayersById(document: DesignDocument, layerIds: string[]): ShapeLayer[] {
+  return layerIds.map((id) => {
+    const layer = document.layers.find((l) => l.id === id);
+    if (!layer || !isShapeLayer(layer)) {
+      throw new Error("שכבת המקור לא נמצאה במסמך — רעננו ונסו שוב");
+    }
+    return layer;
+  });
+}
+
+/** Package an op outcome layer + its mesh payload for the wire. */
+function withResultMesh<T extends { layer: ImportedMeshLayer }>(
+  outcome: T
+): T & { resultMesh: MeshData } {
+  const resultMesh = getMesh(outcome.layer.meshId);
+  if (!resultMesh) throw new Error("תוצאת הפעולה לא נמצאה בזיכרון");
+  return { ...outcome, resultMesh };
+}
+
 export interface GeometryJobMap {
+  docBoolean: {
+    payload: DocOpPayloadBase & { layerIds: string[]; kind: BooleanOperation["kind"] };
+    result: DocOpJobResult;
+  };
+  docHollow: {
+    payload: DocOpPayloadBase & { layerId: string; settings: HollowSettings };
+    result: DocOpJobResult & {
+      originalVolumeMm3: number;
+      hollowVolumeMm3: number;
+      savedFraction: number;
+    };
+  };
+  docThicken: {
+    payload: DocOpPayloadBase & { layerId: string; thicknessMm: number };
+    result: DocOpJobResult;
+  };
+  docDrainHoles: {
+    payload: DocOpPayloadBase & { layerId: string; holes: DrainHoleDefinition[] };
+    result: DocOpJobResult & { reachedCavity: boolean[] };
+  };
+  analyzeThickness: {
+    payload: {
+      mesh: MeshData;
+      minWallMm: number;
+      minFeatureMm: number;
+      maxSamples?: number;
+    };
+    result: ThicknessAnalysis;
+  };
+  buildSupports: {
+    payload: { mesh: MeshData; settings: SupportSettings };
+    result: { mesh: MeshData | null; result: SupportGenerationResult };
+  };
   buildDocument: {
     payload: {
       document: DesignDocument;
@@ -129,6 +215,81 @@ async function solidFrom(mesh: MeshData) {
 }
 
 export const JOB_HANDLERS: Handlers = {
+  docBoolean: async ({ document, meshes, layerIds, kind }, ctx) => {
+    for (const { id, mesh } of meshes) storeMesh(mesh, id);
+    const layers = shapeLayersById(document, layerIds);
+    const outcome = await performBoolean(document, layers, kind, {
+      onProgress: ctx.onProgress,
+      throwIfCancelled: ctx.throwIfCancelled,
+    });
+    ctx.onProgress(1, "הושלם");
+    return withResultMesh(outcome);
+  },
+
+  docHollow: async ({ document, meshes, layerId, settings }, ctx) => {
+    for (const { id, mesh } of meshes) storeMesh(mesh, id);
+    const [layer] = shapeLayersById(document, [layerId]);
+    const outcome = await performHollow(document, layer, settings, {
+      onProgress: ctx.onProgress,
+      throwIfCancelled: ctx.throwIfCancelled,
+    });
+    ctx.onProgress(1, "הושלם");
+    return withResultMesh(outcome);
+  },
+
+  docThicken: async ({ document, meshes, layerId, thicknessMm }, ctx) => {
+    for (const { id, mesh } of meshes) storeMesh(mesh, id);
+    const [layer] = shapeLayersById(document, [layerId]);
+    const outcome = await performThicken(document, layer, thicknessMm, {
+      onProgress: ctx.onProgress,
+      throwIfCancelled: ctx.throwIfCancelled,
+    });
+    ctx.onProgress(1, "הושלם");
+    return withResultMesh(outcome);
+  },
+
+  docDrainHoles: async ({ document, meshes, layerId, holes }, ctx) => {
+    for (const { id, mesh } of meshes) storeMesh(mesh, id);
+    const [layer] = shapeLayersById(document, [layerId]);
+    const outcome = await performDrainHoles(document, layer, holes, {
+      onProgress: ctx.onProgress,
+      throwIfCancelled: ctx.throwIfCancelled,
+    });
+    ctx.onProgress(1, "הושלם");
+    return withResultMesh(outcome);
+  },
+
+  analyzeThickness: async ({ mesh, minWallMm, minFeatureMm, maxSamples }, ctx) => {
+    ctx.onProgress(0.1, "טוען את הגוף");
+    const kernel = await getGeometryKernel();
+    const { solid, status } = kernel.fromMeshData(mesh);
+    if (status !== "NoError") {
+      solid.dispose();
+      throw new Error(`הרשת אינה תקינה (${status}) — לא ניתן לדגום עובי`);
+    }
+    ctx.throwIfCancelled();
+    ctx.onProgress(0.3, "דוגם עובי דופן");
+    try {
+      const analysis = analyzeThickness(solid, mesh, { minWallMm, minFeatureMm, maxSamples });
+      ctx.onProgress(1, "הושלם");
+      return analysis;
+    } finally {
+      solid.dispose();
+    }
+  },
+
+  buildSupports: async ({ mesh, settings }, ctx) => {
+    const kernel = await getGeometryKernel();
+    const { solid, result } = buildSupports(kernel, mesh, settings, {
+      onProgress: ctx.onProgress,
+      throwIfCancelled: ctx.throwIfCancelled,
+    });
+    const out = solid ? solid.toMeshData() : null;
+    solid?.dispose();
+    ctx.onProgress(1, "הושלם");
+    return { mesh: out, result };
+  },
+
   buildDocument: async ({ document, meshes }, ctx) => {
     // Seed this thread's mesh store with payloads it has not seen. Layers
     // reference meshes by id; the store is thread-local module state.

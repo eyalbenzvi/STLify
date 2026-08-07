@@ -43,11 +43,10 @@ import { createTemplateDocument, makeBaseLayer, makeHoleLayer, makeTextLayer, PR
 import { getGeometryKernel } from "@/lib/geometry/kernel";
 import { meshDataBounds } from "@/lib/geometry/meshData";
 import { getMesh, storeMesh } from "@/lib/geometry/meshStore";
-import { performBoolean } from "@/lib/geometry/operations/booleans";
 import { performPlaneCut, splitDisconnectedParts } from "@/lib/geometry/operations/cut";
 import { addConnectors } from "@/lib/geometry/operations/connectors";
-import { performDrainHoles, performHollow } from "@/lib/geometry/operations/hollow";
-import { performSimplify, performSmooth, performThicken } from "@/lib/geometry/operations/meshRefine";
+import { performSimplify, performSmooth } from "@/lib/geometry/operations/meshRefine";
+import { adoptDocOpResult, docOpMeshSync } from "@/lib/geometry/jobs/docOpsClient";
 import { OpError } from "@/lib/geometry/operations/layerOps";
 import {
   alignTransforms,
@@ -164,7 +163,6 @@ import {
 } from "@/lib/geometry/calibration";
 import {
   analyzeBridging,
-  buildSupports,
   DEFAULT_SUPPORT_SETTINGS,
 } from "@/lib/geometry/analysis/supports";
 import {
@@ -622,14 +620,27 @@ function EditorInner() {
       );
       if (!layer) return;
       void runOp("קדיחת חור ניקוז", async () => {
-        const result = await performDrainHoles(doc, layer, [
+        const sync = docOpMeshSync([layer]);
+        const jobResult = await jobs.run(
+          "docDrainHoles",
           {
-            diameterMm,
-            depthMm,
-            position: pick.point,
-            direction: { x: -pick.normal.x, y: -pick.normal.y, z: -pick.normal.z },
+            document: doc,
+            meshes: sync.meshes,
+            layerId: layer.id,
+            holes: [
+              {
+                diameterMm,
+                depthMm,
+                position: pick.point,
+                direction: { x: -pick.normal.x, y: -pick.normal.y, z: -pick.normal.z },
+              },
+            ],
           },
-        ]);
+          "קדיחת חור ניקוז",
+          { transferables: sync.transferables }
+        );
+        if (!jobResult) return; // cancelled
+        const result = adoptDocOpResult(jobResult);
         applyOpResult("חור ניקוז", [result.layer], [layer.id], "hide", [
           ...result.warningsHe,
           result.reachedCavity[0]
@@ -638,7 +649,7 @@ function EditorInner() {
         ]);
       });
     },
-    [drainPick, doc, runOp, applyOpResult, dispatch]
+    [drainPick, doc, runOp, applyOpResult, dispatch, jobs]
   );
 
   // ---- boolean / body operations -------------------------------------------
@@ -649,7 +660,22 @@ function EditorInner() {
       setBooleanKind(null);
       if (!kind || selectedShapeLayers.length < 2) return;
       void runOp("פעולה בוליאנית", async () => {
-        const outcome = await performBoolean(doc, selectedShapeLayers, kind);
+        // Runs as a registry job: in the worker where one exists, with
+        // progress and a cancel button; operand meshes sync on demand.
+        const sync = docOpMeshSync(selectedShapeLayers);
+        const result = await jobs.run(
+          "docBoolean",
+          {
+            document: doc,
+            meshes: sync.meshes,
+            layerIds: selectedShapeLayers.map((l) => l.id),
+            kind,
+          },
+          "פעולה בוליאנית",
+          { transferables: sync.transferables }
+        );
+        if (!result) return; // cancelled
+        const outcome = adoptDocOpResult(result);
         applyOpResult(
           kind === "union" ? "איחוד" : kind === "difference" ? "חיסור" : "חיתוך משותף",
           [outcome.layer],
@@ -659,7 +685,7 @@ function EditorInner() {
         );
       });
     },
-    [booleanKind, selectedShapeLayers, doc, runOp, applyOpResult]
+    [booleanKind, selectedShapeLayers, doc, runOp, applyOpResult, jobs]
   );
 
   const handleCutConfirm = useCallback(
@@ -722,14 +748,24 @@ function EditorInner() {
       const layer = singleSelectedShape;
       if (!layer) return;
       void runOp("חלול", async () => {
-        const outcome = await performHollow(doc, layer, settings);
+        // Minkowski erosion — the slowest operation in the app; run it as a
+        // job so the tab keeps painting and the user can cancel.
+        const sync = docOpMeshSync([layer]);
+        const result = await jobs.run(
+          "docHollow",
+          { document: doc, meshes: sync.meshes, layerId: layer.id, settings },
+          "חלול",
+          { transferables: sync.transferables }
+        );
+        if (!result) return; // cancelled
+        const outcome = adoptDocOpResult(result);
         applyOpResult("חלול", [outcome.layer], [layer.id], "hide", [
           `נחסכו ${(outcome.savedFraction * 100).toFixed(0)}% מהחומר (${((outcome.originalVolumeMm3 - outcome.hollowVolumeMm3) / 1000).toFixed(1)} סמ״ק)`,
           ...outcome.warningsHe,
         ]);
       });
     },
-    [singleSelectedShape, doc, runOp, applyOpResult]
+    [singleSelectedShape, doc, runOp, applyOpResult, jobs]
   );
 
   const handleThickenConfirm = useCallback(
@@ -738,11 +774,20 @@ function EditorInner() {
       const layer = singleSelectedShape;
       if (!layer) return;
       void runOp("עיבוי", async () => {
-        const outcome = await performThicken(doc, layer, thicknessMm);
+        // Minkowski dilation — same treatment as hollow: worker + cancel.
+        const sync = docOpMeshSync([layer]);
+        const result = await jobs.run(
+          "docThicken",
+          { document: doc, meshes: sync.meshes, layerId: layer.id, thicknessMm },
+          "עיבוי",
+          { transferables: sync.transferables }
+        );
+        if (!result) return; // cancelled
+        const outcome = adoptDocOpResult(result);
         applyOpResult("עיבוי", [outcome.layer], [layer.id], "hide", outcome.warningsHe);
       });
     },
-    [singleSelectedShape, doc, runOp, applyOpResult]
+    [singleSelectedShape, doc, runOp, applyOpResult, jobs]
   );
 
   const handleSmoothConfirm = useCallback(
@@ -1300,7 +1345,6 @@ function EditorInner() {
     const targets = selectedParts.length > 0 ? selectedParts : build.parts;
     if (targets.length === 0) return;
     void runOp("יצירת תמיכות", async () => {
-      const kernel = await getGeometryKernel();
       const profile = getPrintabilityProfile(doc.printabilityProfileId);
       const maxOverhangDeg =
         doc.customPrintability?.maxOverhangDeg ?? profile.maxOverhangDeg;
@@ -1308,18 +1352,33 @@ function EditorInner() {
       const layers: DesignLayer[] = [];
       const lines: string[] = [];
       for (const part of targets) {
-        const { solid, result } = buildSupports(kernel, part.worldMesh, {
-          ...DEFAULT_SUPPORT_SETTINGS,
-          maxOverhangDeg,
-        });
-        lines.push(`${part.nameHe}: ${result.summaryHe}`);
-        if (!solid) continue;
+        // Off-thread with progress + cancel. transferables=[] on purpose:
+        // worldMesh doubles as live analysis/export data on this thread and
+        // must not be detached by the postMessage.
+        const jobResult = await jobs.run(
+          "buildSupports",
+          {
+            mesh: part.worldMesh,
+            settings: { ...DEFAULT_SUPPORT_SETTINGS, maxOverhangDeg },
+          },
+          `יצירת תמיכות — ${part.nameHe}`,
+          { transferables: [] }
+        );
+        if (!jobResult) return; // cancelled
+        lines.push(`${part.nameHe}: ${jobResult.result.summaryHe}`);
+        if (!jobResult.mesh) continue;
+        const kernel = await getGeometryKernel();
+        const { solid, status } = kernel.fromMeshData(jobResult.mesh);
+        if (status !== "NoError" || solid.isEmpty()) {
+          solid.dispose();
+          continue;
+        }
         layers.push(
           generatorToLayer(
             solid,
             `${part.nameHe} — תמיכות`,
             doc.materialSlots[0]?.id ?? "slot1",
-            result.summaryHe
+            jobResult.result.summaryHe
           )
         );
       }
@@ -1331,7 +1390,7 @@ function EditorInner() {
       dispatch({ type: "ui/select", selection: layers.map((l) => l.id) });
       setMessage({ titleHe: "תמיכות נוצרו", bodyHe: lines.join("\n"), kind: "success" });
     });
-  }, [selectedParts, build.parts, doc, runOp, applyDocument, dispatch]);
+  }, [selectedParts, build.parts, doc, runOp, applyDocument, dispatch, jobs]);
 
   const handleCheckBridging = useCallback(() => {
     const targets = selectedParts.length > 0 ? selectedParts : build.parts;

@@ -26,9 +26,8 @@ import {
   type DocumentBuildResult,
   type PrintablePart,
 } from "../buildDocument";
-import { getMesh } from "../meshStore";
-import type { MeshData } from "../meshData";
-import { geometryWorkerAvailable, runGeometryJob, workerGeneration } from "./client";
+import { geometryWorkerAvailable, runGeometryJob } from "./client";
+import { collectUnsyncedMeshes, documentMeshIds, markMeshesSynced } from "./meshSync";
 import type { BuildDocumentJobResult } from "./registry";
 
 export interface BuildDocumentOutcome {
@@ -42,21 +41,6 @@ export interface BuildDocumentCallOptions {
   onProgress?: (fraction: number, labelHe: string) => void;
   /** Force the direct path (used by tests to compare both paths). */
   forceInProcess?: boolean;
-}
-
-/** Mesh ids the CURRENT worker already holds. */
-let knownMeshes = new Set<string>();
-let knownGeneration = -1;
-
-/** Mesh ids referenced by layers that resolve through the mesh store. */
-function referencedMeshIds(document: DesignDocument): string[] {
-  const ids: string[] = [];
-  for (const layer of document.layers) {
-    if (!layer.visible) continue;
-    if (layer.type === "importedMesh") ids.push(layer.meshId);
-    else if (layer.type === "imageRelief" && layer.meshId) ids.push(layer.meshId);
-  }
-  return ids;
 }
 
 function reviveParts(wire: BuildDocumentJobResult): DocumentBuildResult {
@@ -87,23 +71,7 @@ export async function buildDocumentViaJob(
     return { result, ranOn: "main" };
   }
 
-  const generation = workerGeneration();
-  if (generation !== knownGeneration) {
-    knownMeshes = new Set();
-    knownGeneration = generation;
-  }
-
-  const meshes: { id: string; mesh: MeshData }[] = [];
-  const transferables: ArrayBuffer[] = [];
-  for (const id of new Set(referencedMeshIds(document))) {
-    if (knownMeshes.has(id)) continue;
-    const mesh = getMesh(id);
-    if (!mesh) continue; // missing mesh is reported by the build itself
-    const positions = mesh.positions.slice();
-    const indices = mesh.indices.slice();
-    meshes.push({ id, mesh: { positions, indices } });
-    transferables.push(positions.buffer, indices.buffer);
-  }
+  const { meshes, transferables } = collectUnsyncedMeshes(documentMeshIds(document.layers));
 
   const { result, ranOn } = await runGeometryJob(
     "buildDocument",
@@ -115,8 +83,6 @@ export async function buildDocumentViaJob(
     }
   );
   // Mark as known only after success — a failed send retries the sync.
-  if (ranOn === "worker") {
-    for (const { id } of meshes) knownMeshes.add(id);
-  }
+  markMeshesSynced(meshes, ranOn);
   return { result: reviveParts(result), ranOn };
 }

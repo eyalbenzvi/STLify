@@ -17,7 +17,7 @@ import type {
 } from "@/types/design";
 import { getGeometryKernel } from "../kernel";
 import type { MeshData } from "../meshData";
-import { materializeWorldSolid, OpError, solidToResultLayer } from "./layerOps";
+import { materializeWorldSolid, OpError, solidToResultLayer, type OpHooks } from "./layerOps";
 
 // ---------------------------------------------------------------------------
 // Thicken
@@ -34,12 +34,15 @@ const DILATION_PROXY_MAX_TRIS = 6000;
 export async function performThicken(
   document: DesignDocument,
   layer: ShapeLayer,
-  thicknessMm: number
+  thicknessMm: number,
+  hooks: OpHooks = {}
 ): Promise<ThickenOutcome> {
   if (thicknessMm <= 0 || thicknessMm > 20) {
     throw new OpError("עובי ההוספה חייב להיות בין 0.1 ל-20 מ״מ");
   }
   const kernel = await getGeometryKernel();
+  hooks.throwIfCancelled?.();
+  hooks.onProgress?.(0.15, "מכין את הגוף");
   let solid = await materializeWorldSolid(kernel, document, layer);
   if (!solid || solid.isEmpty()) {
     solid?.dispose();
@@ -58,6 +61,14 @@ export async function performThicken(
     }
     warningsHe.push("המודל פושט מעט לפני העיבוי כדי לאפשר את החישוב");
   }
+  // Last safe cancel point before the Minkowski dilation.
+  try {
+    hooks.throwIfCancelled?.();
+  } catch (err) {
+    solid.dispose();
+    throw err;
+  }
+  hooks.onProgress?.(0.4, "מנפח את הגוף");
   const ball = kernel.sphere(thicknessMm, 8);
   const result = solid.minkowskiSum(ball);
   if (result.status() !== "NoError" || result.isEmpty()) {

@@ -21,7 +21,7 @@ import {
   type PrinterProfile,
 } from "@/types/profiles";
 import type { DocumentBuilderState } from "@/hooks/useDocumentBuilder";
-import { getGeometryKernel } from "@/lib/geometry/kernel";
+import { runGeometryJob } from "@/lib/geometry/jobs/client";
 import { meshDataBounds, transformMeshData } from "@/lib/geometry/meshData";
 import type { BuiltPart } from "@/hooks/useDocumentBuilder";
 import { matrix4ToTransform, transformToMatrix4 } from "@/lib/geometry/transform";
@@ -30,7 +30,6 @@ import {
   analyzeContact,
   analyzeFloatingParts,
   analyzeOverhangs,
-  analyzeThickness,
   overhangToVertexColors,
   suggestOrientations,
   thicknessToVertexColors,
@@ -80,7 +79,6 @@ export function useAnalysisRunner(context: AnalysisContext) {
     // Yield to paint the busy state before the synchronous analysis work.
     setTimeout(async () => {
       try {
-        const kernel = await getGeometryKernel();
         const profile = getPrintabilityProfile(doc.printabilityProfileId);
         const custom = doc.customPrintability;
         const minWall = custom?.minWallMm ?? profile.minWallMm;
@@ -102,13 +100,16 @@ export function useAnalysisRunner(context: AnalysisContext) {
           const floating = analyzeFloatingParts(mesh);
           const volume = analyzeBuildVolume(part.stats.bounds, printer);
 
-          const { solid, status } = kernel.fromMeshData(mesh);
+          // Ray-sampled wall thickness is the expensive analysis — it runs
+          // as a job (in the worker when one exists). transferables=[]: the
+          // worldMesh stays live on this thread for export and later runs.
           let thicknessIssues: ModelIssue[] = [];
-          if (status === "NoError") {
-            const thickness = analyzeThickness(solid, mesh, {
-              minWallMm: minWall,
-              minFeatureMm: minFeature,
-            });
+          try {
+            const { result: thickness } = await runGeometryJob(
+              "analyzeThickness",
+              { mesh, minWallMm: minWall, minFeatureMm: minFeature },
+              { transferables: [] }
+            );
             thicknessIssues = thickness.issues;
             colors.set(
               part.primaryLayerId,
@@ -116,8 +117,10 @@ export function useAnalysisRunner(context: AnalysisContext) {
                 ? overhangToVertexColors(mesh, overhang.triangleFlags)
                 : thicknessToVertexColors(mesh, thickness, minWall)
             );
+          } catch {
+            // A body the kernel refuses (non-manifold) simply reports no
+            // thickness data — the same silent skip as before V6.
           }
-          solid.dispose();
 
           const prefix = build.parts.length > 1 ? `${part.nameHe}: ` : "";
           for (const issue of [

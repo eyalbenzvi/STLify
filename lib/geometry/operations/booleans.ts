@@ -12,6 +12,7 @@ import {
   materializeWorldSolid,
   OpError,
   solidToResultLayer,
+  type OpHooks,
 } from "./layerOps";
 
 const KIND_NAMES_HE: Record<BooleanOperation["kind"], string> = {
@@ -36,7 +37,8 @@ export const MAX_BOOLEAN_OPERANDS = 6;
 export async function performBoolean(
   document: DesignDocument,
   layers: ShapeLayer[],
-  kind: BooleanOperation["kind"]
+  kind: BooleanOperation["kind"],
+  hooks: OpHooks = {}
 ): Promise<BooleanOpOutcome> {
   if (layers.length < 2) {
     throw new OpError("יש לבחור לפחות שתי שכבות לפעולה בוליאנית");
@@ -51,8 +53,26 @@ export async function performBoolean(
   const kernel = await getGeometryKernel();
   const warningsHe: string[] = [];
   const solids: Solid[] = [];
+  // Cancellation must escape unwrapped (the catch below turns other errors
+  // into OpError with fix suggestions, which would eat the cancel signal).
+  let cancelled = false;
+  const cancelPoint = () => {
+    if (!hooks.throwIfCancelled) return;
+    try {
+      hooks.throwIfCancelled();
+    } catch (err) {
+      cancelled = true;
+      throw err;
+    }
+  };
   try {
+    let operandIndex = 0;
     for (const layer of layers) {
+      cancelPoint();
+      hooks.onProgress?.(
+        0.1 + 0.5 * (operandIndex++ / layers.length),
+        `מכין את "${layer.name}"`
+      );
       const solid = await materializeWorldSolid(kernel, document, layer);
       if (!solid || solid.isEmpty()) {
         solid?.dispose();
@@ -77,6 +97,10 @@ export async function performBoolean(
         );
       }
     }
+
+    // Last safe cancel point: every operand is still individually owned.
+    cancelPoint();
+    hooks.onProgress?.(0.7, "מבצע את הפעולה הבוליאנית");
 
     let result: Solid;
     if (kind === "union") {
@@ -113,7 +137,7 @@ export async function performBoolean(
     return { layer, warningsHe };
   } catch (err) {
     for (const solid of solids) solid.dispose();
-    if (err instanceof OpError) throw err;
+    if (cancelled || err instanceof OpError) throw err;
     throw new OpError(
       `הפעולה "${KIND_NAMES_HE[kind]}" נכשלה: ${err instanceof Error ? err.message : String(err)}`,
       BOOLEAN_FIX_SUGGESTIONS_HE
