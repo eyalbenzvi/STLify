@@ -236,7 +236,14 @@ export interface MeshProvenance {
     | "smoothResult"
     | "simplifyResult"
     | "connectorResult"
-    | "imageRelief";
+    | "imageRelief"
+    /**
+     * Print-aid geometry. These kinds change EXPORT semantics: 3MF marks
+     * them so the slicer treats them as removable aids, not as the model.
+     */
+    | "supportResult"
+    | "brimResult"
+    | "raftResult";
   /** Original file name for stlImport. */
   fileName?: string;
   /** Hebrew description of the producing operation. */

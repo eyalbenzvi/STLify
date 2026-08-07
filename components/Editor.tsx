@@ -1378,7 +1378,8 @@ function EditorInner() {
             solid,
             `${part.nameHe} — תמיכות`,
             doc.materialSlots[0]?.id ?? "slot1",
-            jobResult.result.summaryHe
+            jobResult.result.summaryHe,
+            "supportResult"
           )
         );
       }
@@ -1918,6 +1919,17 @@ function EditorInner() {
           }
         }
 
+        // Generated supports export as SUPPORT objects, not model bodies —
+        // otherwise the slicer gives them full perimeters and infill and
+        // they come out too strong to snap off.
+        const roleOf = (part: PrintablePart): "model" | "support" => {
+          const layer = doc.layers.find((l) => l.id === part.primaryLayerId);
+          return layer?.type === "importedMesh" &&
+            layer.provenance.kind === "supportResult"
+            ? "support"
+            : "model";
+        };
+
         if (kind === "threemf") {
           const usage = USAGE_PROFILES.find((u) => u.id === doc.usageProfileId);
           const material =
@@ -1932,6 +1944,7 @@ function EditorInner() {
                 materialName: slot ? `${slot.nameHe} (${material.nameHe})` : material.nameHe,
                 vertices: part.worldMesh.positions,
                 triangles: part.worldMesh.indices,
+                role: roleOf(part),
               };
             }),
             fileName
@@ -1971,6 +1984,10 @@ function EditorInner() {
             materialSlot:
               doc.materialSlots.find((s) => s.id === part.materialSlotId) ?? null,
             triangleCount: part.stats.triangleCount,
+            printAidHe:
+              roleOf(part) === "support"
+                ? "חלק תמיכה — הדפיסו בהגדרות תמיכה (ללא מילוי מלא) והסירו לאחר ההדפסה"
+                : undefined,
           })),
           {
             designName: fileName,

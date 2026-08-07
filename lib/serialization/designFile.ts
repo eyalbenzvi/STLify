@@ -504,12 +504,22 @@ function sanitizeLayer(
         typeof raw.originalMeshId === "string"
           ? (meshIdMap.get(raw.originalMeshId) ?? null)
           : null;
+      // Print-aid kinds must survive a save/load round trip: the 3MF export
+      // marks supports/brim/raft by provenance, and a reloaded design whose
+      // supports had been flattened to "stlImport" would export them as
+      // model bodies — full infill, unbreakable. Other kinds still collapse
+      // to "stlImport" (they carry no export semantics).
+      const rawKind = String(provenance.kind ?? "");
+      const preservedKind =
+        rawKind === "supportResult" || rawKind === "brimResult" || rawKind === "raftResult"
+          ? (rawKind as "supportResult" | "brimResult" | "raftResult")
+          : "stlImport";
       return {
         ...common,
         type: "importedMesh",
         meshId,
         provenance: {
-          kind: "stlImport",
+          kind: preservedKind,
           fileName: boundedString(provenance.fileName, "", 200) || undefined,
           descriptionHe: boundedString(provenance.descriptionHe, "", 300) || undefined,
         },

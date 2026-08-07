@@ -26,6 +26,12 @@ export interface ThreeMfPart {
   vertices: Float32Array;
   /** CCW triangle indices. */
   triangles: Uint32Array;
+  /**
+   * What the part IS to the slicer. Generated supports/brims/rafts must not
+   * export as model bodies — a slicer would give them full perimeters and
+   * infill and they would come out too strong to snap off. Default "model".
+   */
+  role?: "model" | "support";
 }
 
 const CONTENT_TYPES = `<?xml version="1.0" encoding="UTF-8"?>
@@ -69,16 +75,22 @@ export function buildModelXml(parts: ThreeMfPart[], designTitle: string): string
   chunks.push(' <metadata name="Application">PrintCraft STL Studio</metadata>');
   chunks.push(" <resources>");
 
+  // Wrapper component objects for supports (allocated after the per-part id
+  // pairs so the existing id scheme is untouched).
+  let nextExtraId = parts.length * 2 + 2;
+  const buildItems: string[] = [];
+
   parts.forEach((part, index) => {
     const materialId = index * 2 + 1;
     const objectId = index * 2 + 2;
+    const role = part.role ?? "model";
     chunks.push(`  <basematerials id="${materialId}">`);
     chunks.push(
       `   <base name="${xmlEscape(part.materialName || part.name)}" displaycolor="${displayColor(part.colorHex)}"/>`
     );
     chunks.push("  </basematerials>");
     chunks.push(
-      `  <object id="${objectId}" type="model" name="${xmlEscape(part.name)}" pid="${materialId}" pindex="0">`
+      `  <object id="${objectId}" type="${role}" name="${xmlEscape(part.name)}" pid="${materialId}" pindex="0">`
     );
     chunks.push("   <mesh>");
     chunks.push("    <vertices>");
@@ -95,13 +107,30 @@ export function buildModelXml(parts: ThreeMfPart[], designTitle: string): string
     chunks.push("    </triangles>");
     chunks.push("   </mesh>");
     chunks.push("  </object>");
+
+    if (role === "support") {
+      // The Core spec forbids referencing a type="support" object directly
+      // from the build; it must arrive via a components element of a model
+      // object. The wrapper carries the identity, the typed object carries
+      // the meaning — a slicer that understands support objects prints them
+      // as removable aids, one that does not still sees valid geometry.
+      const wrapperId = nextExtraId++;
+      chunks.push(
+        `  <object id="${wrapperId}" type="model" name="${xmlEscape(part.name)}">`
+      );
+      chunks.push("   <components>");
+      chunks.push(`    <component objectid="${objectId}"/>`);
+      chunks.push("   </components>");
+      chunks.push("  </object>");
+      buildItems.push(`  <item objectid="${wrapperId}"/>`);
+    } else {
+      buildItems.push(`  <item objectid="${objectId}"/>`);
+    }
   });
 
   chunks.push(" </resources>");
   chunks.push(" <build>");
-  parts.forEach((_, index) => {
-    chunks.push(`  <item objectid="${index * 2 + 2}"/>`);
-  });
+  chunks.push(...buildItems);
   chunks.push(" </build>");
   chunks.push("</model>");
   return chunks.join("\n");

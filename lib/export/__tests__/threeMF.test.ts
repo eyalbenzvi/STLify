@@ -85,3 +85,33 @@ describe("3MF export", () => {
     expect(() => buildThreeMf([], "x")).toThrow();
   });
 });
+
+describe("3MF support marking (V6 item 10)", () => {
+  it("marks support parts distinct from model parts", () => {
+    const model = cubePart("גוף", "#2f6feb");
+    const support = { ...cubePart("תמיכות", "#8a8f98"), role: "support" as const };
+    const xml = buildModelXml([model, support], "בדיקה");
+
+    // The model part keeps type="model"; the support part is typed as such.
+    expect(xml).toContain('<object id="2" type="model" name="גוף"');
+    expect(xml).toContain('<object id="4" type="support" name="תמיכות"');
+
+    // The Core spec forbids build items referencing a support object
+    // directly — it must arrive through a components wrapper of type model.
+    expect(xml).not.toContain('<item objectid="4"/>');
+    expect(xml).toContain('<component objectid="4"/>');
+    const wrapperMatch = xml.match(
+      /<object id="(\d+)" type="model" name="תמיכות">\s*<components>\s*<component objectid="4"\/>/
+    );
+    expect(wrapperMatch).not.toBeNull();
+    expect(xml).toContain(`<item objectid="${wrapperMatch![1]}"/>`);
+  });
+
+  it("emits no wrapper and no support types when all parts are models", () => {
+    const xml = buildModelXml([cubePart("א", "#2f6feb"), cubePart("ב", "#8a8f98")], "בדיקה");
+    expect(xml).not.toContain('type="support"');
+    expect(xml).not.toContain("<components>");
+    expect(xml).toContain('<item objectid="2"/>');
+    expect(xml).toContain('<item objectid="4"/>');
+  });
+});
