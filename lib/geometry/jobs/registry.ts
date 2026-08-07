@@ -12,7 +12,10 @@
  * `runGeometryJob` picks whichever is available (see ./client.ts).
  */
 
+import type { DesignDocument, ModelIssue } from "@/types/design";
 import { getGeometryKernel } from "../kernel";
+import { buildDocument, type DocumentBuildStatus, type PrintablePart } from "../buildDocument";
+import { storeMesh } from "../meshStore";
 import type { MeshData } from "../meshData";
 import { cleanupComponents } from "../repair/cleanup";
 import { diagnoseMesh, repairMesh, type RepairOptions } from "../repair/diagnose";
@@ -39,7 +42,34 @@ export class JobCancelledError extends Error {
   }
 }
 
+/**
+ * A PrintablePart in wire form: THREE.Matrix4 does not survive structured
+ * clone (it would arrive as a plain object), so the placement crosses the
+ * boundary as its 16 column-major elements and is revived by the client.
+ */
+export interface WirePrintablePart extends Omit<PrintablePart, "worldMatrix"> {
+  worldMatrixElements: number[];
+}
+
+export interface BuildDocumentJobResult {
+  status: DocumentBuildStatus;
+  issues: ModelIssue[];
+  parts: WirePrintablePart[];
+}
+
 export interface GeometryJobMap {
+  buildDocument: {
+    payload: {
+      document: DesignDocument;
+      /**
+       * Mesh payloads the executing side may not have yet. The worker keeps
+       * its own mesh store, so a mesh travels across ONCE per session; the
+       * in-process path re-stores them under the same ids (idempotent).
+       */
+      meshes: { id: string; mesh: MeshData }[];
+    };
+    result: BuildDocumentJobResult;
+  };
   repairMesh: {
     payload: { mesh: MeshData; options: RepairOptions };
     result: Awaited<ReturnType<typeof repairMesh>>;
@@ -99,6 +129,26 @@ async function solidFrom(mesh: MeshData) {
 }
 
 export const JOB_HANDLERS: Handlers = {
+  buildDocument: async ({ document, meshes }, ctx) => {
+    // Seed this thread's mesh store with payloads it has not seen. Layers
+    // reference meshes by id; the store is thread-local module state.
+    for (const { id, mesh } of meshes) storeMesh(mesh, id);
+    ctx.throwIfCancelled();
+    const result = await buildDocument(document, {
+      onProgress: ctx.onProgress,
+      throwIfCancelled: ctx.throwIfCancelled,
+    });
+    ctx.onProgress(1, "הושלם");
+    return {
+      status: result.status,
+      issues: result.issues,
+      parts: result.parts.map((part) => {
+        const { worldMatrix, ...rest } = part;
+        return { ...rest, worldMatrixElements: worldMatrix.toArray() as number[] };
+      }),
+    };
+  },
+
   repairMesh: async ({ mesh, options }, ctx) => {
     ctx.onProgress(0.05, "מנתח את הרשת");
     ctx.throwIfCancelled();

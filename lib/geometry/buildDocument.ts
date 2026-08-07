@@ -96,6 +96,18 @@ export interface DocumentBuildResult {
   issues: ModelIssue[];
 }
 
+/**
+ * Progress and cancellation hooks, used when the build runs as a job.
+ *
+ * `throwIfCancelled` throws the CALLER's cancellation error; buildDocument
+ * guarantees that anything it throws propagates out with every solid built
+ * so far disposed — a cancelled build must not leak WASM memory.
+ */
+export interface BuildDocumentOptions {
+  onProgress?: (fraction: number, labelHe: string) => void;
+  throwIfCancelled?: () => void;
+}
+
 export function findBaseLayer(document: DesignDocument): BaseLayer | null {
   for (const layer of document.layers) {
     if (layer.type === "base") return layer;
@@ -569,11 +581,14 @@ function bodyToPart(document: DesignDocument, body: PartBody): PrintablePart {
 
 /** Build all printable parts of a document. */
 export async function buildDocument(
-  document: DesignDocument
+  document: DesignDocument,
+  options: BuildDocumentOptions = {}
 ): Promise<DocumentBuildResult> {
   const kernel = await getGeometryKernel();
   const issues: ModelIssue[] = [];
   const holes: HoleLayer[] = [];
+  const onProgress = options.onProgress ?? (() => undefined);
+  const cancelPoint = () => options.throwIfCancelled?.();
 
   interface BuiltShape {
     layer: ShapeLayer;
@@ -597,7 +612,21 @@ export async function buildDocument(
   }
 
   const visibleLayers = document.layers.filter((l) => l.visible);
+  let layerIndex = 0;
   for (const layer of visibleLayers) {
+    // Cancellation and progress live OUTSIDE the per-layer try: the catch
+    // below exists to turn a broken layer into an issue and keep building,
+    // which is exactly the wrong treatment for "stop building".
+    try {
+      cancelPoint();
+    } catch (err) {
+      for (const b of built) b.solid.dispose();
+      throw err;
+    }
+    onProgress(
+      0.05 + 0.55 * (layerIndex++ / Math.max(1, visibleLayers.length)),
+      `בונה את השכבה "${layer.name}"`
+    );
     if (layer.type === "hole") {
       holes.push(layer);
       continue;
@@ -652,6 +681,18 @@ export async function buildDocument(
             ],
     };
   }
+
+  // Safe cancellation boundary: every solid built so far is still owned by
+  // `built`, so all of them can be disposed. (Inside the assembly below,
+  // handles are progressively consumed by booleans — a mid-assembly cancel
+  // could not tell live handles from consumed ones.)
+  try {
+    cancelPoint();
+  } catch (err) {
+    for (const b of built) b.solid.dispose();
+    throw err;
+  }
+  onProgress(0.65, "מאחד גופים");
 
   const bodies: PartBody[] = [];
   try {
@@ -737,6 +778,16 @@ export async function buildDocument(
     });
     return { status: "error", parts: [], issues };
   }
+
+  // Second safe boundary: assembly is done, every live handle sits in
+  // `bodies`.
+  try {
+    cancelPoint();
+  } catch (err) {
+    for (const body of bodies) body.solid.dispose();
+    throw err;
+  }
+  onProgress(0.85, "מכין חלקים להצגה");
 
   const parts: PrintablePart[] = [];
   for (const body of bodies) {

@@ -2540,6 +2540,10 @@ function EditorInner() {
               // driven by the real geometry pipeline, so watching it is how
               // the tests prove an operation actually ran.
               data-testid="viewport-dimensions"
+              // Honest execution-path report of the last completed build:
+              // "worker" or "main". The e2e suite pins the worker path here —
+              // a silent fallback would otherwise be invisible.
+              data-build-ran-on={build.ranOn ?? ""}
               className="pointer-events-none absolute bottom-3 start-3 rounded-md bg-white/85 px-3 py-1.5 font-mono text-xs text-slate-700 shadow-sm"
               dir="ltr"
             >
@@ -2550,7 +2554,14 @@ function EditorInner() {
           {(busy || build.status === "building") && (
             <div className="pointer-events-none absolute end-3 top-3 flex items-center gap-2 rounded-md bg-white/90 px-3 py-1.5 text-xs text-slate-600 shadow">
               <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-blue-500 border-t-transparent" />
-              {state.ui.busyLabelHe ?? "בונה מודל…"}
+              {state.ui.busyLabelHe ??
+                (build.progress
+                  ? `${build.progress.labelHe} · ${Math.round(build.progress.fraction * 100)}%`
+                  : // ranOn reports the LAST completed build; when it fell back
+                    // to the main thread the next builds will too, so say so.
+                    build.ranOn === "main"
+                    ? "בונה מודל… (בחלון הראשי)"
+                    : "בונה מודל…")}
             </div>
           )}
           {build.status === "invalid" && (
