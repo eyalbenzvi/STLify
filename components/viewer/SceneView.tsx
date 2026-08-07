@@ -14,7 +14,7 @@
  * arrives via props from the editor shell.
  */
 
-import { Canvas, useThree, type ThreeEvent } from "@react-three/fiber";
+import { Canvas, invalidate, useThree, type ThreeEvent } from "@react-three/fiber";
 import { GizmoHelper, GizmoViewport, Grid, Html, Line, OrbitControls, TransformControls } from "@react-three/drei";
 import {
   memo,
@@ -171,6 +171,7 @@ const PartMesh = memo(function PartMesh({
     group.quaternion.copy(quaternion);
     group.scale.copy(scale);
     group.updateMatrix();
+    invalidate();
   }, [part.worldMatrix, part]);
 
   // Vertex colors for analysis overlays.
@@ -184,6 +185,9 @@ const PartMesh = memo(function PartMesh({
     // Imperative three.js buffer invalidation — external-system sync.
     // eslint-disable-next-line react-hooks/immutability
     geometry.attributes.position.needsUpdate = true;
+    // Attribute swaps happen outside the React commit, so the demand
+    // frameloop has to be told about them explicitly.
+    invalidate();
   }, [part.geometry, overlay, overlayColors]);
 
   const useVertexColors = overlay !== "none" && overlayColors !== null;
@@ -199,6 +203,8 @@ const PartMesh = memo(function PartMesh({
       material.onBeforeCompile = () => undefined;
       material.needsUpdate = true;
     }
+    // Shader recompilation is imperative — repaint on demand.
+    invalidate();
   }, [printPreview.enabled, printPreview.layerHeightMm]);
 
   const bbox = useMemo(() => {
@@ -307,6 +313,24 @@ function PendingPoint({ point }: { point: THREE.Vector3 }) {
       <meshBasicMaterial color="#f59e0b" depthTest={false} transparent opacity={0.9} />
     </mesh>
   );
+}
+
+/**
+ * Repaints once after EVERY commit of the scene tree.
+ *
+ * The canvas runs `frameloop="demand"`, so a missed invalidation is a frozen
+ * viewport. R3F invalidates automatically when ITS elements change, but this
+ * scene also mutates three objects inside effects (group poses, buffer
+ * attributes, shader recompiles) and those are invisible to the reconciler.
+ * The imperative spots call `invalidate()` themselves; this catch-all covers
+ * every prop-driven change (tool, selection, overlay, section, measurements,
+ * xray, building, …) so no tool mode can be forgotten.
+ */
+function InvalidateOnUpdate() {
+  useEffect(() => {
+    invalidate();
+  });
+  return null;
 }
 
 function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string) => void }) {
@@ -450,6 +474,7 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
 
   return (
     <>
+      <InvalidateOnUpdate />
       <color attach="background" args={["#eef2f7"]} />
       <ambientLight intensity={0.55} />
       <directionalLight position={[60, -80, 120]} intensity={1.1} />
@@ -482,6 +507,9 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
           rotationSnap={snap.enabled ? (snap.rotationDeg * Math.PI) / 180 : null}
           scaleSnap={snap.enabled ? snap.scaleStep : null}
           onMouseUp={commitGizmo}
+          // A drag mutates the object outside React; each change event asks
+          // the demand frameloop for a repaint or the drag appears frozen.
+          onChange={() => invalidate()}
           size={0.8}
         />
       )}
@@ -700,6 +728,7 @@ function CameraFocus({ target }: { target: { x: number; y: number; z: number } |
     controls.target.copy(next);
     camera.position.copy(next).add(offset);
     controls.update();
+    invalidate();
   }, [target, controls, camera]);
 
   return null;
@@ -714,6 +743,11 @@ export function SceneView(
         camera={{ position: [0, -160, 110], up: [0, 0, 1], fov: 40, near: 0.1, far: 3000 }}
         className="h-full w-full"
         gl={{ localClippingEnabled: true }}
+        // The scene is static between edits — rendering 60fps for nothing
+        // burned battery, and unbounded dpr rendered 4x the pixels on Retina.
+        // Every change point calls invalidate(); see InvalidateOnUpdate.
+        frameloop="demand"
+        dpr={[1, 2]}
       >
         <SceneContent {...props} />
       </Canvas>
