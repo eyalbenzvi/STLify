@@ -390,6 +390,21 @@ function compact(mesh: MeshData): MeshData {
   return { positions: new Float32Array(positions), indices };
 }
 
+/**
+ * Planarity test for the UI, using the same tolerance push/pull enforces.
+ *
+ * Exported so the panel can disable the button BEFORE the click rather than
+ * letting the operation fail — the tolerance must be the identical value or
+ * the button and the operation would disagree.
+ */
+export function isSelectionPlanarForUi(
+  mesh: MeshData,
+  adjacency: MeshAdjacency,
+  selected: ReadonlySet<number>
+): boolean {
+  return isSelectionPlanar(mesh, adjacency, selected, 0.05);
+}
+
 // ---------------------------------------------------------------------------
 // Region report
 // ---------------------------------------------------------------------------

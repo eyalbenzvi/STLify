@@ -54,6 +54,10 @@ export interface ToolsPanelProps {
   onInspectMesh: () => void;
   onCheckInterference: () => void;
   onArrangePlate: () => void;
+  onRevolve: () => void;
+  onEmboss: () => void;
+  /** True when the selection is a profile that can be revolved. */
+  canRevolve: boolean;
   /** Number of printable parts currently in the document. */
   partCount: number;
 }
@@ -102,6 +106,7 @@ export function ToolsPanel(props: ToolsPanelProps) {
     selectedPartCount,
     busy,
     partCount,
+    canRevolve,
   } = props;
   const single = selectedPartCount === 1;
   const singleShape = selectedShapeCount === 1;
@@ -317,6 +322,18 @@ export function ToolsPanel(props: ToolsPanelProps) {
             title="מילוי ג׳ירואיד / חלת דבש — חוסך חומר ושומר על קשיחות"
             disabled={!singleShape || busy}
             onClick={props.onLattice}
+          />
+          <ToolButton
+            label="סיבוב פרופיל"
+            title="הופך סקיצה או SVG לגוף סיבובי — כוס, אגרטל, כפתור"
+            disabled={!canRevolve || busy}
+            onClick={props.onRevolve}
+          />
+          <ToolButton
+            label="הטבעה על משטח"
+            title="עוטף או מקרין טקסט/SVG על גוף מעוקל"
+            disabled={!singleShape || busy || partCount < 2}
+            onClick={props.onEmboss}
           />
         </div>
       </div>

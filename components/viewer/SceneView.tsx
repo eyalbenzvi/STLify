@@ -70,6 +70,10 @@ export interface SceneViewProps {
    * same location can be revisited.
    */
   focusTarget?: { x: number; y: number; z: number } | null;
+  /** Highlighted triangles on one body, from the sub-object selection. */
+  faceSelection?: { layerId: string; triangles: number[] } | null;
+  /** Fired in faceSelect mode with the clicked triangle. */
+  onFacePick?: (primaryLayerId: string, triangleIndex: number, additive: boolean) => void;
 }
 
 /** Material color for a part, honouring its material slot. */
@@ -319,6 +323,8 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
     onAddMeasurement,
     onRemoveMeasurement,
     focusTarget,
+    faceSelection,
+    onFacePick,
   } = props;
 
   const { gl } = useThree();
@@ -360,7 +366,11 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
     return [new THREE.Plane(normal, section.offsetMm * (section.flip ? -1 : 1))];
   }, [section]);
 
-  const pickMode = tool === "measure" || tool === "placeOnSurface" || tool === "drainHole";
+  const pickMode =
+    tool === "measure" ||
+    tool === "placeOnSurface" ||
+    tool === "drainHole" ||
+    tool === "faceSelect";
 
   const handlePartClick = useCallback(
     (event: ThreeEvent<MouseEvent>, part: BuiltPart) => {
@@ -373,6 +383,18 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
           onAddMeasurement(pendingPoint, point);
           setPendingPoint(null);
         }
+        return;
+      }
+      if (tool === "faceSelect") {
+        // three.js reports faceIndex against the rendered geometry, which is
+        // the part's local mesh — the same triangle ordering the region
+        // operations use, so the index carries straight through.
+        if (event.faceIndex === undefined || event.faceIndex === null) return;
+        onFacePick?.(
+          part.primaryLayerId,
+          event.faceIndex,
+          event.ctrlKey || event.metaKey || event.shiftKey
+        );
         return;
       }
       if (tool === "placeOnSurface" || tool === "drainHole") {
@@ -391,7 +413,7 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
       }
       onSelect([part.primaryLayerId], event.ctrlKey || event.metaKey || event.shiftKey);
     },
-    [tool, pendingPoint, onAddMeasurement, onSurfacePick, onSelect]
+    [tool, pendingPoint, onAddMeasurement, onSurfacePick, onSelect, onFacePick]
   );
 
   // Gizmo target: the single selected layer that owns a part.
@@ -456,6 +478,14 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
         />
       )}
 
+      {faceSelection && (
+        <FaceSelectionHighlight
+          parts={parts}
+          selection={faceSelection}
+          clippingPlanes={clippingPlanes}
+        />
+      )}
+
       {measurements.map((m) => (
         <MeasurementView key={m.id} measurement={m} onRemove={onRemoveMeasurement} />
       ))}
@@ -483,6 +513,68 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
       <OrbitControls makeDefault enableDamping />
       <CameraFocus target={focusTarget ?? null} />
     </>
+  );
+}
+
+/**
+ * Draws the selected triangles on top of the body.
+ *
+ * Rendered as its own geometry rather than by recolouring vertices, because
+ * a selection changes far more often than the body does and rebuilding the
+ * part's own buffers on every click would stutter. `polygonOffset` keeps the
+ * highlight from z-fighting with the surface it sits on.
+ */
+function FaceSelectionHighlight({
+  parts,
+  selection,
+  clippingPlanes,
+}: {
+  parts: BuiltPart[];
+  selection: { layerId: string; triangles: number[] };
+  clippingPlanes: THREE.Plane[];
+}) {
+  const part = parts.find((p) => p.primaryLayerId === selection.layerId);
+
+  const geometry = useMemo(() => {
+    if (!part || selection.triangles.length === 0) return null;
+    const source = part.localMesh;
+    const triangleCount = source.indices.length / 3;
+    const positions = new Float32Array(selection.triangles.length * 9);
+    let cursor = 0;
+    for (const t of selection.triangles) {
+      if (t < 0 || t >= triangleCount) continue;
+      for (let k = 0; k < 3; k++) {
+        const v = source.indices[t * 3 + k] * 3;
+        positions[cursor++] = source.positions[v];
+        positions[cursor++] = source.positions[v + 1];
+        positions[cursor++] = source.positions[v + 2];
+      }
+    }
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute("position", new THREE.BufferAttribute(positions.subarray(0, cursor), 3));
+    geom.computeVertexNormals();
+    return geom;
+  }, [part, selection.triangles]);
+
+  useEffect(() => () => geometry?.dispose(), [geometry]);
+
+  if (!part || !geometry) return null;
+  return (
+    <group matrixAutoUpdate={false} matrix={part.worldMatrix}>
+      <mesh geometry={geometry} renderOrder={2}>
+        <meshBasicMaterial
+          color="#f59e0b"
+          transparent
+          opacity={0.75}
+          side={THREE.DoubleSide}
+          depthTest
+          polygonOffset
+          polygonOffsetFactor={-2}
+          polygonOffsetUnits={-2}
+          clippingPlanes={clippingPlanes}
+        />
+      </mesh>
+    </group>
   );
 }
 

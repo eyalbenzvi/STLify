@@ -155,3 +155,4 @@ export function disposeGeometryWorker(): void {
 }
 
 export { JobCancelledError };
+export type { GeometryJobMap, GeometryJobName };

@@ -38,12 +38,15 @@ export interface LayerListPanelProps {
   onDeleteLayer: (id: string) => void;
   onDuplicateLayer: (id: string) => void;
   onMoveLayer: (id: string, direction: -1 | 1) => void;
+  /** Re-parent a layer, or detach it with null. */
+  onReparent: (childId: string, parentId: string | null) => void;
 }
 
 export function LayerListPanel({
   document,
   selection,
   onSelect,
+  onReparent,
   onUpdateLayer,
   onDeleteLayer,
   onDuplicateLayer,
@@ -85,8 +88,10 @@ export function LayerListPanel({
                 aria-hidden
                 className="w-5 text-center text-xs text-slate-400"
                 title={TYPE_NAMES_HE[layer.type]}
+                // Indent children so the hierarchy is visible at a glance.
+                style={layer.parentId ? { marginInlineStart: 12 } : undefined}
               >
-                {TYPE_ICONS[layer.type]}
+                {layer.parentId ? "└" : TYPE_ICONS[layer.type]}
               </span>
               {renaming === layer.id ? (
                 <input
@@ -161,6 +166,22 @@ export function LayerListPanel({
               <IconButton label="שכפול השכבה" onClick={() => onDuplicateLayer(layer.id)}>
                 ⧉
               </IconButton>
+              <select
+                aria-label={`שכבת אב עבור ${layer.name}`}
+                title="שכבת אב — הזזת האב מזיזה את הבן איתו"
+                className="max-w-[70px] rounded border border-slate-200 bg-white px-1 py-0.5 text-[10px] text-slate-500"
+                value={layer.parentId ?? ""}
+                onChange={(e) => onReparent(layer.id, e.target.value || null)}
+              >
+                <option value="">ללא אב</option>
+                {document.layers
+                  .filter((other) => other.id !== layer.id)
+                  .map((other) => (
+                    <option key={other.id} value={other.id}>
+                      {other.name}
+                    </option>
+                  ))}
+              </select>
               <IconButton
                 label="מחיקת השכבה"
                 onClick={() => onDeleteLayer(layer.id)}

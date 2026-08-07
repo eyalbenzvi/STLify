@@ -13,9 +13,11 @@ import type {
   HoleLayer,
   ImageReliefLayer,
   ImportedMeshLayer,
+  SketchLayer,
   SvgLayer,
   TextLayer,
 } from "@/types/design";
+import { PivotControls, PrimitiveProps, SketchProps } from "./PrimitiveProps";
 import { FONTS, fontHasBold } from "@/lib/geometry/fonts";
 import { PARAM_RANGES } from "@/lib/geometry/types";
 import { getMesh } from "@/lib/geometry/meshStore";
@@ -40,6 +42,25 @@ export function PropertiesPanel({ document, layer, onUpdate }: PropertiesPanelPr
       )}
       {layer.type === "importedMesh" && <MeshProps layer={layer} />}
       {layer.type === "hole" && <HoleProps layer={layer} onUpdate={onUpdate} />}
+      {layer.type === "primitive" && <PrimitiveProps layer={layer} onUpdate={onUpdate} />}
+      {layer.type === "sketch" && (
+        <SketchProps
+          layer={layer}
+          onUpdate={onUpdate}
+          extraControls={
+            <>
+              <CombineSelect
+                document={document}
+                value={layer.combine}
+                onChange={(combine) => onUpdate({ combine }, "מצב שילוב")}
+              />
+              <BevelControls layer={layer} onUpdate={onUpdate} />
+            </>
+          }
+        />
+      )}
+
+      <PivotControls layer={layer} onUpdate={onUpdate} />
 
       <MaterialSlotSelect document={document} layer={layer} onUpdate={onUpdate} />
 
@@ -117,7 +138,7 @@ function BevelControls({
   layer,
   onUpdate,
 }: {
-  layer: TextLayer | SvgLayer | ImageReliefLayer;
+  layer: TextLayer | SvgLayer | ImageReliefLayer | SketchLayer;
   onUpdate: (patch: Partial<DesignLayer>, labelHe: string) => void;
 }) {
   return (

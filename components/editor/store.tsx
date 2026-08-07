@@ -39,7 +39,26 @@ export type EditorTool =
   | "scale"
   | "measure"
   | "placeOnSurface"
-  | "drainHole";
+  | "drainHole"
+  /** Pick individual faces of one body for direct editing. */
+  | "faceSelect";
+
+/** How a face click expands into a region. */
+export type FaceGrowMode = "triangle" | "coplanar" | "connected" | "similarNormal";
+
+/**
+ * Triangles selected on ONE body.
+ *
+ * Deliberately scoped to a single layer: every direct-editing operation acts
+ * on one body, and a selection spanning two bodies has no meaning for
+ * push/pull or split. Selecting a face on a different body replaces the
+ * selection rather than merging.
+ */
+export interface FaceSelection {
+  layerId: string;
+  /** Triangle indices into the part's mesh. */
+  triangles: number[];
+}
 
 export type OverlayMode = "none" | "thickness" | "overhang";
 
@@ -64,6 +83,10 @@ export interface PrintPreviewState {
 
 export interface EditorUiState {
   selection: string[];
+  faceSelection: FaceSelection | null;
+  faceGrowMode: FaceGrowMode;
+  /** Angle tolerance for coplanar / similar-normal growth, degrees. */
+  faceGrowAngleDeg: number;
   tool: EditorTool;
   transformSpace: "world" | "local";
   snap: SnapSettings;
@@ -92,6 +115,9 @@ export type EditorAction =
   /** Jump N steps back (negative) or forward (positive) in one action. */
   | { type: "history/jump"; delta: number }
   | { type: "ui/select"; selection: string[] }
+  | { type: "ui/setFaceSelection"; selection: FaceSelection | null }
+  | { type: "ui/setFaceGrowMode"; mode: FaceGrowMode }
+  | { type: "ui/setFaceGrowAngle"; degrees: number }
   | { type: "ui/setTool"; tool: EditorTool }
   | { type: "ui/setTransformSpace"; space: "world" | "local" }
   | { type: "ui/setSnap"; snap: Partial<SnapSettings> }
@@ -107,6 +133,9 @@ export type EditorAction =
 
 const initialUi: EditorUiState = {
   selection: [],
+  faceSelection: null,
+  faceGrowMode: "coplanar",
+  faceGrowAngleDeg: 5,
   tool: "select",
   transformSpace: "world",
   snap: { enabled: false, positionMm: 1, rotationDeg: 15, scaleStep: 0.1 },
@@ -207,9 +236,37 @@ function reducer(state: EditorState, action: EditorAction): EditorState {
       };
     }
     case "ui/select":
-      return { ...state, ui: { ...state.ui, selection: action.selection } };
+      // Changing which BODY is selected invalidates any face selection on the
+      // previous one — triangle indices are meaningless across bodies.
+      return {
+        ...state,
+        ui: {
+          ...state.ui,
+          selection: action.selection,
+          faceSelection:
+            state.ui.faceSelection &&
+            action.selection.includes(state.ui.faceSelection.layerId)
+              ? state.ui.faceSelection
+              : null,
+        },
+      };
+    case "ui/setFaceSelection":
+      return { ...state, ui: { ...state.ui, faceSelection: action.selection } };
+    case "ui/setFaceGrowMode":
+      return { ...state, ui: { ...state.ui, faceGrowMode: action.mode } };
+    case "ui/setFaceGrowAngle":
+      return { ...state, ui: { ...state.ui, faceGrowAngleDeg: action.degrees } };
     case "ui/setTool":
-      return { ...state, ui: { ...state.ui, tool: action.tool } };
+      // Leaving face-select mode clears the highlight so it cannot be acted
+      // on from a tool that does not understand it.
+      return {
+        ...state,
+        ui: {
+          ...state.ui,
+          tool: action.tool,
+          faceSelection: action.tool === "faceSelect" ? state.ui.faceSelection : null,
+        },
+      };
     case "ui/setTransformSpace":
       return { ...state, ui: { ...state.ui, transformSpace: action.space } };
     case "ui/setSnap":
