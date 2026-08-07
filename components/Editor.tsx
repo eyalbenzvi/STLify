@@ -15,7 +15,7 @@ import {
   useRef,
   useState,
 } from "react";
-import * as THREE from "three";
+import type * as THREE from "three";
 import type {
   BooleanOperationKind,
   ConnectorDefinition,
@@ -42,8 +42,6 @@ import {
 import {
   getPrintabilityProfile,
   getPrinterProfile,
-  MATERIAL_PROFILES,
-  USAGE_PROFILES,
   type PrinterProfile,
 } from "@/types/profiles";
 import { useDocumentBuilder, type BuiltPart } from "@/hooks/useDocumentBuilder";
@@ -101,31 +99,18 @@ import type { FilletSettings, ShellSettings } from "@/lib/geometry/operations/fi
 import type { LatticeSettings } from "@/lib/geometry/operations/lattice";
 import { buildPattern, PatternError, type PatternSettings } from "@/lib/geometry/operations/pattern";
 import {
-  arrangeOnPlate,
-  convexHullXY,
   detectInterference,
   type InterferenceReport,
 } from "@/lib/geometry/analysis/collision";
-import {
-  matrix4ToTransform,
-  snapTransformNoise,
-  transformToMatrix4,
-} from "@/lib/geometry/transform";
-import {
-  buildEnclosure,
-  buildGear,
-  buildLivingHinge,
-  buildSnapFit,
-  buildThread,
-  type ThreadFitClass,
-  buildToleranceTest,
-  GeneratorError,
-} from "@/lib/geometry/generators";
+import { arrangePartsOnPlate } from "@/lib/geometry/operations/plateArrange";
+import { GeneratorError } from "@/lib/geometry/generators";
 import { downloadBlob } from "@/lib/export/download";
-import { meshDataToBinaryStl } from "@/lib/export/stlData";
 import type { PrintablePart } from "@/lib/geometry/buildDocument";
-import { buildMultiPartZip } from "@/lib/export/package";
-import { buildThreeMf, matrixToThreeMfTransform } from "@/lib/export/threeMF";
+import {
+  buildStlExport,
+  buildThreeMfExport,
+  buildZipExport,
+} from "@/lib/export/exportDocument";
 import { DESIGN_FILE_EXTENSION, DesignFileError, serializeDesignFile } from "@/lib/serialization/designFile";
 import { decodeShareHash, encodeShareHash, SHARE_HASH_PREFIX, shareLinkEligibility } from "@/lib/serialization/shareLink";
 import type { ModelIssue } from "@/types/design";
@@ -159,7 +144,13 @@ import { ExportDialog, type ExportKind } from "@/components/dialogs/ExportDialog
 import { LibraryDialog } from "@/components/dialogs/LibraryDialog";
 import { ShortcutsDialog } from "@/components/dialogs/ShortcutsDialog";
 import { actionForEvent, loadKeymap, type Keymap } from "@/lib/keyboard/keymap";
-import { CreatePanel, type GeneratorKind } from "@/components/editor/CreatePanel";
+import { CreatePanel } from "@/components/editor/CreatePanel";
+import { buildGeneratorLayers } from "@/lib/geometry/generators/buildGeneratorLayers";
+import {
+  type GeneratorKind,
+  type GeneratorParams,
+} from "@/lib/geometry/generators/specs";
+import { GeneratorDialog } from "@/components/dialogs/GeneratorDialog";
 import {
   SubObjectPanel,
   type PaintInfo,
@@ -177,7 +168,6 @@ import {
 } from "@/lib/geometry/painting";
 import { CalibrationPanel, CustomPrinterPanel } from "@/components/editor/CalibrationPanel";
 import {
-  clearanceForFit,
   documentNozzleDiameterMm,
   type CalibrationSettings,
 } from "@/lib/geometry/calibration";
@@ -230,13 +220,11 @@ import {
   ModifierEditDialog,
   RecoveryDialog,
   RevolveDialog,
-  GeneratorDialog,
   InterferenceDialog,
   LatticeDialog,
   MeshInspectorDialog,
   PatternDialog,
   ShellDialog,
-  type GeneratorParams,
 } from "@/components/dialogs/AdvancedDialogs";
 import { BaseModeSwitchDialog, OrientationDialog } from "@/components/dialogs/MiscDialogs";
 import type { SurfacePick } from "@/components/viewer/SceneView";
@@ -262,23 +250,6 @@ export function Editor() {
   );
 }
 
-/** Hebrew handling note for print-aid parts in the ZIP README. */
-function printAidNote(doc: DesignDocument, part: PrintablePart): string | undefined {
-  const layer = doc.layers.find((l) => l.id === part.primaryLayerId);
-  if (layer?.type !== "importedMesh") return undefined;
-  switch (layer.provenance.kind) {
-    case "supportResult":
-      return "חלק תמיכה — הדפיסו בהגדרות תמיכה (ללא מילוי מלא) והסירו לאחר ההדפסה";
-    case "brimResult":
-      return "Brim — טבעת הצמדה למשטח; קלפו אותה מהחלק לאחר ההדפסה";
-    case "raftResult":
-      return "Raft — משטח בסיס; הפרידו את החלק ממנו לאחר ההדפסה";
-    default:
-      return undefined;
-  }
-}
-
-/** Read a File as ArrayBuffer. */
 function EditorInner() {
   const { state, dispatch, document: doc, selection, selectedLayers, canUndo, canRedo } =
     useEditor();
@@ -956,131 +927,9 @@ function EditorInner() {
   const handleGeneratorConfirm = useCallback(
     (kind: GeneratorKind, params: GeneratorParams) => {
       setGeneratorKind(null);
-      const num = (key: string, fallback: number): number =>
-        typeof params[key] === "number" ? (params[key] as number) : fallback;
-      const bool = (key: string, fallback: boolean): boolean =>
-        typeof params[key] === "boolean" ? (params[key] as boolean) : fallback;
-      const slot = primaryMaterialSlotId(doc);
-
       void runOp("יצירת חלק פרמטרי", async () => {
         const kernel = await getGeometryKernel();
-        const layers: DesignLayer[] = [];
-        switch (kind) {
-          case "thread": {
-            const internal = bool("internal", false);
-            const rawFit = params.fitClass;
-            const fitClass: ThreadFitClass =
-              rawFit === "tight" || rawFit === "loose" ? rawFit : "normal";
-            const solid = buildThread(kernel, {
-              diameterMm: num("diameterMm", 8),
-              pitchMm: num("pitchMm", 1.25),
-              lengthMm: num("lengthMm", 20),
-              internal,
-              // A calibrated machine knows its own clearance; the dialog's
-              // default is only a guess for a machine nobody measured.
-              clearanceMm: doc.calibration
-                ? clearanceForFit(doc.calibration, "sliding")
-                : num("clearanceMm", 0.4),
-              fitClass,
-              chamferMm: num("chamferMm", 0.6),
-              segments: 48,
-            });
-            layers.push(
-              generatorToLayer(
-                solid,
-                internal ? "כלי חיתוך להברגה פנימית" : "הברגה",
-                slot,
-                `הברגה M${num("diameterMm", 8)}×${num("pitchMm", 1.25)}`
-              )
-            );
-            break;
-          }
-          case "gear": {
-            const solid = buildGear(kernel, {
-              teeth: num("teeth", 20),
-              moduleMm: num("moduleMm", 2),
-              thicknessMm: num("thicknessMm", 6),
-              pressureAngleDeg: 20,
-              boreDiameterMm: num("boreDiameterMm", 6),
-              backlashMm: num("backlashMm", 0.1),
-            });
-            layers.push(
-              generatorToLayer(
-                solid,
-                `גלגל שיניים ${num("teeth", 20)}Z`,
-                slot,
-                `מודול ${num("moduleMm", 2)}, ${num("teeth", 20)} שיניים`
-              )
-            );
-            break;
-          }
-          case "enclosure": {
-            const { box, lid } = buildEnclosure(kernel, {
-              innerWidthMm: num("innerWidthMm", 60),
-              innerDepthMm: num("innerDepthMm", 40),
-              innerHeightMm: num("innerHeightMm", 25),
-              wallMm: num("wallMm", 2),
-              floorMm: num("floorMm", 2),
-              cornerRadiusMm: num("cornerRadiusMm", 3),
-              lipHeightMm: num("lipHeightMm", 4),
-              // The calibration panel promises enclosures derive from the
-              // measured value; until now they took the dialog's guess.
-              clearanceMm: doc.calibration
-                ? clearanceForFit(doc.calibration, "sliding")
-                : num("clearanceMm", 0.2),
-            });
-            layers.push(generatorToLayer(box, "מארז — קופסה", slot, "גוף המארז"));
-            const lidLayer = generatorToLayer(lid, "מארז — מכסה", slot, "מכסה המארז");
-            // Park the lid beside the box so both are visible and printable.
-            lidLayer.transform.x += num("innerWidthMm", 60) + num("wallMm", 2) * 2 + 10;
-            layers.push(lidLayer);
-            break;
-          }
-          case "livingHinge": {
-            const solid = buildLivingHinge(kernel, {
-              widthMm: num("widthMm", 40),
-              lengthMm: num("lengthMm", 30),
-              thicknessMm: num("thicknessMm", 2),
-              hingeThicknessMm: num("hingeThicknessMm", 0.5),
-              grooveCount: num("grooveCount", 3),
-              grooveWidthMm: num("grooveWidthMm", 1),
-            });
-            layers.push(generatorToLayer(solid, "ציר חי", slot, "פאנל מתקפל"));
-            break;
-          }
-          case "snapFit": {
-            const solid = buildSnapFit(kernel, {
-              lengthMm: num("lengthMm", 15),
-              widthMm: num("widthMm", 6),
-              thicknessMm: num("thicknessMm", 1.5),
-              hookDepthMm: num("hookDepthMm", 1),
-              insertionAngleDeg: num("insertionAngleDeg", 30),
-              retentionAngleDeg: num("retentionAngleDeg", 75),
-            });
-            layers.push(generatorToLayer(solid, "תפס", slot, "וו הצמדה גמיש"));
-            break;
-          }
-          case "toleranceTest": {
-            const { plate, pin, clearancesMm } = buildToleranceTest(kernel, {
-              pinDiameterMm: num("pinDiameterMm", 5),
-              clearancesMm: [0.1, 0.2, 0.3, 0.4, 0.5],
-              thicknessMm: num("thicknessMm", 4),
-              spacingMm: num("spacingMm", 12),
-            });
-            layers.push(
-              generatorToLayer(
-                plate,
-                "מבחן סבולות — לוחית",
-                slot,
-                `מרווחים: ${clearancesMm.join(" / ")} מ״מ`
-              )
-            );
-            const pinLayer = generatorToLayer(pin, "מבחן סבולות — פין", slot, "פין בדיקה");
-            pinLayer.transform.y += num("spacingMm", 12);
-            layers.push(pinLayer);
-            break;
-          }
-        }
+        const layers = buildGeneratorLayers(kernel, doc, kind, params);
         applyDocument({ ...doc, layers: [...doc.layers, ...layers] }, "יצירת חלק פרמטרי");
         dispatch({ type: "ui/select", selection: layers.map((l) => l.id) });
       });
@@ -1264,79 +1113,13 @@ function EditorInner() {
   }, [build.parts, runOp]);
 
   const handleArrangePlate = useCallback(() => {
-    const layerById = new Map(doc.layers.map((l) => [l.id, l]));
-    const items = build.parts.map((part) => {
-      const layer = layerById.get(part.primaryLayerId);
-      const currentX = (part.stats.bounds.min.x + part.stats.bounds.max.x) / 2;
-      const currentY = (part.stats.bounds.min.y + part.stats.bounds.max.y) / 2;
-      // The REAL footprint: convex hull of the world mesh's XY projection
-      // (relative to the part centre) — a diagonal part stops costing its
-      // huge axis-aligned box.
-      const points: [number, number][] = [];
-      const pos = part.worldMesh.positions;
-      for (let i = 0; i < pos.length; i += 3) {
-        points.push([pos[i] - currentX, pos[i + 1] - currentY]);
-      }
-      return {
-        layerId: part.primaryLayerId,
-        widthMm: part.stats.dimensionsMm.x,
-        depthMm: part.stats.dimensionsMm.y,
-        currentX,
-        currentY,
-        hull: convexHullXY(points),
-        // Rotation composes into the layer transform, which is only sound
-        // for a free-standing layer — parents and pivots change what a Z
-        // rotation about the part centre means.
-        allowRotation: !!layer && !layer.locked && !layer.parentId && !layer.pivot,
-      };
-    });
-    if (items.length === 0) return;
-    const result = arrangeOnPlate(items, {
-      plateWidthMm: printer.buildVolumeMm.x,
-      plateDepthMm: printer.buildVolumeMm.y,
-      spacingMm: 5,
-    });
-    const byLayer = new Map(result.placements.map((p) => [p.layerId, p]));
-    const layers = doc.layers.map((layer) => {
-      const placement = byLayer.get(layer.id);
-      if (!placement) return layer;
-      const item = items.find((i) => i.layerId === layer.id);
-      if (!item) return layer;
-      if (placement.rotationDeg !== 0) {
-        // Rotate about the part's current centre, then move the centre to
-        // its shelf position — composed on the layer's own matrix.
-        const rad = (placement.rotationDeg * Math.PI) / 180;
-        const pivotRotation = new THREE.Matrix4()
-          .makeTranslation(item.currentX, item.currentY, 0)
-          .multiply(new THREE.Matrix4().makeRotationZ(rad))
-          .multiply(new THREE.Matrix4().makeTranslation(-item.currentX, -item.currentY, 0));
-        const move = new THREE.Matrix4().makeTranslation(
-          placement.x - item.currentX,
-          placement.y - item.currentY,
-          0
-        );
-        const next = move.multiply(pivotRotation).multiply(transformToMatrix4(layer.transform));
-        return {
-          ...layer,
-          transform: snapTransformNoise(matrix4ToTransform(next)),
-        } as DesignLayer;
-      }
-      // Placements are absolute plate positions; shift the layer transform by
-      // the delta so any local offset baked into the mesh is preserved.
-      return {
-        ...layer,
-        transform: {
-          ...layer.transform,
-          x: layer.transform.x + (placement.x - item.currentX),
-          y: layer.transform.y + (placement.y - item.currentY),
-        },
-      } as DesignLayer;
-    });
-    applyDocument({ ...doc, layers }, "סידור אוטומטי על המשטח");
+    const arranged = arrangePartsOnPlate(doc, build.parts, printer);
+    if (!arranged) return;
+    applyDocument({ ...doc, layers: arranged.layers }, "סידור אוטומטי על המשטח");
     setMessage({
       titleHe: "סידור אוטומטי",
-      bodyHe: result.summaryHe,
-      kind: result.unplaced.length > 0 ? "info" : "success",
+      bodyHe: arranged.summaryHe,
+      kind: arranged.unplacedCount > 0 ? "info" : "success",
     });
   }, [build.parts, doc, printer, applyDocument]);
 
@@ -2142,106 +1925,16 @@ function EditorInner() {
           }
         }
 
-        // Generated supports export as SUPPORT objects, not model bodies —
-        // otherwise the slicer gives them full perimeters and infill and
-        // they come out too strong to snap off.
-        const roleOf = (part: PrintablePart): "model" | "support" => {
-          const layer = doc.layers.find((l) => l.id === part.primaryLayerId);
-          return layer?.type === "importedMesh" &&
-            layer.provenance.kind === "supportResult"
-            ? "support"
-            : "model";
-        };
-
-        if (kind === "threemf") {
-          const usage = USAGE_PROFILES.find((u) => u.id === doc.usageProfileId);
-          const material =
-            MATERIAL_PROFILES.find((m) => m.id === usage?.suggestedMaterialId) ??
-            MATERIAL_PROFILES[0];
-          const blob = buildThreeMf(
-            parts.map((part) => {
-              const slot = doc.materialSlots.find((s) => s.id === part.materialSlotId);
-              // LOCAL geometry placed by a build transform — the slicer sees
-              // a movable object, so repositioning there needs no re-bake
-              // here. The layer hierarchy travels as an assembly: a child
-              // part rides its parent's assembly object at its relative
-              // placement.
-              const layer = doc.layers.find((l) => l.id === part.primaryLayerId);
-              const parentPart = layer?.parentId
-                ? parts.find((p) => p.primaryLayerId === layer.parentId)
-                : undefined;
-              const relativeTransform = parentPart
-                ? matrixToThreeMfTransform(
-                    parentPart.worldMatrix.clone().invert().multiply(part.worldMatrix)
-                      .elements
-                  )
-                : undefined;
-              return {
-                id: part.id,
-                name: part.nameHe,
-                colorHex: slot?.colorHex ?? "#8a8f98",
-                materialName: slot ? `${slot.nameHe} (${material.nameHe})` : material.nameHe,
-                vertices: part.localMesh.positions,
-                triangles: part.localMesh.indices,
-                role: roleOf(part),
-                buildTransform: matrixToThreeMfTransform(part.worldMatrix.elements),
-                parentId: parentPart?.id ?? null,
-                relativeTransform,
-              };
-            }),
-            fileName
-          );
-          downloadBlob(blob, `${fileName}.3mf`);
-          return;
-        }
-        if (kind === "stl") {
-          // Merge all parts (world space) into one binary STL.
-          let totalVerts = 0;
-          let totalIdx = 0;
-          for (const part of build.parts) {
-            totalVerts += part.worldMesh.positions.length;
-            totalIdx += part.worldMesh.indices.length;
-          }
-          const positions = new Float32Array(totalVerts);
-          const indices = new Uint32Array(totalIdx);
-          let vOffset = 0;
-          let iOffset = 0;
-          for (const part of build.parts) {
-            positions.set(part.worldMesh.positions, vOffset * 3);
-            for (let i = 0; i < part.worldMesh.indices.length; i++) {
-              indices[iOffset + i] = part.worldMesh.indices[i] + vOffset;
-            }
-            vOffset += part.worldMesh.positions.length / 3;
-            iOffset += part.worldMesh.indices.length;
-          }
-          downloadBlob(meshDataToBinaryStl({ positions, indices }), `${fileName}.stl`);
-          return;
-        }
-        // ZIP of separate parts.
-        const zip = await buildMultiPartZip(
-          parts.map((part, index) => ({
-            fileBaseName: `${fileName}-${index + 1}-${part.nameHe}`,
-            nameHe: part.nameHe,
-            mesh: part.worldMesh,
-            materialSlot:
-              doc.materialSlots.find((s) => s.id === part.materialSlotId) ?? null,
-            triangleCount: part.stats.triangleCount,
-            printAidHe: printAidNote(doc, part),
-          })),
-          {
-            designName: fileName,
-            connectorsInfoHe: doc.layers
-              .filter(
-                (l): l is ImportedMeshLayer =>
-                  l.type === "importedMesh" && l.provenance.kind === "connectorResult"
-              )
-              .map((l) => l.provenance.descriptionHe ?? "מחברים"),
-          }
-        );
-        downloadBlob(zip, `${fileName}.zip`);
+        const output =
+          kind === "threemf"
+            ? buildThreeMfExport(doc, parts, fileName)
+            : kind === "stl"
+              ? buildStlExport(parts, fileName)
+              : await buildZipExport(doc, parts, fileName);
+        downloadBlob(output.blob, output.fileName);
       });
     },
-    [doc, build.parts, runOp, setMessage]
+    [doc, build.parts, runOp]
   );
 
   // ---- layers / mode -----------------------------------------------------------

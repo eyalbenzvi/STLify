@@ -10,14 +10,11 @@
  */
 
 import { PRIMITIVE_NAMES_HE, type PrimitiveKind } from "@/types/design";
-
-export type GeneratorKind =
-  | "thread"
-  | "gear"
-  | "enclosure"
-  | "livingHinge"
-  | "snapFit"
-  | "toleranceTest";
+import {
+  GENERATOR_KINDS,
+  GENERATOR_SPECS,
+  type GeneratorKind,
+} from "@/lib/geometry/generators/specs";
 
 /** Names come from the shared table so the menu and the layer agree. */
 const PRIMITIVE_ICONS: Record<PrimitiveKind, string> = {
@@ -36,14 +33,11 @@ const PRIMITIVES = (Object.keys(PRIMITIVE_ICONS) as PrimitiveKind[]).map((kind) 
   icon: PRIMITIVE_ICONS[kind],
 }));
 
-const GENERATORS: { kind: GeneratorKind; labelHe: string; hintHe: string }[] = [
-  { kind: "thread", labelHe: "הברגה", hintHe: "בורג או אום בתקן ISO" },
-  { kind: "gear", labelHe: "גלגל שיניים", hintHe: "פרופיל אבולבנטי אמיתי" },
-  { kind: "enclosure", labelHe: "מארז", hintHe: "קופסה עם מכסה מותאם" },
-  { kind: "livingHinge", labelHe: "ציר חי", hintHe: "פאנל מתקפל" },
-  { kind: "snapFit", labelHe: "תפס", hintHe: "וו הצמדה גמיש" },
-  { kind: "toleranceTest", labelHe: "מבחן סבולות", hintHe: "כיול דיוק המדפסת" },
-];
+const GENERATORS = GENERATOR_KINDS.map((kind) => ({
+  kind,
+  labelHe: GENERATOR_SPECS[kind].labelHe,
+  hintHe: GENERATOR_SPECS[kind].hintHe,
+}));
 
 export interface CreatePanelProps {
   busy: boolean;
