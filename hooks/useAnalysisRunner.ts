@@ -36,6 +36,12 @@ import {
   type OrientationCandidate,
 } from "@/lib/geometry/analysis";
 import { estimateDetailed, type DetailedEstimateResult } from "@/lib/geometry/analysis/estimateDetailed";
+import {
+  estimateFromSlices,
+  mergeSliceMetrics,
+  type SliceMetrics,
+  type SlicedEstimateResult,
+} from "@/lib/geometry/analysis/estimateSliced";
 
 /** Everything the analysis runner needs from the editor shell. */
 export interface AnalysisContext {
@@ -52,7 +58,7 @@ export interface AnalysisContext {
   setAnalysisBusy: (busy: boolean) => void;
   setModelIssues: (issues: ModelIssue[]) => void;
   setOverlayColors: (colors: Map<string, Float32Array>) => void;
-  setEstimate: (estimate: DetailedEstimateResult | null) => void;
+  setEstimate: (estimate: DetailedEstimateResult | SlicedEstimateResult | null) => void;
   setOrientationCandidates: (candidates: OrientationCandidate[] | null) => void;
 }
 
@@ -150,17 +156,41 @@ export function useAnalysisRunner(context: AnalysisContext) {
             z: bounds.z,
           };
         }
+        const estimateInputs = {
+          modelVolumeMm3: totalVolume,
+          boundsMm: bounds,
+          technology: profile.technology,
+          layerHeightMm: layerHeight,
+          nozzleDiameterMm: custom?.nozzleDiameterMm ?? profile.nozzleDiameterMm,
+          infillPercent: usage?.suggestedInfillPct ?? 20,
+          densityGCm3: material.densityGCm3,
+          pricePerKgIls: material.pricePerKgIls,
+        };
+        // Slice-measured time model: perimeter length, cross-section area
+        // and island count per layer, priced per component. A part the
+        // slicer cannot load falls back to the old volume-only model —
+        // honestly, with no component breakdown and lower confidence.
+        const sliceMetrics: SliceMetrics[] = [];
+        for (const part of build.parts) {
+          try {
+            const { result } = await runGeometryJob(
+              "measureSlices",
+              { mesh: part.worldMesh, layerHeightMm: layerHeight },
+              { transferables: [] }
+            );
+            sliceMetrics.push(result);
+          } catch {
+            // fall through to the volume-only estimate below
+          }
+        }
+        const merged =
+          sliceMetrics.length === build.parts.length
+            ? mergeSliceMetrics(sliceMetrics)
+            : null;
         setEstimate(
-          estimateDetailed({
-            modelVolumeMm3: totalVolume,
-            boundsMm: bounds,
-            technology: profile.technology,
-            layerHeightMm: layerHeight,
-            nozzleDiameterMm: custom?.nozzleDiameterMm ?? profile.nozzleDiameterMm,
-            infillPercent: usage?.suggestedInfillPct ?? 20,
-            densityGCm3: material.densityGCm3,
-            pricePerKgIls: material.pricePerKgIls,
-          })
+          merged
+            ? estimateFromSlices(estimateInputs, merged)
+            : estimateDetailed(estimateInputs)
         );
       } catch (err) {
         showError(err, "ניתוח המודל נכשל");

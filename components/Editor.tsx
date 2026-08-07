@@ -63,6 +63,7 @@ import {
 } from "@/lib/geometry/operations/placement";
 import type { OrientationCandidate } from "@/lib/geometry/analysis";
 import type { DetailedEstimateResult } from "@/lib/geometry/analysis/estimateDetailed";
+import type { SlicedEstimateResult } from "@/lib/geometry/analysis/estimateSliced";
 import { attemptMeshRepair } from "@/lib/geometry/repair/repair";
 import { StlImportError } from "@/lib/import/stl";
 import { SvgImportError } from "@/lib/import/svg";
@@ -274,7 +275,7 @@ function EditorInner() {
   const [modeSwitchTarget, setModeSwitchTarget] = useState<"withBase" | "baseless" | null>(null);
   const [modelIssues, setModelIssues] = useState<ModelIssue[]>([]);
   const [overlayColors, setOverlayColors] = useState<Map<string, Float32Array>>(new Map());
-  const [estimate, setEstimate] = useState<DetailedEstimateResult | null>(null);
+  const [estimate, setEstimate] = useState<DetailedEstimateResult | SlicedEstimateResult | null>(null);
   const [analysisBusy, setAnalysisBusy] = useState(false);
   const [filletOpen, setFilletOpen] = useState(false);
   const [shellOpen, setShellOpen] = useState(false);

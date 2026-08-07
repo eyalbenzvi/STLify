@@ -30,6 +30,7 @@ import { performBoolean } from "../operations/booleans";
 import { performDrainHoles, performHollow } from "../operations/hollow";
 import { performThicken } from "../operations/meshRefine";
 import { analyzeThickness, type ThicknessAnalysis } from "../analysis/thickness";
+import { measureSliceMetrics, type SliceMetrics } from "../analysis/estimateSliced";
 import { buildSupports, type SupportGenerationResult, type SupportSettings } from "../analysis/supports";
 import { cleanupComponents } from "../repair/cleanup";
 import { diagnoseMesh, repairMesh, type RepairOptions } from "../repair/diagnose";
@@ -139,6 +140,10 @@ export interface GeometryJobMap {
       maxSamples?: number;
     };
     result: ThicknessAnalysis;
+  };
+  measureSlices: {
+    payload: { mesh: MeshData; layerHeightMm: number };
+    result: SliceMetrics;
   };
   buildSupports: {
     payload: { mesh: MeshData; settings: SupportSettings };
@@ -273,6 +278,24 @@ export const JOB_HANDLERS: Handlers = {
       const analysis = analyzeThickness(solid, mesh, { minWallMm, minFeatureMm, maxSamples });
       ctx.onProgress(1, "הושלם");
       return analysis;
+    } finally {
+      solid.dispose();
+    }
+  },
+
+  measureSlices: async ({ mesh, layerHeightMm }, ctx) => {
+    ctx.onProgress(0.1, "פורס את הגוף");
+    const kernel = await getGeometryKernel();
+    const { solid, status } = kernel.fromMeshData(mesh);
+    if (status !== "NoError") {
+      solid.dispose();
+      throw new Error(`הרשת אינה תקינה (${status}) — לא ניתן לפרוס`);
+    }
+    ctx.throwIfCancelled();
+    try {
+      const metrics = measureSliceMetrics(solid, layerHeightMm);
+      ctx.onProgress(1, "הושלם");
+      return metrics;
     } finally {
       solid.dispose();
     }

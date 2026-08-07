@@ -16,6 +16,7 @@ import {
   getPrintabilityProfile,
 } from "@/types/profiles";
 import { formatMinutesHe, type DetailedEstimateResult } from "@/lib/geometry/analysis/estimateDetailed";
+import type { SlicedEstimateResult } from "@/lib/geometry/analysis/estimateSliced";
 import type { ValidationIssue } from "@/lib/geometry/types";
 import { NumberField } from "@/components/ui/NumberField";
 import type { OverlayMode } from "./store";
@@ -26,7 +27,7 @@ export interface AnalysisPanelProps {
   modelIssues: ModelIssue[];
   overlay: OverlayMode;
   analysisBusy: boolean;
-  estimate: DetailedEstimateResult | null;
+  estimate: DetailedEstimateResult | SlicedEstimateResult | null;
   onSetOverlay: (overlay: OverlayMode) => void;
   onRunAnalysis: () => void;
   onSuggestOrientation: () => void;
@@ -311,6 +312,27 @@ export function AnalysisPanel({
             <dt className="text-slate-500">סה״כ עלות משוערת</dt>
             <dd className="text-end font-bold">{estimate.totalCostIls} ₪</dd>
           </dl>
+          {"componentsHe" in estimate && estimate.componentsHe.length > 0 ? (
+            <div className="mt-1 border-t border-slate-100 pt-1">
+              <p className="text-[11px] font-bold text-slate-500">ממה מורכבת ההערכה (זמן הדפסה):</p>
+              <ul className="mt-0.5 space-y-0.5">
+                {estimate.componentsHe.map((component) => (
+                  <li key={component.labelHe} className="flex justify-between text-[11px]">
+                    <span>{component.labelHe}</span>
+                    <span dir="ltr">{formatMinutesHe(component.minutes)}</span>
+                  </li>
+                ))}
+              </ul>
+              <p className="mt-0.5 text-[11px] text-slate-400">
+                נמדד מפריסת המודל לשכבות (אורך היקפים, שטח חתך ומעברים) — עדיין
+                הערכה גסה, לא פלט סלייסר.
+              </p>
+            </div>
+          ) : (
+            <p className="mt-1 text-[11px] text-slate-400">
+              הערכה לפי נפח בלבד — פריסת המודל לשכבות לא הייתה זמינה.
+            </p>
+          )}
           <p className="mt-1 text-[11px] text-slate-400">
             רמת ביטחון: {estimate.time.confidence === "high" ? "גבוהה" : estimate.time.confidence === "medium" ? "בינונית" : "נמוכה"}
           </p>
