@@ -1,8 +1,14 @@
 "use client";
 
 /**
- * Minimal accessible modal: focus trap-lite (autofocus + Escape to close),
- * backdrop click closes, RTL-friendly.
+ * Accessible modal: real focus trap, Escape to close, focus restored to the
+ * control that opened it, backdrop click closes, RTL-friendly.
+ *
+ * "Focus-trap-lite" (autofocus only) was not a trap at all: Tab walked
+ * straight out of the dialog into the editor behind it, so a keyboard user
+ * ended up operating controls they could not see while a modal claimed to be
+ * modal. Since every geometry operation is configured through one of these,
+ * that made the whole feature set keyboard-hostile.
  */
 
 import { useEffect, useRef, type ReactNode } from "react";
@@ -18,15 +24,58 @@ export interface ModalProps {
 
 export function Modal({ title, open, onClose, children, footer, wide }: ModalProps) {
   const ref = useRef<HTMLDivElement>(null);
+  const previouslyFocused = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+    previouslyFocused.current = document.activeElement as HTMLElement | null;
+
+    const focusable = (): HTMLElement[] => {
+      const root = ref.current;
+      if (!root) return [];
+      return [
+        ...root.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+        ),
+      ].filter((el) => el.offsetParent !== null || el === document.activeElement);
     };
+
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        onClose();
+        return;
+      }
+      if (e.key !== "Tab") return;
+      const items = focusable();
+      if (items.length === 0) {
+        e.preventDefault();
+        ref.current?.focus();
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      const active = document.activeElement;
+      // Wrap at both ends so focus can never leave the dialog.
+      if (e.shiftKey && (active === first || active === ref.current)) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && active === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+
     window.addEventListener("keydown", onKey);
-    ref.current?.focus();
-    return () => window.removeEventListener("keydown", onKey);
+    // Prefer the first real control; fall back to the dialog itself.
+    const items = focusable();
+    (items[0] ?? ref.current)?.focus();
+
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      // Returning focus is what makes a dialog feel like a detour rather than
+      // a teleport: the user resumes exactly where they were.
+      previouslyFocused.current?.focus?.();
+    };
   }, [open, onClose]);
 
   if (!open) return null;

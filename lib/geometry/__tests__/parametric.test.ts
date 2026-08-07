@@ -22,6 +22,7 @@ import {
 import { getGeometryKernel } from "../kernel";
 import { applyModifiers, defaultModifier, describeModifier, type Modifier } from "../modifiers";
 import { layerWorldMatrix } from "../buildDocument";
+import { validateDocument } from "../documentValidation";
 import {
   defaultPrimitive,
   identityTransform,
@@ -368,5 +369,74 @@ describe("hierarchy and pivots", () => {
     for (let i = 0; i < 16; i++) {
       expect(m1.elements[i]).toBeCloseTo(m2.elements[i], 10);
     }
+  });
+});
+
+describe("binding validation", () => {
+  function docWith(
+    bindings: Record<string, string>,
+    parameters: ParameterDefinition[] = []
+  ): DesignDocument {
+    return {
+      schemaVersion: 3,
+      baseMode: "baseless",
+      layers: [
+        {
+          id: "l1",
+          type: "primitive",
+          name: "תיבה",
+          visible: true,
+          locked: false,
+          materialSlotId: "slot1",
+          transform: identityTransform(),
+          previewOpacity: 1,
+          bindings,
+          ...defaultPrimitive("box"),
+        } as DesignLayer,
+      ],
+      materialSlots: [{ id: "slot1", nameHe: "חומר", colorHex: "#888888" }],
+      printerProfileId: "genericFdm220",
+      printabilityProfileId: "fdmPla",
+      customPrintability: null,
+      usageProfileId: null,
+      templateId: null,
+      parameters,
+    };
+  }
+
+  it("accepts a binding onto a real field with a defined parameter", () => {
+    const result = validateDocument(
+      docWith({ widthMm: "wall * 2" }, [
+        { name: "wall", value: 5, expression: "", noteHe: "" },
+      ])
+    );
+    expect(result.issues.filter((i) => i.code.startsWith("binding/"))).toHaveLength(0);
+  });
+
+  it("reports a binding onto a field that does not exist", () => {
+    // The exact defect this check exists for: a typo that silently does
+    // nothing rather than failing.
+    const result = validateDocument(
+      docWith({ widthMmm: "wall" }, [{ name: "wall", value: 5, expression: "", noteHe: "" }])
+    );
+    const issue = result.issues.find((i) => i.code === "binding/unknown-field");
+    expect(issue).toBeDefined();
+    expect(issue?.message).toContain("widthMmm");
+    expect(issue?.severity).toBe("warning");
+  });
+
+  it("reports a binding that uses an undefined parameter", () => {
+    const result = validateDocument(docWith({ widthMm: "nope * 2" }));
+    const issue = result.issues.find((i) => i.code === "binding/unknown-parameter");
+    expect(issue).toBeDefined();
+    expect(issue?.message).toContain("nope");
+    // An undefined parameter produces wrong geometry, so it blocks the build.
+    expect(issue?.severity).toBe("error");
+    expect(result.ok).toBe(false);
+  });
+
+  it("ignores empty bindings", () => {
+    const result = validateDocument(docWith({ widthMm: "   " }));
+    expect(result.issues.filter((i) => i.code.startsWith("binding/"))).toHaveLength(0);
   });
 });

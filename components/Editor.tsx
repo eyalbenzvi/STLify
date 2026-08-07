@@ -2635,6 +2635,10 @@ function EditorInner() {
           </ErrorBoundary>
           {totalDims && (
             <div
+              // Stable hook for the UI regression suite: this readout is
+              // driven by the real geometry pipeline, so watching it is how
+              // the tests prove an operation actually ran.
+              data-testid="viewport-dimensions"
               className="pointer-events-none absolute bottom-3 start-3 rounded-md bg-white/85 px-3 py-1.5 font-mono text-xs text-slate-700 shadow-sm"
               dir="ltr"
             >

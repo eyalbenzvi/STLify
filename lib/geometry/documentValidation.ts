@@ -19,6 +19,7 @@ import type {
   TextLayer,
 } from "@/types/design";
 import { getPrintabilityProfile } from "@/types/profiles";
+import { expressionDependencies } from "./expression";
 import { DEFAULT_LIMITS, PARAM_RANGES, type ValidationIssue, type ValidationResult } from "./types";
 
 export { DEFAULT_LIMITS, PARAM_RANGES };
@@ -98,6 +99,7 @@ export function validateDocument(document: DesignDocument): ValidationResult {
         break; // geometric checks happen at build/analysis time
     }
     validateTransform(layer, issues);
+    validateBindings(layer, document, issues);
   }
 
   const visibleShapes = document.layers.filter((l) => l.visible && l.type !== "hole");
@@ -111,6 +113,47 @@ export function validateDocument(document: DesignDocument): ValidationResult {
 
   const ok = !issues.some((issue) => issue.severity === "error");
   return { ok, issues };
+}
+
+/**
+ * Check that every expression binding names a field that exists on the layer
+ * and refers only to parameters that are defined.
+ *
+ * Bindings are a side table keyed by field NAME, so a typo — `extrudMm`
+ * instead of `extrudeMm` — was silently ignored: the expression evaluated
+ * fine, wrote to a property nothing reads, and the user saw a parameter that
+ * simply had no effect with no explanation anywhere.
+ */
+function validateBindings(
+  layer: DesignLayer,
+  document: DesignDocument,
+  issues: ValidationIssue[]
+): void {
+  const bindings = layer.bindings;
+  if (!bindings) return;
+  const known = new Set((document.parameters ?? []).map((p) => p.name));
+  const record = layer as unknown as Record<string, unknown>;
+
+  for (const [field, expression] of Object.entries(bindings)) {
+    if (!expression || !expression.trim()) continue;
+
+    if (typeof record[field] !== "number") {
+      issues.push({
+        code: "binding/unknown-field",
+        severity: "warning",
+        message: `הביטוי בשכבה "${layer.name}" מקושר לשדה לא קיים ("${field}") ולכן אינו משפיע על כלום`,
+      });
+      continue;
+    }
+    for (const dependency of expressionDependencies(expression)) {
+      if (known.has(dependency)) continue;
+      issues.push({
+        code: "binding/unknown-parameter",
+        severity: "error",
+        message: `הביטוי של "${field}" בשכבה "${layer.name}" משתמש בפרמטר לא מוגדר: "${dependency}"`,
+      });
+    }
+  }
 }
 
 function validateTransform(layer: DesignLayer, issues: ValidationIssue[]): void {
