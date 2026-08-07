@@ -136,13 +136,11 @@ function traceBoundaryLoops(
       while (node !== undefined) {
         loop.push(node);
         const next: number | undefined = take(node);
-        if (next === undefined) break;
-        if (next === loop[0]) {
-          node = undefined;
+        // Ran out of edges, closed the loop, or hit a pathological chain
+        // longer than the whole mesh — either way this loop is finished.
+        if (next === undefined || next === loop[0] || loop.length > positions.length) {
           break;
         }
-        // Guard against pathological chains longer than the whole mesh.
-        if (loop.length > positions.length) break;
         node = next;
       }
       if (loop.length >= 3) {

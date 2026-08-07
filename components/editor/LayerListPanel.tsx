@@ -14,6 +14,8 @@ const TYPE_ICONS: Record<DesignLayer["type"], string> = {
   svg: "✒",
   imageRelief: "🖼",
   importedMesh: "◆",
+  primitive: "⬢",
+  sketch: "✐",
   hole: "◎",
 };
 
@@ -23,6 +25,8 @@ const TYPE_NAMES_HE: Record<DesignLayer["type"], string> = {
   svg: "SVG",
   imageRelief: "תמונה",
   importedMesh: "רשת",
+  primitive: "גוף בסיסי",
+  sketch: "סקיצה",
   hole: "חור",
 };
 

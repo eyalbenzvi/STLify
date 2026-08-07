@@ -18,10 +18,17 @@ import type {
   MaterialSlot,
   PortableDesignFile,
   PortableMesh,
+  PrimitiveKind,
+  SketchEntity,
   StoredContour,
   Transform3D,
 } from "@/types/design";
-import { DESIGN_SCHEMA_VERSION, identityTransform, newId } from "@/types/design";
+import {
+  DESIGN_SCHEMA_VERSION,
+  defaultPrimitive,
+  identityTransform,
+  newId,
+} from "@/types/design";
 import { decodeMeshData, encodeMeshData } from "@/lib/geometry/meshData";
 import { getMesh, storeMesh } from "@/lib/geometry/meshStore";
 
@@ -149,6 +156,101 @@ function sanitizeContours(value: unknown): StoredContour[] {
   return contours;
 }
 
+/** A positive linear dimension, bounded to something a printer could make. */
+function clampSize(value: unknown, fallback: number): number {
+  const n = finiteNumber(value, fallback);
+  return Math.max(0.001, Math.min(n, 5000));
+}
+
+/** Cap on total sketch points, mirroring the contour limit. */
+const MAX_SKETCH_POINTS = 100_000;
+
+function sanitizeSketchPoints(value: unknown): [number, number][] {
+  if (!Array.isArray(value)) return [];
+  const points: [number, number][] = [];
+  for (const raw of value) {
+    if (!Array.isArray(raw) || raw.length < 2) continue;
+    const x = Number(raw[0]);
+    const y = Number(raw[1]);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    points.push([x, y]);
+    if (points.length > MAX_SKETCH_POINTS) break;
+  }
+  return points;
+}
+
+function sanitizeSketchEntities(value: unknown, warningsHe: string[]): SketchEntity[] {
+  if (!Array.isArray(value)) return [];
+  const entities: SketchEntity[] = [];
+  let skipped = 0;
+  for (const raw of value) {
+    if (!isRecord(raw)) {
+      skipped++;
+      continue;
+    }
+    switch (raw.kind) {
+      case "polyline":
+      case "bezier": {
+        const points = sanitizeSketchPoints(raw.points);
+        if (points.length < 2) {
+          skipped++;
+          continue;
+        }
+        entities.push({
+          kind: raw.kind,
+          points,
+          closed: raw.closed === true,
+          strokeWidthMm: Math.max(0.01, Math.min(finiteNumber(raw.strokeWidthMm, 1), 100)),
+        });
+        break;
+      }
+      case "rectangle":
+        entities.push({
+          kind: "rectangle",
+          x: finiteNumber(raw.x, 0),
+          y: finiteNumber(raw.y, 0),
+          widthMm: clampSize(raw.widthMm, 20),
+          heightMm: clampSize(raw.heightMm, 20),
+          cornerRadiusMm: Math.max(0, Math.min(finiteNumber(raw.cornerRadiusMm, 0), 5000)),
+          rotationDeg: finiteNumber(raw.rotationDeg, 0),
+        });
+        break;
+      case "circle":
+        entities.push({
+          kind: "circle",
+          x: finiteNumber(raw.x, 0),
+          y: finiteNumber(raw.y, 0),
+          radiusMm: clampSize(raw.radiusMm, 10),
+        });
+        break;
+      case "ellipse":
+        entities.push({
+          kind: "ellipse",
+          x: finiteNumber(raw.x, 0),
+          y: finiteNumber(raw.y, 0),
+          radiusXMm: clampSize(raw.radiusXMm, 10),
+          radiusYMm: clampSize(raw.radiusYMm, 6),
+          rotationDeg: finiteNumber(raw.rotationDeg, 0),
+        });
+        break;
+      case "polygon":
+        entities.push({
+          kind: "polygon",
+          x: finiteNumber(raw.x, 0),
+          y: finiteNumber(raw.y, 0),
+          radiusMm: clampSize(raw.radiusMm, 10),
+          sides: Math.max(3, Math.min(Math.round(finiteNumber(raw.sides, 6)), 256)),
+          rotationDeg: finiteNumber(raw.rotationDeg, 0),
+        });
+        break;
+      default:
+        skipped++;
+    }
+  }
+  if (skipped > 0) warningsHe.push(`${skipped} ישויות סקיצה לא מוכרות דולגו`);
+  return entities;
+}
+
 function sanitizeBevel(value: unknown): { enabled: boolean; sizeMm: number; segments: number } {
   if (!isRecord(value)) return { enabled: false, sizeMm: 0.6, segments: 4 };
   return {
@@ -158,7 +260,25 @@ function sanitizeBevel(value: unknown): { enabled: boolean; sizeMm: number; segm
   };
 }
 
-const LAYER_TYPES = new Set(["base", "text", "svg", "imageRelief", "importedMesh", "hole"]);
+const LAYER_TYPES = new Set([
+  "base",
+  "text",
+  "svg",
+  "imageRelief",
+  "importedMesh",
+  "primitive",
+  "sketch",
+  "hole",
+]);
+const PRIMITIVE_KINDS = new Set([
+  "box",
+  "cylinder",
+  "sphere",
+  "cone",
+  "torus",
+  "wedge",
+  "tube",
+]);
 const COMBINE_MODES = new Set(["raised", "engraved", "inlay", "standalone"]);
 const FONT_IDS = new Set(["alef", "davidLibre", "suezOne", "varelaRound"]);
 
@@ -289,6 +409,33 @@ function sanitizeLayer(
         combine,
       };
     }
+    case "primitive": {
+      const kind = PRIMITIVE_KINDS.has(String(raw.kind))
+        ? (String(raw.kind) as PrimitiveKind)
+        : "box";
+      const defaults = defaultPrimitive(kind);
+      return {
+        ...common,
+        type: "primitive",
+        kind,
+        widthMm: clampSize(raw.widthMm, defaults.widthMm),
+        depthMm: clampSize(raw.depthMm, defaults.depthMm),
+        heightMm: clampSize(raw.heightMm, defaults.heightMm),
+        radiusMm: clampSize(raw.radiusMm, defaults.radiusMm),
+        radius2Mm: Math.max(0, Math.min(finiteNumber(raw.radius2Mm, defaults.radius2Mm), 5000)),
+        segments: Math.max(3, Math.min(Math.round(finiteNumber(raw.segments, defaults.segments)), 256)),
+        combine,
+      };
+    }
+    case "sketch":
+      return {
+        ...common,
+        type: "sketch",
+        entities: sanitizeSketchEntities(raw.entities, warningsHe),
+        extrudeMm: finiteNumber(raw.extrudeMm, 3),
+        combine,
+        bevel: sanitizeBevel(raw.bevel),
+      };
     case "hole":
       return {
         ...common,

@@ -61,6 +61,8 @@ export type LayerType =
   | "svg"
   | "imageRelief"
   | "importedMesh"
+  | "primitive"
+  | "sketch"
   | "hole";
 
 /**
@@ -218,6 +220,107 @@ export interface ImportedMeshLayer extends LayerCommon {
   combine: CombineMode;
 }
 
+// ---------------------------------------------------------------------------
+// Primitive solids
+// ---------------------------------------------------------------------------
+
+export type PrimitiveKind =
+  | "box"
+  | "cylinder"
+  | "sphere"
+  | "cone"
+  | "torus"
+  | "wedge"
+  | "tube";
+
+/**
+ * A parametric primitive solid. Every kind is built from the same parameter
+ * set so the properties panel and the design-file validator stay simple; each
+ * kind documents which fields it reads and ignores the rest.
+ *
+ * All primitives are built centred on the local XY origin with z ∈ [0, height]
+ * (spheres and tori are centred on z = 0 and then dropped to sit on z = 0),
+ * matching the convention every other layer builder follows.
+ */
+export interface PrimitiveLayer extends LayerCommon {
+  type: "primitive";
+  kind: PrimitiveKind;
+  /** box, wedge: size along X. */
+  widthMm: number;
+  /** box, wedge: size along Y. */
+  depthMm: number;
+  /** box, wedge, cylinder, cone, tube: size along Z. */
+  heightMm: number;
+  /** cylinder/tube outer, sphere, cone bottom, torus major. */
+  radiusMm: number;
+  /** cone top, tube inner, torus minor. Ignored by the other kinds. */
+  radius2Mm: number;
+  /** Facets around the axis for curved kinds. */
+  segments: number;
+  combine: CombineMode;
+}
+
+// ---------------------------------------------------------------------------
+// Sketches
+// ---------------------------------------------------------------------------
+
+/**
+ * A 2D sketch entity, in millimetres, in the sketch layer's local XY plane.
+ * Entities are resolved together with the NonZero fill rule, so overlapping
+ * shapes merge and an opposite-wound shape cuts a hole — the same rule the
+ * kernel already applies to font glyphs and SVG artwork.
+ */
+export type SketchEntity =
+  | {
+      kind: "polyline";
+      points: [number, number][];
+      /** Open polylines are stroked to `strokeWidthMm`; closed ones are filled. */
+      closed: boolean;
+      strokeWidthMm: number;
+    }
+  | {
+      kind: "rectangle";
+      x: number;
+      y: number;
+      widthMm: number;
+      heightMm: number;
+      cornerRadiusMm: number;
+      rotationDeg: number;
+    }
+  | { kind: "circle"; x: number; y: number; radiusMm: number }
+  | {
+      kind: "ellipse";
+      x: number;
+      y: number;
+      radiusXMm: number;
+      radiusYMm: number;
+      rotationDeg: number;
+    }
+  | {
+      kind: "polygon";
+      x: number;
+      y: number;
+      radiusMm: number;
+      sides: number;
+      rotationDeg: number;
+    }
+  | {
+      /** A quadratic Bezier chain: [start, control, end, control, end, ...]. */
+      kind: "bezier";
+      points: [number, number][];
+      closed: boolean;
+      strokeWidthMm: number;
+    };
+
+/** A drawn 2D profile, extruded exactly like an imported SVG. */
+export interface SketchLayer extends LayerCommon {
+  type: "sketch";
+  entities: SketchEntity[];
+  extrudeMm: number;
+  combine: CombineMode;
+  bevel: BevelSettings;
+}
+
 /** A cylindrical cut. Direction is the layer's local +Z axis. */
 export interface HoleLayer extends LayerCommon {
   type: "hole";
@@ -233,6 +336,8 @@ export type DesignLayer =
   | SvgLayer
   | ImageReliefLayer
   | ImportedMeshLayer
+  | PrimitiveLayer
+  | SketchLayer
   | HoleLayer;
 
 /** Layers that produce a printable body of their own. */
@@ -474,12 +579,42 @@ export function isShapeLayer(layer: DesignLayer): layer is ShapeLayer {
 /** Layers that are live 2D-contour extrusions (support bevel + combine). */
 export function isContourLayer(
   layer: DesignLayer
-): layer is TextLayer | SvgLayer | ImageReliefLayer {
+): layer is TextLayer | SvgLayer | ImageReliefLayer | SketchLayer {
   return (
     layer.type === "text" ||
     layer.type === "svg" ||
+    layer.type === "sketch" ||
     (layer.type === "imageRelief" && layer.mode === "silhouette")
   );
+}
+
+/** Default parameters for a freshly created primitive of each kind. */
+export function defaultPrimitive(kind: PrimitiveKind): Omit<
+  PrimitiveLayer,
+  keyof LayerCommon | "type"
+> {
+  const base = {
+    kind,
+    widthMm: 20,
+    depthMm: 20,
+    heightMm: 20,
+    radiusMm: 10,
+    radius2Mm: 5,
+    segments: 64,
+    combine: "standalone" as CombineMode,
+  };
+  switch (kind) {
+    case "sphere":
+      return { ...base, segments: 48 };
+    case "torus":
+      return { ...base, radiusMm: 15, radius2Mm: 4, segments: 48 };
+    case "cone":
+      return { ...base, radius2Mm: 0 };
+    case "tube":
+      return { ...base, radiusMm: 10, radius2Mm: 7 };
+    default:
+      return base;
+  }
 }
 
 export function defaultBevel(): BevelSettings {

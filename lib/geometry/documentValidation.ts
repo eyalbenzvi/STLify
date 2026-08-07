@@ -13,6 +13,8 @@ import type {
   DesignLayer,
   HoleLayer,
   ImageReliefLayer,
+  PrimitiveLayer,
+  SketchLayer,
   SvgLayer,
   TextLayer,
 } from "@/types/design";
@@ -83,7 +85,11 @@ export function validateDocument(document: DesignDocument): ValidationResult {
         break;
       case "svg":
       case "imageRelief":
+      case "sketch":
         validateContourish(layer, document, base, limits, issues);
+        break;
+      case "primitive":
+        validatePrimitive(layer, limits, issues);
         break;
       case "hole":
         validateHole(layer, base, limits, issues);
@@ -197,8 +203,97 @@ function validateBase(layer: BaseLayer, limits: Limits, issues: ValidationIssue[
   }
 }
 
+/**
+ * Primitives are validated on their own parameters only: they are solid
+ * bodies, so the extrusion-depth rules that govern contour layers do not
+ * apply. The checks that matter are "can this shape exist at all" and "is any
+ * part of it thinner than the printer can produce".
+ */
+function validatePrimitive(
+  layer: PrimitiveLayer,
+  limits: Limits,
+  issues: ValidationIssue[]
+): void {
+  const positive = (value: number, nameHe: string, code: string): boolean => {
+    if (Number.isFinite(value) && value > 0) return true;
+    issues.push({
+      code,
+      severity: "error",
+      message: `${nameHe} של "${layer.name}" חייב להיות גדול מאפס`,
+    });
+    return false;
+  };
+
+  switch (layer.kind) {
+    case "box":
+    case "wedge":
+      positive(layer.widthMm, "הרוחב", "primitive/width");
+      positive(layer.depthMm, "העומק", "primitive/depth");
+      positive(layer.heightMm, "הגובה", "primitive/height");
+      break;
+    case "cylinder":
+      positive(layer.radiusMm, "הרדיוס", "primitive/radius");
+      positive(layer.heightMm, "הגובה", "primitive/height");
+      break;
+    case "sphere":
+      positive(layer.radiusMm, "הרדיוס", "primitive/radius");
+      break;
+    case "cone":
+      positive(layer.radiusMm, "רדיוס הבסיס", "primitive/radius");
+      positive(layer.heightMm, "הגובה", "primitive/height");
+      if (layer.radius2Mm < 0) {
+        issues.push({
+          code: "primitive/radius2-negative",
+          severity: "error",
+          message: `הרדיוס העליון של "${layer.name}" אינו יכול להיות שלילי`,
+        });
+      }
+      break;
+    case "torus":
+      if (positive(layer.radiusMm, "הרדיוס הראשי", "primitive/radius") &&
+          positive(layer.radius2Mm, "רדיוס החתך", "primitive/radius2") &&
+          layer.radius2Mm >= layer.radiusMm) {
+        issues.push({
+          code: "primitive/torus-ratio",
+          severity: "error",
+          message: `רדיוס החתך של "${layer.name}" חייב להיות קטן מהרדיוס הראשי`,
+        });
+      }
+      break;
+    case "tube":
+      if (positive(layer.radiusMm, "הרדיוס החיצוני", "primitive/radius") &&
+          positive(layer.heightMm, "הגובה", "primitive/height")) {
+        if (layer.radius2Mm >= layer.radiusMm) {
+          issues.push({
+            code: "primitive/tube-ratio",
+            severity: "error",
+            message: `הרדיוס הפנימי של "${layer.name}" חייב להיות קטן מהחיצוני`,
+          });
+        } else {
+          const wall = layer.radiusMm - layer.radius2Mm;
+          if (wall < limits.minWallMm) {
+            issues.push({
+              code: "primitive/tube-thin",
+              severity: "warning",
+              message: `דופן הצינור "${layer.name}" (${round2(wall)} מ״מ) דקה מהמינימום המומלץ (${limits.minWallMm} מ״מ)`,
+            });
+          }
+        }
+      }
+      break;
+  }
+
+  if (layer.kind === "torus" && layer.radius2Mm > 0 && layer.radius2Mm * 2 < limits.minFeatureMm) {
+    issues.push({
+      code: "primitive/torus-thin",
+      severity: "warning",
+      message: `עובי הטבעת "${layer.name}" קטן מהפרט המינימלי שניתן להדפיס (${limits.minFeatureMm} מ״מ)`,
+    });
+  }
+}
+
 function validateExtrusion(
-  layer: TextLayer | SvgLayer | ImageReliefLayer,
+  layer: TextLayer | SvgLayer | ImageReliefLayer | SketchLayer,
   document: DesignDocument,
   base: BaseLayer | null,
   limits: Limits,
@@ -332,12 +427,24 @@ function validateText(
 }
 
 function validateContourish(
-  layer: SvgLayer | ImageReliefLayer,
+  layer: SvgLayer | ImageReliefLayer | SketchLayer,
   document: DesignDocument,
   base: BaseLayer | null,
   limits: Limits,
   issues: ValidationIssue[]
 ): void {
+  if (layer.type === "sketch") {
+    if (layer.entities.length === 0) {
+      issues.push({
+        code: "sketch/empty",
+        severity: "error",
+        message: `הסקיצה "${layer.name}" ריקה — הוסיפו לפחות צורה אחת`,
+      });
+      return;
+    }
+    validateExtrusion(layer, document, base, limits, issues);
+    return;
+  }
   if (layer.type === "imageRelief" && layer.mode === "relief") {
     if (!layer.meshId) {
       issues.push({
