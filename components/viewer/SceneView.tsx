@@ -69,9 +69,20 @@ export interface SceneViewProps {
    * World point to centre the camera on. Set by the mesh inspector and the
    * interference report so a listed problem can be looked at rather than
    * merely described. A new object identity re-triggers the move, so the
-   * same location can be revisited.
+   * same location can be revisited. With `fitRadius` the camera also moves
+   * to a distance that FRAMES a sphere of that radius (the F shortcut).
    */
-  focusTarget?: { x: number; y: number; z: number } | null;
+  focusTarget?: { x: number; y: number; z: number; fitRadius?: number } | null;
+  /**
+   * Numeric view preset (top/front/side/iso). A new nonce re-applies the
+   * same view.
+   */
+  viewPreset?: {
+    kind: "top" | "front" | "side" | "iso";
+    center: { x: number; y: number; z: number };
+    radius: number;
+    nonce: number;
+  } | null;
   /** Highlighted triangles on one body, from the sub-object selection. */
   faceSelection?: { layerId: string; triangles: number[] } | null;
   /** Fired in faceSelect mode with the clicked triangle. */
@@ -554,6 +565,7 @@ function SceneContent(props: SceneViewProps & { onRemoveMeasurement: (id: string
 
       <OrbitControls makeDefault enableDamping />
       <CameraFocus target={focusTarget ?? null} />
+      <ViewPresetApplier preset={props.viewPreset ?? null} />
     </>
   );
 }
@@ -713,9 +725,14 @@ function FaceSelectionHighlight({
 
 /**
  * Pans the orbit target onto a world point, keeping the current viewing
- * direction and distance so the user does not lose their bearings.
+ * direction — and, when `fitRadius` is given (the F shortcut), moving to a
+ * distance that frames a sphere of that radius.
  */
-function CameraFocus({ target }: { target: { x: number; y: number; z: number } | null }) {
+function CameraFocus({
+  target,
+}: {
+  target: { x: number; y: number; z: number; fitRadius?: number } | null;
+}) {
   const camera = useThree((s) => s.camera);
   const controls = useThree((s) => s.controls) as
     | { target: THREE.Vector3; update: () => void }
@@ -725,11 +742,49 @@ function CameraFocus({ target }: { target: { x: number; y: number; z: number } |
     if (!target || !controls) return;
     const next = new THREE.Vector3(target.x, target.y, target.z);
     const offset = camera.position.clone().sub(controls.target);
+    if (target.fitRadius !== undefined) {
+      // ~2.8× the radius fills most of a 40° field of view.
+      offset.setLength(Math.max(40, target.fitRadius * 2.8));
+    }
     controls.target.copy(next);
     camera.position.copy(next).add(offset);
     controls.update();
     invalidate();
   }, [target, controls, camera]);
+
+  return null;
+}
+
+/** Applies the numeric view presets (top/front/side/iso). */
+function ViewPresetApplier({
+  preset,
+}: {
+  preset: SceneViewProps["viewPreset"];
+}) {
+  const camera = useThree((s) => s.camera);
+  const controls = useThree((s) => s.controls) as
+    | { target: THREE.Vector3; update: () => void }
+    | null;
+
+  useEffect(() => {
+    if (!preset || !controls) return;
+    const directions: Record<string, THREE.Vector3> = {
+      // Top keeps a hair of Y so the view is never exactly parallel to the
+      // camera's up axis (+Z), which makes OrbitControls flip.
+      top: new THREE.Vector3(0, -0.02, 1),
+      front: new THREE.Vector3(0, -1, 0.02),
+      side: new THREE.Vector3(1, 0, 0.02),
+      iso: new THREE.Vector3(1, -1, 0.8),
+    };
+    const center = new THREE.Vector3(preset.center.x, preset.center.y, preset.center.z);
+    const distance = Math.max(60, preset.radius * 2.8);
+    controls.target.copy(center);
+    camera.position
+      .copy(center)
+      .add(directions[preset.kind].clone().normalize().multiplyScalar(distance));
+    controls.update();
+    invalidate();
+  }, [preset, controls, camera]);
 
   return null;
 }

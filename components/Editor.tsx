@@ -148,6 +148,8 @@ import {
 } from "@/components/dialogs/ImportDialogs";
 import { ExportDialog, type ExportKind } from "@/components/dialogs/ExportDialog";
 import { LibraryDialog } from "@/components/dialogs/LibraryDialog";
+import { ShortcutsDialog } from "@/components/dialogs/ShortcutsDialog";
+import { actionForEvent, loadKeymap, type Keymap } from "@/lib/keyboard/keymap";
 import { CreatePanel, type GeneratorKind } from "@/components/editor/CreatePanel";
 import {
   SubObjectPanel,
@@ -298,6 +300,14 @@ function EditorInner() {
   const [imagePending, setImagePending] = useState<{ file: File; fileName: string } | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
   const [libraryOpen, setLibraryOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [keymap, setKeymap] = useState<Keymap>(() => loadKeymap());
+  const [viewPreset, setViewPreset] = useState<{
+    kind: "top" | "front" | "side" | "iso";
+    center: { x: number; y: number; z: number };
+    radius: number;
+    nonce: number;
+  } | null>(null);
   const [orientationCandidates, setOrientationCandidates] = useState<OrientationCandidate[] | null>(null);
   const [modeSwitchTarget, setModeSwitchTarget] = useState<"withBase" | "baseless" | null>(null);
   const [modelIssues, setModelIssues] = useState<ModelIssue[]>([]);
@@ -314,7 +324,12 @@ function EditorInner() {
   const [diagnosis, setDiagnosis] = useState<MeshDiagnosis | null>(null);
   const [repairReport, setRepairReport] = useState<MeshRepairReport | null>(null);
   const [interference, setInterference] = useState<InterferenceReport | null>(null);
-  const [focusTarget, setFocusTarget] = useState<{ x: number; y: number; z: number } | null>(null);
+  const [focusTarget, setFocusTarget] = useState<{
+    x: number;
+    y: number;
+    z: number;
+    fitRadius?: number;
+  } | null>(null);
   /** Bumped by the GC handler, which changes the store without changing doc. */
   const [memoryVersion, setMemoryVersion] = useState(0);
   const [recovery, setRecovery] = useState<RecoverySnapshot | null>(null);
@@ -2348,44 +2363,156 @@ function EditorInner() {
   }, [applyDocument]);
 
   // ---- keyboard shortcuts -----------------------------------------------------
+  // The full 3D-tool set (V6 item 18), driven by an EDITABLE keymap stored
+  // on this device (lib/keyboard/keymap.ts). Esc stays hardcoded — a panic
+  // key must not be remappable into oblivion.
+
+  /** Bounds of the selection (fallback: all parts) for framing and views. */
+  const selectionFrame = useCallback(() => {
+    const parts = selectedParts.length > 0 ? selectedParts : build.parts;
+    if (parts.length === 0) return null;
+    const min = { x: Infinity, y: Infinity, z: Infinity };
+    const max = { x: -Infinity, y: -Infinity, z: -Infinity };
+    for (const part of parts) {
+      min.x = Math.min(min.x, part.stats.bounds.min.x);
+      min.y = Math.min(min.y, part.stats.bounds.min.y);
+      min.z = Math.min(min.z, part.stats.bounds.min.z);
+      max.x = Math.max(max.x, part.stats.bounds.max.x);
+      max.y = Math.max(max.y, part.stats.bounds.max.y);
+      max.z = Math.max(max.z, part.stats.bounds.max.z);
+    }
+    const center = {
+      x: (min.x + max.x) / 2,
+      y: (min.y + max.y) / 2,
+      z: (min.z + max.z) / 2,
+    };
+    const radius =
+      Math.hypot(max.x - min.x, max.y - min.y, max.z - min.z) / 2 || 10;
+    return { center, radius };
+  }, [selectedParts, build.parts]);
+
+  const handleFrameSelection = useCallback(() => {
+    const frame = selectionFrame();
+    if (!frame) return;
+    setFocusTarget({ ...frame.center, fitRadius: frame.radius });
+  }, [selectionFrame]);
+
+  const handleViewPreset = useCallback(
+    (kind: "top" | "front" | "side" | "iso") => {
+      const frame = selectionFrame();
+      if (!frame) return;
+      setViewPreset((prev) => ({
+        kind,
+        center: frame.center,
+        radius: frame.radius,
+        nonce: (prev?.nonce ?? 0) + 1,
+      }));
+    },
+    [selectionFrame]
+  );
+
+  const handleSelectAll = useCallback(() => {
+    dispatch({
+      type: "ui/select",
+      selection: build.parts.map((p) => p.primaryLayerId),
+    });
+  }, [dispatch, build.parts]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
-      if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
-      if ((e.ctrlKey || e.metaKey) && e.code === "KeyZ") {
-        e.preventDefault();
-        dispatch({ type: e.shiftKey ? "history/redo" : "history/undo" });
-        return;
-      }
-      if ((e.ctrlKey || e.metaKey) && e.code === "KeyY") {
-        e.preventDefault();
-        dispatch({ type: "history/redo" });
-        return;
-      }
-      if (e.code === "Delete" || e.code === "Backspace") {
-        for (const layer of selectedLayers) {
-          if (!layer.locked) handleDeleteLayer(layer.id);
-        }
-        return;
-      }
-      const toolByCode: Record<string, "select" | "translate" | "rotate" | "scale"> = {
-        KeyQ: "select",
-        KeyG: "translate",
-        KeyR: "rotate",
-        KeyS: "scale",
-      };
-      if (toolByCode[e.code] && !e.ctrlKey && !e.metaKey) {
-        dispatch({ type: "ui/setTool", tool: toolByCode[e.code] });
+      // Never swallow typing: form fields and editable content keep every key.
+      if (
+        target &&
+        (["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName) || target.isContentEditable)
+      ) {
         return;
       }
       if (e.code === "Escape") {
         dispatch({ type: "ui/setTool", tool: "select" });
+        return;
+      }
+      const action = actionForEvent(e, keymap);
+      if (!action) return;
+      switch (action) {
+        case "undo":
+          e.preventDefault();
+          dispatch({ type: "history/undo" });
+          break;
+        case "redo":
+          e.preventDefault();
+          dispatch({ type: "history/redo" });
+          break;
+        case "delete": {
+          // One document update for the whole selection. The old per-layer
+          // loop called the single-delete handler repeatedly over the SAME
+          // stale document, so only the last deletion survived.
+          const doomed = new Set(
+            selectedLayers.filter((l) => !l.locked).map((l) => l.id)
+          );
+          if (doomed.size > 0) {
+            const current = state.history.present.document;
+            applyDocument(
+              { ...current, layers: current.layers.filter((l) => !doomed.has(l.id)) },
+              doomed.size === 1 ? "מחיקת שכבה" : `מחיקת ${doomed.size} שכבות`
+            );
+          }
+          break;
+        }
+        case "toolSelect":
+          dispatch({ type: "ui/setTool", tool: "select" });
+          break;
+        case "toolTranslate":
+          dispatch({ type: "ui/setTool", tool: "translate" });
+          break;
+        case "toolRotate":
+          dispatch({ type: "ui/setTool", tool: "rotate" });
+          break;
+        case "toolScale":
+          dispatch({ type: "ui/setTool", tool: "scale" });
+          break;
+        case "frameSelection":
+          handleFrameSelection();
+          break;
+        case "duplicate":
+          e.preventDefault();
+          handleDuplicate();
+          break;
+        case "selectAll":
+          e.preventDefault();
+          handleSelectAll();
+          break;
+        case "viewTop":
+          handleViewPreset("top");
+          break;
+        case "viewFront":
+          handleViewPreset("front");
+          break;
+        case "viewSide":
+          handleViewPreset("side");
+          break;
+        case "viewIso":
+          handleViewPreset("iso");
+          break;
+        case "shortcutHelp":
+          e.preventDefault();
+          setShortcutsOpen(true);
+          break;
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [dispatch, selectedLayers, handleDeleteLayer]);
+  }, [
+    dispatch,
+    keymap,
+    selectedLayers,
+    state.history.present.document,
+    applyDocument,
+    handleFrameSelection,
+    handleViewPreset,
+    handleDuplicate,
+    handleSelectAll,
+  ]);
 
   // ---- derived UI -----------------------------------------------------------
 
@@ -2501,6 +2628,15 @@ function EditorInner() {
             onClick={() => setLibraryOpen(true)}
           >
             ספרייה
+          </button>
+          <button
+            type="button"
+            className="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-sm text-slate-600 hover:bg-slate-50"
+            title="קיצורי מקלדת (Shift+?)"
+            aria-label="קיצורי מקלדת"
+            onClick={() => setShortcutsOpen(true)}
+          >
+            ⌨
           </button>
           <button
             type="button"
@@ -2806,6 +2942,7 @@ function EditorInner() {
             onSurfacePick={handleSurfacePick}
             onAddMeasurement={handleAddMeasurement}
             focusTarget={focusTarget}
+            viewPreset={viewPreset}
             faceSelection={faceSelection}
             onFacePick={handleFacePick}
             onRemoveMeasurement={(id) => dispatch({ type: "ui/removeMeasurement", id })}
@@ -2937,6 +3074,12 @@ function EditorInner() {
         buildOk={build.status === "ok"}
         onExport={handleExport}
         onClose={() => setExportOpen(false)}
+      />
+      <ShortcutsDialog
+        open={shortcutsOpen}
+        keymap={keymap}
+        onClose={() => setShortcutsOpen(false)}
+        onChange={setKeymap}
       />
       <LibraryDialog
         open={libraryOpen}
