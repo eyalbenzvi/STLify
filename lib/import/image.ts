@@ -78,7 +78,54 @@ export function validateImageFile(file: {
 // Grid utilities
 // ---------------------------------------------------------------------------
 
-/** 3×3 box blur with clamped edges, `passes` times. */
+/**
+ * How far apart two luminances have to be before the filter stops treating
+ * them as the same surface. 0.2 sits well above sensor/JPEG noise and well
+ * below the contrast of any edge a silhouette is traced from.
+ */
+const BILATERAL_RANGE_SIGMA = 0.2;
+
+/** exp(-d²/2σ²) for the 3×3 neighbourhood, σ = 1 pixel. Row-major, centre 4. */
+const BILATERAL_SPATIAL = [
+  Math.exp(-1), Math.exp(-0.5), Math.exp(-1),
+  Math.exp(-0.5), 1, Math.exp(-0.5),
+  Math.exp(-1), Math.exp(-0.5), Math.exp(-1),
+];
+
+/**
+ * Range weights by quantised luminance difference. A lookup table rather than
+ * a call to exp per tap: a 512×512 grid at five passes is twelve million
+ * taps, and the table makes the filter cost the same as the box blur it
+ * replaced.
+ */
+const BILATERAL_RANGE = (() => {
+  const table = new Float64Array(256);
+  for (let k = 0; k < 256; k++) {
+    const d = k / 255;
+    table[k] = Math.exp(-(d * d) / (2 * BILATERAL_RANGE_SIGMA * BILATERAL_RANGE_SIGMA));
+  }
+  return table;
+})();
+
+/**
+ * Edge-preserving 3×3 smoothing, `passes` times.
+ *
+ * This used to be a box blur, which reduced noise by pulling every pixel
+ * toward its neighbours — including the pixels ON an edge, whose neighbours
+ * are the background. The corner of a letter would drift toward the threshold
+ * and the tracer would round it off, so the control labelled "smoothing" was
+ * quietly also a control for "lose the corners".
+ *
+ * A bilateral filter weights each neighbour by BOTH distance and luminance
+ * similarity, so a pixel is averaged with its own side of an edge and not
+ * across it. Noise still goes; corners stay.
+ *
+ * The deliberate trade: a full-amplitude 1-bit dither pattern is
+ * indistinguishable from real structure by amplitude alone, so this filter
+ * preserves it where the box blur merged it. In practice the decode
+ * downsamples to at most 512 px first, which turns a scanned halftone into
+ * greys before it ever reaches here.
+ */
 export function smoothGrid(grid: LuminanceGrid, passes: number): LuminanceGrid {
   if (passes <= 0) return grid;
   const { width, height } = grid;
@@ -87,19 +134,24 @@ export function smoothGrid(grid: LuminanceGrid, passes: number): LuminanceGrid {
   for (let pass = 0; pass < passes; pass++) {
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
+        const centre = src[y * width + x];
         let sum = 0;
-        let count = 0;
+        let weight = 0;
         for (let dy = -1; dy <= 1; dy++) {
           const yy = y + dy;
           if (yy < 0 || yy >= height) continue;
           for (let dx = -1; dx <= 1; dx++) {
             const xx = x + dx;
             if (xx < 0 || xx >= width) continue;
-            sum += src[yy * width + xx];
-            count++;
+            const value = src[yy * width + xx];
+            const delta = value - centre;
+            const bin = Math.min(255, Math.round((delta < 0 ? -delta : delta) * 255));
+            const w = BILATERAL_SPATIAL[(dy + 1) * 3 + (dx + 1)] * BILATERAL_RANGE[bin];
+            sum += value * w;
+            weight += w;
           }
         }
-        dst[y * width + x] = sum / count;
+        dst[y * width + x] = weight > 0 ? sum / weight : centre;
       }
     }
     const tmp = src;
@@ -113,7 +165,7 @@ export function smoothGrid(grid: LuminanceGrid, passes: number): LuminanceGrid {
 // Marching squares silhouette
 // ---------------------------------------------------------------------------
 
-interface SilhouetteOptions {
+export interface SilhouetteOptions {
   /** Luminance threshold 0..1; darker-than-threshold is solid. */
   threshold: number;
   invert: boolean;
@@ -121,36 +173,865 @@ interface SilhouetteOptions {
   pixelSizeMm: number;
 }
 
-/** Douglas-Peucker simplification. */
-function simplifyPolyline(points: [number, number][], tolerance: number): [number, number][] {
-  if (points.length <= 4) return points;
-  const keep = new Uint8Array(points.length);
-  keep[0] = keep[points.length - 1] = 1;
-  const stack: [number, number][] = [[0, points.length - 1]];
-  while (stack.length > 0) {
-    const [start, end] = stack.pop()!;
-    if (end - start < 2) continue;
-    const [x1, y1] = points[start];
-    const [x2, y2] = points[end];
-    const dx = x2 - x1;
-    const dy = y2 - y1;
-    const len = Math.hypot(dx, dy) || 1;
-    let worst = -1;
-    let worstDist = tolerance;
-    for (let i = start + 1; i < end; i++) {
-      const [px, py] = points[i];
-      const dist = Math.abs(dy * (px - x1) - dx * (py - y1)) / len;
-      if (dist > worstDist) {
-        worstDist = dist;
-        worst = i;
-      }
-    }
-    if (worst >= 0) {
-      keep[worst] = 1;
-      stack.push([start, worst], [worst, end]);
+/** Below this the two classes are the same colour and Otsu has nothing to say. */
+const OTSU_MIN_SEPARATION = 1 / 256;
+
+/**
+ * Otsu's method: the luminance split that maximises between-class variance.
+ *
+ * The threshold used to be the first thing the user had to guess, before they
+ * had seen a single contour — and the guess governs the whole shape. Otsu
+ * answers it from the image itself, deterministically and with no model.
+ *
+ * IMPORTANT: this runs at IMPORT time only. The silhouette threshold is a
+ * stored field, and re-deriving it on a rebuild would change the geometry of
+ * every design already saved. The computed value is written into the layer's
+ * stored `threshold`; the rebuild keeps reading that value.
+ *
+ * The grid handed in should be the one that will actually be thresholded
+ * (after brightness/contrast and smoothing), so the split lands where the
+ * tracer will use it.
+ *
+ * Returns 0.5 for a flat image, where every split is equally arbitrary. The
+ * result is clamped to the same 0.05..0.95 range the manual control offers,
+ * so switching to manual afterwards shows a value that control can hold.
+ */
+export function otsuThreshold(grid: LuminanceGrid): number {
+  const bins = 256;
+  const histogram = new Float64Array(bins);
+  for (let i = 0; i < grid.values.length; i++) {
+    const v = grid.values[i];
+    const bin = v <= 0 ? 0 : v >= 1 ? bins - 1 : Math.floor(v * bins);
+    histogram[bin]++;
+  }
+  const total = grid.values.length;
+  if (total === 0) return 0.5;
+
+  let sumAll = 0;
+  for (let b = 0; b < bins; b++) sumAll += b * histogram[b];
+
+  let weightLow = 0;
+  let sumLow = 0;
+  let best = -1;
+  let bestBin = -1;
+  for (let b = 0; b < bins - 1; b++) {
+    weightLow += histogram[b];
+    if (weightLow === 0) continue;
+    const weightHigh = total - weightLow;
+    if (weightHigh === 0) break;
+    sumLow += b * histogram[b];
+    const meanLow = sumLow / weightLow;
+    const meanHigh = (sumAll - sumLow) / weightHigh;
+    const between = weightLow * weightHigh * (meanLow - meanHigh) ** 2;
+    if (between > best) {
+      best = between;
+      bestBin = b;
     }
   }
-  return points.filter((_, i) => keep[i] === 1);
+  if (bestBin < 0) return 0.5;
+  // Split at the upper edge of the darker class, so `lum < threshold`
+  // selects exactly the pixels Otsu assigned to it.
+  const threshold = (bestBin + 1) / bins;
+  if (best <= 0) return 0.5;
+  return Math.max(0.05, Math.min(0.95, threshold));
+}
+
+/**
+ * Whether an image has two distinguishable luminance populations at all. A
+ * photo of a wall does not, and an automatic split of it is a coin toss the
+ * user should hear about rather than discover in the geometry.
+ */
+export function isBimodalEnough(grid: LuminanceGrid, threshold: number): boolean {
+  let low = 0;
+  let lowSum = 0;
+  let high = 0;
+  let highSum = 0;
+  for (let i = 0; i < grid.values.length; i++) {
+    const v = grid.values[i];
+    if (v < threshold) {
+      low++;
+      lowSum += v;
+    } else {
+      high++;
+      highSum += v;
+    }
+  }
+  if (low === 0 || high === 0) return false;
+  return highSum / high - lowSum / low > OTSU_MIN_SEPARATION * 8;
+}
+
+// ---------------------------------------------------------------------------
+// Manual mask brush
+// ---------------------------------------------------------------------------
+
+/**
+ * One painted stroke: the escape hatch for when automatic background removal
+ * and the threshold between them get the silhouette wrong.
+ *
+ * Coordinates are NORMALISED to the source image (0..1, x right, y down) and
+ * the radius is a fraction of the image's larger side — not grid pixels. That
+ * one choice settles both of the ways strokes could otherwise go stale:
+ *
+ * - Changing the resolution re-rasterises the same strokes at the new grid
+ *   size instead of leaving them pointing at pixels that no longer exist.
+ * - Brightness and contrast re-run the decode, and strokes do not depend on
+ *   the decode's output at all, so they survive every slider nudge.
+ */
+export interface MaskStroke {
+  /** Path points in normalised image space; a single point is a dab. */
+  points: [number, number][];
+  /** Brush radius as a fraction of the image's larger side. */
+  radius: number;
+  /** true = paint solid, false = erase to background. */
+  add: boolean;
+}
+
+/**
+ * Burn painted strokes into a luminance grid as hard solid/background values.
+ *
+ * Applied AFTER smoothing and BEFORE tracing: a correction the user drew by
+ * hand is a statement about the shape, not a measurement to be filtered, so
+ * nothing downstream is allowed to soften it back out.
+ */
+export function applyMaskStrokes(
+  grid: LuminanceGrid,
+  strokes: readonly MaskStroke[],
+  options: Pick<SilhouetteOptions, "threshold" | "invert">
+): LuminanceGrid {
+  if (strokes.length === 0) return grid;
+  const { width, height } = grid;
+  const values = new Float32Array(grid.values);
+  const solid = options.invert ? 1 : 0;
+  const background = options.invert ? 0 : 1;
+  const scale = Math.max(width, height);
+
+  for (const stroke of strokes) {
+    if (stroke.points.length === 0) continue;
+    const value = stroke.add ? solid : background;
+    const radiusPx = Math.max(0.5, stroke.radius * scale);
+    const r2 = radiusPx * radiusPx;
+    const paintSegment = (
+      ax: number,
+      ay: number,
+      bx: number,
+      by: number
+    ): void => {
+      const minX = Math.max(0, Math.floor(Math.min(ax, bx) - radiusPx));
+      const maxX = Math.min(width - 1, Math.ceil(Math.max(ax, bx) + radiusPx));
+      const minY = Math.max(0, Math.floor(Math.min(ay, by) - radiusPx));
+      const maxY = Math.min(height - 1, Math.ceil(Math.max(ay, by) + radiusPx));
+      const dx = bx - ax;
+      const dy = by - ay;
+      const lengthSq = dx * dx + dy * dy;
+      for (let y = minY; y <= maxY; y++) {
+        for (let x = minX; x <= maxX; x++) {
+          const px = x + 0.5;
+          const py = y + 0.5;
+          let t = lengthSq > 0 ? ((px - ax) * dx + (py - ay) * dy) / lengthSq : 0;
+          t = t < 0 ? 0 : t > 1 ? 1 : t;
+          const ox = px - (ax + dx * t);
+          const oy = py - (ay + dy * t);
+          if (ox * ox + oy * oy <= r2) values[y * width + x] = value;
+        }
+      }
+    };
+
+    const toPixel = (p: [number, number]): [number, number] => [
+      p[0] * width,
+      p[1] * height,
+    ];
+    if (stroke.points.length === 1) {
+      const [x, y] = toPixel(stroke.points[0]);
+      paintSegment(x, y, x, y);
+      continue;
+    }
+    for (let i = 1; i < stroke.points.length; i++) {
+      const [ax, ay] = toPixel(stroke.points[i - 1]);
+      const [bx, by] = toPixel(stroke.points[i]);
+      paintSegment(ax, ay, bx, by);
+    }
+  }
+  return { width, height, values };
+}
+
+// ---------------------------------------------------------------------------
+// Minimum-feature check (thin strokes the nozzle cannot resolve)
+// ---------------------------------------------------------------------------
+
+/**
+ * The solid/background mask the silhouette tracer sees, padded by one
+ * "outside" pixel on every side exactly as `gridToSilhouetteContours` pads
+ * its field. Sharing the padding is what makes a measurement taken here
+ * describe the contours that come out of there.
+ */
+function silhouetteMask(
+  grid: LuminanceGrid,
+  options: Pick<SilhouetteOptions, "threshold" | "invert">
+): { mask: Uint8Array; width: number; height: number } {
+  const pw = grid.width + 2;
+  const ph = grid.height + 2;
+  const mask = new Uint8Array(pw * ph);
+  for (let y = 0; y < grid.height; y++) {
+    for (let x = 0; x < grid.width; x++) {
+      const lum = grid.values[y * grid.width + x];
+      const inside = options.invert ? lum > options.threshold : lum < options.threshold;
+      if (inside) mask[(y + 1) * pw + (x + 1)] = 1;
+    }
+  }
+  return { mask, width: pw, height: ph };
+}
+
+const EDT_INF = 1e20;
+
+/** Felzenszwalb–Huttenlocher lower-envelope transform of one 1D sample row. */
+function edt1d(f: Float64Array, n: number, out: Float64Array): void {
+  const v = new Int32Array(n);
+  const z = new Float64Array(n + 1);
+  let k = 0;
+  v[0] = 0;
+  z[0] = -EDT_INF;
+  z[1] = EDT_INF;
+  for (let q = 1; q < n; q++) {
+    let s = (f[q] + q * q - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+    while (s <= z[k]) {
+      k--;
+      s = (f[q] + q * q - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+    }
+    k++;
+    v[k] = q;
+    z[k] = s;
+    z[k + 1] = EDT_INF;
+  }
+  k = 0;
+  for (let q = 0; q < n; q++) {
+    while (z[k + 1] < q) k++;
+    out[q] = (q - v[k]) * (q - v[k]) + f[v[k]];
+  }
+}
+
+/**
+ * Exact Euclidean distance, in pixels, from every pixel to the nearest pixel
+ * whose `mask` value is `target`. Exact rather than a chamfer approximation
+ * because a half-pixel error here is a tenth of a millimetre on a typical
+ * import, which is the same order as the thing being measured.
+ */
+function distanceToValue(
+  mask: Uint8Array,
+  width: number,
+  height: number,
+  target: 0 | 1
+): Float64Array {
+  const f = new Float64Array(Math.max(width, height));
+  const g = new Float64Array(Math.max(width, height));
+  const sq = new Float64Array(width * height);
+  for (let i = 0; i < sq.length; i++) sq[i] = mask[i] === target ? 0 : EDT_INF;
+  for (let x = 0; x < width; x++) {
+    for (let y = 0; y < height; y++) f[y] = sq[y * width + x];
+    edt1d(f, height, g);
+    for (let y = 0; y < height; y++) sq[y * width + x] = g[y];
+  }
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) f[x] = sq[y * width + x];
+    edt1d(f, width, g);
+    for (let x = 0; x < width; x++) sq[y * width + x] = g[x];
+  }
+  for (let i = 0; i < sq.length; i++) sq[i] = Math.sqrt(sq[i]);
+  return sq;
+}
+
+/**
+ * Traced contours below this area are dropped as specks. Shared with the
+ * minimum-feature check on purpose: a measurement that reports a feature the
+ * tracer then throws away is a measurement of nothing.
+ */
+const MIN_CONTOUR_AREA_MM2 = 1;
+
+/**
+ * Area in mm² of the solid component each pixel belongs to, 0 for background.
+ *
+ * 8-connected, which matters: a one-pixel-wide DIAGONAL stroke is a real
+ * hairline and is 8-connected but not 4-connected, so labelling it by
+ * 4-connectivity would shatter it into single pixels and the check would miss
+ * exactly the defect it exists to find.
+ */
+function componentAreasMm2(
+  mask: Uint8Array,
+  width: number,
+  height: number,
+  pixelAreaMm2: number
+): Float64Array {
+  const label = new Int32Array(mask.length).fill(-1);
+  const areas: number[] = [];
+  const stack: number[] = [];
+  for (let start = 0; start < mask.length; start++) {
+    if (mask[start] !== 1 || label[start] >= 0) continue;
+    const id = areas.length;
+    let count = 0;
+    label[start] = id;
+    stack.push(start);
+    while (stack.length > 0) {
+      const i = stack.pop()!;
+      count++;
+      const x = i % width;
+      const y = (i / width) | 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= height) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx;
+          if (xx < 0 || xx >= width) continue;
+          const j = yy * width + xx;
+          if (mask[j] === 1 && label[j] < 0) {
+            label[j] = id;
+            stack.push(j);
+          }
+        }
+      }
+    }
+    areas.push(count * pixelAreaMm2);
+  }
+  const out = new Float64Array(mask.length);
+  for (let i = 0; i < mask.length; i++) {
+    if (label[i] >= 0) out[i] = areas[label[i]];
+  }
+  return out;
+}
+
+/** What the minimum-feature check found on a traced silhouette. */
+export interface ThinFeatureReport {
+  /** Narrowest stroke found, mm. `null` when the shape has no solid area. */
+  thinnestMm: number | null;
+  /** Narrowest stroke this machine can lay down, mm (two extrusion widths). */
+  minimumMm: number;
+  /** One grid pixel in mm — the resolution the measurement itself has. */
+  pixelSizeMm: number;
+  /** True when a real feature is below what the machine can resolve. */
+  violates: boolean;
+  /** Outward offset that lifts the thinnest stroke to `minimumMm`, mm. */
+  suggestedDilationMm: number;
+}
+
+/**
+ * Measure the narrowest stroke in the silhouette and compare it with what the
+ * machine can actually lay down.
+ *
+ * Why here and not in the wall-thickness analysis, which finds the same
+ * defect: by the time that analysis runs the user has a solid, and the three
+ * things that would have fixed it cheaply — the threshold, the resolution and
+ * the artwork itself — are all behind them. The cost of the check is the same;
+ * only the timing differs, and the timing is the whole point.
+ *
+ * Method: an exact distance transform of the solid mask, restricted to its
+ * ridge (pixels no lower than all eight neighbours). The ridge restriction is
+ * deliberate — it measures elongated strokes and ignores the tapering tip of a
+ * serif or an arrowhead, which is thin by design and thin in every artwork, so
+ * flagging it would make the check fire on everything and mean nothing.
+ */
+export function measureThinnestFeature(
+  grid: LuminanceGrid,
+  options: SilhouetteOptions & { minimumMm: number }
+): ThinFeatureReport {
+  const { mask, width, height } = silhouetteMask(grid, options);
+  const px = options.pixelSizeMm;
+  const empty: ThinFeatureReport = {
+    thinnestMm: null,
+    minimumMm: options.minimumMm,
+    pixelSizeMm: px,
+    violates: false,
+    suggestedDilationMm: 0,
+  };
+  if (!mask.some((v) => v === 1)) return empty;
+
+  const inner = distanceToValue(mask, width, height, 0);
+  // Specks the tracer is going to discard must not be measured. Without this,
+  // ONE dust pixel on a scan reported a 0.3 mm "feature" and thickened the
+  // whole artwork — a 60-pixel logo square grew by 5.6% — to fix a mark that
+  // never appeared in the output at all, and the notice explaining it named a
+  // stroke width the user could not find anywhere in their drawing.
+  const componentArea = componentAreasMm2(mask, width, height, px * px);
+  let thinnestPx = Infinity;
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const i = y * width + x;
+      if (mask[i] !== 1) continue;
+      if (componentArea[i] < MIN_CONTOUR_AREA_MM2) continue;
+      const d = inner[i];
+      let isRidge = true;
+      for (let dy = -1; dy <= 1 && isRidge; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (inner[i + dy * width + dx] > d) {
+            isRidge = false;
+            break;
+          }
+        }
+      }
+      if (isRidge && d < thinnestPx) thinnestPx = d;
+    }
+  }
+  if (!Number.isFinite(thinnestPx)) return empty;
+
+  // A stroke n pixels wide puts its ridge (n+1)/2 pixel centres from the
+  // background, so the width the ridge distance implies is 2d − 1.
+  const widthPx = Math.max(1, 2 * thinnestPx - 1);
+  const thinnestMm = widthPx * px;
+  const violates = thinnestMm < options.minimumMm;
+  return {
+    thinnestMm,
+    minimumMm: options.minimumMm,
+    pixelSizeMm: px,
+    violates,
+    // Dilation adds twice its radius to a stroke's width.
+    suggestedDilationMm: violates ? (options.minimumMm - thinnestMm) / 2 : 0,
+  };
+}
+
+/**
+ * Morphological dilation of the silhouette by `dilationMm`, returned as a
+ * luminance grid the caller re-traces with its ORIGINAL threshold and invert.
+ *
+ * The offset is encoded as a signed distance scaled into luminance around the
+ * caller's threshold rather than as a pixel-snapped mask, so the marching
+ * squares interpolation still lands the boundary between pixel centres. A
+ * pixel-snapped dilation would quantise a 0.15 mm correction up to a whole
+ * 0.3 mm pixel and put back the faceting the rest of this module removes.
+ */
+export function dilateSilhouetteGrid(
+  grid: LuminanceGrid,
+  options: SilhouetteOptions,
+  dilationMm: number
+): LuminanceGrid {
+  if (!(dilationMm > 0)) return grid;
+  const { mask, width, height } = silhouetteMask(grid, options);
+  const toOutside = distanceToValue(mask, width, height, 0);
+  const toInside = distanceToValue(mask, width, height, 1);
+  const radiusPx = dilationMm / options.pixelSizeMm;
+
+  // Keep the encoded luminance inside [0,1] whatever threshold the caller
+  // chose; only cells straddling the new boundary matter, and adjacent
+  // distance samples differ by at most ~1.42 px, so clamping farther out is
+  // harmless.
+  const t = options.threshold;
+  const scale = Math.max(0.01, Math.min(0.25, t * 0.4, (1 - t) * 0.4));
+
+  const values = new Float32Array(grid.width * grid.height);
+  for (let y = 0; y < grid.height; y++) {
+    for (let x = 0; x < grid.width; x++) {
+      const pi = (y + 1) * width + (x + 1);
+      // Signed distance to the original boundary, which sits half a pixel
+      // from the centre of the last solid pixel.
+      const signed = mask[pi] === 1 ? -(toOutside[pi] - 0.5) : toInside[pi] - 0.5;
+      const d = signed - radiusPx;
+      const lum = options.invert ? t - scale * d : t + scale * d;
+      values[y * grid.width + x] = Math.max(0, Math.min(1, lum));
+    }
+  }
+  return { width: grid.width, height: grid.height, values };
+}
+
+/** Hebrew report for the minimum-feature check. `applied` = we thickened. */
+export function thinFeatureMessageHe(report: ThinFeatureReport, applied: boolean): string {
+  const thin = (report.thinnestMm ?? 0).toFixed(2);
+  const min = report.minimumMm.toFixed(2);
+  const head =
+    `הקו הדק ביותר בצללית הוא כ-${thin} מ״מ, ` +
+    `והמדפסת הזו יכולה להדפיס לפחות ${min} מ״מ (שתי רצועות פיה).`;
+  if (applied) {
+    return (
+      `${head} הקווים עובו אוטומטית ב-${report.suggestedDilationMm.toFixed(2)} מ״מ ` +
+      `לכל צד כדי שיודפסו. אם זה שינה את הצורה יותר מדי — בטלו את הסימון ` +
+      `״עיבוי קווים דקים״ בחלון הייבוא, או השתמשו בציור מקורי עבה יותר.`
+    );
+  }
+  return (
+    `${head} קווים דקים מזה ייעלמו או ייצאו גל בהדפסה. סמנו ״עיבוי קווים דקים״ ` +
+    `בחלון הייבוא, או עבו את הציור המקורי.`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Contour vectorisation (curve fitting)
+// ---------------------------------------------------------------------------
+
+/**
+ * Marching squares walks a grid, so its output is a staircase whichever way
+ * you look at it. Douglas-Peucker used to reduce that staircase by KEEPING a
+ * subset of its own points — which means the result is still on the staircase,
+ * only with the steps further apart. Every letter and every logo edge came out
+ * faceted, and the faceting was a property of the tracer, not of the artwork.
+ *
+ * Fitting cubics instead lets the curve pass BETWEEN the sample points, so the
+ * grid quantisation averages out rather than being preserved: the same
+ * tolerance buys a shape both closer to the original and described by fewer
+ * points. There is no new setting — the tolerance is the one the tracer
+ * already derives from the pixel size.
+ *
+ * Written from scratch: the classic tracer for this job, potrace, is GPL, and
+ * this repository is not.
+ */
+
+type Point = [number, number];
+type Cubic = [Point, Point, Point, Point];
+
+/** How many points ahead a one-sided tangent looks. One step of the grid
+ * staircase turns 45°, so a tangent from the immediate neighbour is noise. */
+const TANGENT_SPAN = 3;
+/** Recursion guard on fit splitting and on flattening. */
+const MAX_FIT_DEPTH = 12;
+const MAX_FLATTEN_DEPTH = 10;
+/**
+ * Flattening runs looser than fitting.
+ *
+ * The two errors do not add up in practice — the fit error is where the curve
+ * sits relative to the samples, the flattening error is where the chord sits
+ * relative to the curve, and the flatness test itself is conservative by about
+ * a third. Measured on traced disks, raising this from 1 to 1.5 drops the
+ * point count by a fifth and leaves the deviation from a true circle
+ * unchanged; past 2 the deviation starts to climb.
+ */
+const FLATTEN_SLACK = 1.5;
+/** Below this a loop has no curve worth fitting. */
+const MIN_FIT_POINTS = 8;
+/** Initial cuts of a closed loop; a single cubic cannot describe one. */
+const INITIAL_SEGMENTS = 4;
+/**
+ * A corner is confirmed when the turn over the window reaches CONFIRM
+ * somewhere, and the whole run of samples above SHOULDER around it is pinned.
+ *
+ * Two thresholds because a raster corner is not one sample. Marching squares
+ * cuts a right angle into a 45° diagonal, so the 90° of turn arrives spread
+ * over three or four samples with no single dominant one — pin only the
+ * sharpest and the fit smooths straight across the shoulders, which is the
+ * corner-cutting the whole exercise is trying to avoid.
+ */
+const CORNER_CONFIRM_RAD = (65 * Math.PI) / 180;
+const CORNER_SHOULDER_RAD = (30 * Math.PI) / 180;
+
+function subtract(a: Point, b: Point): Point {
+  return [a[0] - b[0], a[1] - b[1]];
+}
+
+function normalize(v: Point): Point {
+  const length = Math.hypot(v[0], v[1]);
+  return length > 0 ? [v[0] / length, v[1] / length] : [0, 0];
+}
+
+/**
+ * Unit direction leaving `points[from]` toward `points[to]`, averaged over the
+ * span between them so a staircase step does not become the tangent.
+ */
+function spanTangent(points: Point[], from: number, to: number): Point {
+  const step = to > from ? 1 : -1;
+  const limit = Math.min(Math.abs(to - from), TANGENT_SPAN);
+  let x = 0;
+  let y = 0;
+  for (let k = 1; k <= limit; k++) {
+    const d = subtract(points[from + step * k], points[from]);
+    // Nearer samples weigh more: they say where the curve leaves, the far
+    // ones say where it is going.
+    const weight = 1 / k;
+    x += d[0] * weight;
+    y += d[1] * weight;
+  }
+  return normalize([x, y]);
+}
+
+/** Unit direction through `index`, taken from both sides of the closed loop. */
+function centredTangent(points: Point[], index: number): Point {
+  const n = points.length;
+  let x = 0;
+  let y = 0;
+  for (let k = 1; k <= TANGENT_SPAN; k++) {
+    const d = subtract(points[(index + k) % n], points[(index - k + n) % n]);
+    const weight = 1 / k;
+    x += d[0] * weight;
+    y += d[1] * weight;
+  }
+  return normalize([x, y]);
+}
+
+/**
+ * Indices where the outline genuinely turns a corner.
+ *
+ * Corners have to be found GEOMETRICALLY and pinned as segment ends, not left
+ * to the fit's error-driven splitting. The fit tolerance must be at least the
+ * size of the grid quantisation — that is what lets it average the staircase
+ * away — and any tolerance-bounded fit is free to cut a sharp corner by that
+ * much. Pinning the corner makes it an endpoint, which is exact.
+ *
+ * The turn is measured across `windowMm` of arc on each side rather than
+ * between neighbouring samples: one step of a marching-squares staircase turns
+ * 45°, so a per-sample test would call every edge of every shape a corner.
+ */
+function findCorners(points: Point[], windowMm: number): number[] {
+  const n = points.length;
+  if (n < MIN_FIT_POINTS || !(windowMm > 0)) return [];
+  const maxSteps = Math.max(2, Math.floor(n / 4));
+  /** Index reached by walking `dir` from `i` until `windowMm` of arc passes. */
+  const walk = (i: number, dir: number): number => {
+    let length = 0;
+    let j = i;
+    for (let s = 0; s < maxSteps; s++) {
+      const next = (j + dir + n) % n;
+      length += Math.hypot(...subtract(points[next], points[j]));
+      j = next;
+      if (length >= windowMm) break;
+    }
+    return j;
+  };
+
+  const turn = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const a = normalize(subtract(points[i], points[walk(i, -1)]));
+    const b = normalize(subtract(points[walk(i, 1)], points[i]));
+    if ((a[0] === 0 && a[1] === 0) || (b[0] === 0 && b[1] === 0)) continue;
+    turn[i] = Math.acos(Math.max(-1, Math.min(1, a[0] * b[0] + a[1] * b[1])));
+  }
+
+  // Walk the loop once, collecting maximal runs above the shoulder threshold
+  // and keeping only those that peak above the confirm threshold. A gently
+  // curving outline sits below the shoulder everywhere; a small circle sits
+  // above the shoulder everywhere but never peaks, so it stays smooth too.
+  const pinned: number[] = [];
+  let start = 0;
+  while (start < n && turn[start] >= CORNER_SHOULDER_RAD) start++;
+  if (start === n) return []; // above the shoulder all the way round
+  for (let offset = 0; offset < n; offset++) {
+    const i = (start + offset) % n;
+    if (turn[i] < CORNER_SHOULDER_RAD) continue;
+    const run: number[] = [];
+    let peak = 0;
+    let k = offset;
+    while (k < n) {
+      const index = (start + k) % n;
+      if (turn[index] < CORNER_SHOULDER_RAD) break;
+      run.push(index);
+      peak = Math.max(peak, turn[index]);
+      k++;
+    }
+    if (peak >= CORNER_CONFIRM_RAD) pinned.push(...run);
+    offset = k - 1;
+  }
+  return pinned.sort((p, q) => p - q);
+}
+
+function bezierAt(curve: Cubic, t: number): Point {
+  const u = 1 - t;
+  const b0 = u * u * u;
+  const b1 = 3 * u * u * t;
+  const b2 = 3 * u * t * t;
+  const b3 = t * t * t;
+  return [
+    curve[0][0] * b0 + curve[1][0] * b1 + curve[2][0] * b2 + curve[3][0] * b3,
+    curve[0][1] * b0 + curve[1][1] * b1 + curve[2][1] * b2 + curve[3][1] * b3,
+  ];
+}
+
+/** Chord-length parameterisation of a point run, normalised to 0..1. */
+function chordParameters(points: Point[], start: number, end: number): number[] {
+  const u = [0];
+  for (let i = start + 1; i <= end; i++) {
+    u.push(u[u.length - 1] + Math.hypot(...subtract(points[i], points[i - 1])));
+  }
+  const total = u[u.length - 1];
+  if (!(total > 0)) return u.map((_, i) => i / Math.max(1, u.length - 1));
+  return u.map((v) => v / total);
+}
+
+/**
+ * Least-squares cubic through `points[start..end]` with the given unit end
+ * tangents, solved for the two control-point distances. The 2×2 normal
+ * equations are the standard ones; `t2` points BACK from the end point.
+ */
+function fitOneCubic(
+  points: Point[],
+  start: number,
+  end: number,
+  t1: Point,
+  t2: Point,
+  u: number[]
+): Cubic {
+  const first = points[start];
+  const last = points[end];
+  let c00 = 0;
+  let c01 = 0;
+  let c11 = 0;
+  let x0 = 0;
+  let x1 = 0;
+  for (let i = 0; i <= end - start; i++) {
+    const t = u[i];
+    const v = 1 - t;
+    const b0 = v * v * v;
+    const b1 = 3 * v * v * t;
+    const b2 = 3 * v * t * t;
+    const b3 = t * t * t;
+    const a1: Point = [t1[0] * b1, t1[1] * b1];
+    const a2: Point = [t2[0] * b2, t2[1] * b2];
+    c00 += a1[0] * a1[0] + a1[1] * a1[1];
+    c01 += a1[0] * a2[0] + a1[1] * a2[1];
+    c11 += a2[0] * a2[0] + a2[1] * a2[1];
+    const target: Point = [
+      points[start + i][0] - (first[0] * (b0 + b1) + last[0] * (b2 + b3)),
+      points[start + i][1] - (first[1] * (b0 + b1) + last[1] * (b2 + b3)),
+    ];
+    x0 += target[0] * a1[0] + target[1] * a1[1];
+    x1 += target[0] * a2[0] + target[1] * a2[1];
+  }
+
+  const det = c00 * c11 - c01 * c01;
+  const chord = Math.hypot(...subtract(last, first));
+  let alpha1 = det !== 0 ? (x0 * c11 - x1 * c01) / det : 0;
+  let alpha2 = det !== 0 ? (c00 * x1 - c01 * x0) / det : 0;
+  // A degenerate solve means the data does not constrain the handles; the
+  // even-thirds fallback is what every implementation of this uses.
+  const minimum = chord * 1e-6;
+  if (!(alpha1 > minimum) || !(alpha2 > minimum) || !Number.isFinite(alpha1) || !Number.isFinite(alpha2)) {
+    alpha1 = chord / 3;
+    alpha2 = chord / 3;
+  }
+  return [
+    first,
+    [first[0] + t1[0] * alpha1, first[1] + t1[1] * alpha1],
+    [last[0] + t2[0] * alpha2, last[1] + t2[1] * alpha2],
+    last,
+  ];
+}
+
+/** Fit `points[start..end]`, splitting at the worst sample until it holds. */
+function fitCubics(
+  points: Point[],
+  start: number,
+  end: number,
+  t1: Point,
+  t2: Point,
+  tolerance: number,
+  depth: number,
+  out: Cubic[]
+): void {
+  if (end - start < 1) return;
+  if (end - start === 1) {
+    const a = points[start];
+    const b = points[end];
+    out.push([a, a, b, b]);
+    return;
+  }
+
+  const u = chordParameters(points, start, end);
+  const curve = fitOneCubic(points, start, end, t1, t2, u);
+
+  let worst = -1;
+  let worstError = 0;
+  for (let i = 1; i < end - start; i++) {
+    const on = bezierAt(curve, u[i]);
+    const error = Math.hypot(...subtract(points[start + i], on));
+    if (error > worstError) {
+      worstError = error;
+      worst = start + i;
+    }
+  }
+  if (worstError <= tolerance || depth >= MAX_FIT_DEPTH || worst <= start || worst >= end) {
+    out.push(curve);
+    return;
+  }
+
+  // Split at the worst sample with ONE-SIDED tangents on each side. A corner
+  // is exactly where the fit fails, so this both refines a curve and keeps a
+  // corner sharp — a centred tangent here would round off every serif.
+  fitCubics(points, start, worst, t1, spanTangent(points, worst, start), tolerance, depth + 1, out);
+  fitCubics(points, worst, end, spanTangent(points, worst, end), t2, tolerance, depth + 1, out);
+}
+
+/** Emit `curve` as points, subdividing until the control polygon is flat. */
+function flatten(curve: Cubic, tolerance: number, depth: number, out: Point[]): void {
+  const [p0, p1, p2, p3] = curve;
+  const dx = p3[0] - p0[0];
+  const dy = p3[1] - p0[1];
+  const chord = Math.hypot(dx, dy);
+  if (depth >= MAX_FLATTEN_DEPTH || chord === 0) {
+    out.push(p0);
+    return;
+  }
+  const distance = (p: Point) => Math.abs(dy * (p[0] - p0[0]) - dx * (p[1] - p0[1])) / chord;
+  if (Math.max(distance(p1), distance(p2)) <= tolerance) {
+    out.push(p0);
+    return;
+  }
+  // de Casteljau at t = 1/2.
+  const mid = (a: Point, b: Point): Point => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+  const p01 = mid(p0, p1);
+  const p12 = mid(p1, p2);
+  const p23 = mid(p2, p3);
+  const p012 = mid(p01, p12);
+  const p123 = mid(p12, p23);
+  const centre = mid(p012, p123);
+  flatten([p0, p01, p012, centre], tolerance, depth + 1, out);
+  flatten([centre, p123, p23, p3], tolerance, depth + 1, out);
+}
+
+/**
+ * Vectorise one closed traced loop: fit cubics through it, then flatten them
+ * back to the point list the extruder consumes.
+ *
+ * Point ORDER is never touched, only how many points there are and where they
+ * sit, so the loop's winding survives untouched — which matters more here than
+ * it looks: outers and holes come out of the tracer with OPPOSITE windings and
+ * Clipper2's NonZero fill is what turns that into a hole. Reverse a loop and
+ * the hole fills in.
+ */
+export function fitClosedContour(
+  points: Point[],
+  tolerance: number,
+  cornerWindowMm = tolerance * 6
+): Point[] {
+  const n = points.length;
+  if (n < MIN_FIT_POINTS) return points;
+
+  // Cut the closed loop into open runs before fitting — one cubic cannot
+  // describe a closed curve. Corners are the natural cuts; where a loop has
+  // fewer than two, evenly spaced ones stand in, so no single seam carries
+  // the whole approximation error.
+  const corners = findCorners(points, cornerWindowMm);
+  const cuts = new Set(corners);
+  if (cuts.size < 2) {
+    for (let i = 0; i < INITIAL_SEGMENTS; i++) {
+      cuts.add(Math.round((i * n) / INITIAL_SEGMENTS) % n);
+    }
+  }
+  const ordered = [...cuts].sort((p, q) => p - q);
+  if (ordered.length < 2) return points;
+
+  // A cut that is not a corner is a place the curve passes STRAIGHT through,
+  // so both runs meeting there share one centred tangent and the join stays
+  // smooth. At a corner each side keeps its own direction.
+  const cornerSet = new Set(corners);
+  const smoothTangent = new Map<number, Point>();
+  for (const cut of ordered) {
+    if (!cornerSet.has(cut)) smoothTangent.set(cut, centredTangent(points, cut));
+  }
+
+  const curves: Cubic[] = [];
+  for (let i = 0; i < ordered.length; i++) {
+    const from = ordered[i];
+    const to = ordered[(i + 1) % ordered.length];
+    // Unroll the wrap so the run is a plain ascending range.
+    const run: Point[] =
+      to > from
+        ? points.slice(from, to + 1)
+        : [...points.slice(from), ...points.slice(0, to + 1)];
+    if (run.length < 2) continue;
+    const startTangent = smoothTangent.get(from) ?? spanTangent(run, 0, run.length - 1);
+    const endSmooth = smoothTangent.get(to);
+    const endTangent: Point = endSmooth
+      ? [-endSmooth[0], -endSmooth[1]]
+      : spanTangent(run, run.length - 1, 0);
+    fitCubics(run, 0, run.length - 1, startTangent, endTangent, tolerance, 0, curves);
+  }
+  if (curves.length === 0) return points;
+
+  const out: Point[] = [];
+  for (const curve of curves) flatten(curve, tolerance * FLATTEN_SLACK, 0, out);
+  // Fewer than three points is not a polygon; the caller drops it either way,
+  // but returning the original keeps the failure visible rather than silent.
+  return out.length >= 3 ? out : points;
 }
 
 /**
@@ -315,16 +1196,19 @@ export function gridToSilhouetteContours(
       (x - cx) * px,
       -(y - cy) * px,
     ]);
-    const simplified = simplifyPolyline(mm, tolerance);
+    // The corner window is in pixels, not in tolerance: it has to span the
+    // grid's own staircase, which is what makes a bend distinguishable from
+    // quantisation in the first place.
+    const simplified = fitClosedContour(mm, tolerance, px * 2.5);
     if (simplified.length < 3) continue;
-    // Discard specks smaller than 1 mm².
+    // Discard specks — the same threshold measureThinnestFeature ignores.
     let area = 0;
     for (let i = 0; i < simplified.length; i++) {
       const [x1, y1] = simplified[i];
       const [x2, y2] = simplified[(i + 1) % simplified.length];
       area += x1 * y2 - x2 * y1;
     }
-    if (Math.abs(area / 2) < 1) continue;
+    if (Math.abs(area / 2) < MIN_CONTOUR_AREA_MM2) continue;
     contours.push(simplified);
   }
   return contours;

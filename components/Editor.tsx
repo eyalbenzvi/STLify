@@ -645,7 +645,7 @@ function EditorInner() {
   // loading is a self-contained domain, and Editor.tsx had grown past 2,800
   // lines holding every concern at once.
   const {
-    handleStlFile,
+    handleMeshFile,
     confirmStlImport,
     handleSvgConfirm,
     handleImageFile,
@@ -829,7 +829,7 @@ function EditorInner() {
         onRedo={() => dispatch({ type: "history/redo" })}
         onApplyTemplate={(template) => applyDocument(template, "טעינת תבנית")}
         onRequestBaseMode={setModeSwitchTarget}
-        onStlFile={(file) => void handleStlFile(file)}
+        onMeshFile={(file) => void handleMeshFile(file)}
         onSvgFile={(file) =>
           void file.text().then((text) => setSvgPending({ text, fileName: file.name }))
         }
@@ -1260,6 +1260,7 @@ function EditorInner() {
       />
       <ImageImportDialog
         open={imagePending !== null}
+        file={imagePending?.file ?? null}
         fileName={imagePending?.fileName ?? ""}
         onConfirm={handleImageConfirm}
         onClose={() => setImagePending(null)}

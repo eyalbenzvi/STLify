@@ -1,6 +1,7 @@
 /**
  * Automatic background removal — pure algorithm (no DOM), suitable for
- * running inside a Web Worker.
+ * running inside a Web Worker. Nothing here may reach for canvas or
+ * `document`; the raster arrives as bytes and leaves as a mask.
  *
  * Approach: classic border-seeded flood fill. The border pixels are
  * clustered into up to two dominant colours; every pixel reachable from the
@@ -9,8 +10,18 @@
  * model download), deterministic, fast, and works well for logos, product
  * shots and scans on roughly uniform backgrounds.
  *
- * When it fails (busy backgrounds), the UI offers threshold mode and manual
- * mask brushing as fallbacks — see the image dialog.
+ * Colours are compared in CIELAB, not RGB. RGB distance is not perceptual:
+ * it merges saturated colours a person reads as plainly different (yellow and
+ * orange sit 75 RGB units apart, closer than the default tolerance) while
+ * splitting near-identical dark tones. Both errors show up as holes in the
+ * subject or background left behind.
+ *
+ * When it fails (busy backgrounds), the image dialog offers the threshold
+ * controls and a manual mask brush over a live silhouette preview
+ * (`MaskBrush` in components/dialogs/ImportDialogs.tsx). Until V7 this
+ * paragraph named a brush that did not exist and the dialog had no recourse
+ * at all — which is why it now names the component, so the claim can be
+ * checked rather than believed.
  */
 
 /** RGBA raster, row-major, row 0 = top. */
@@ -34,21 +45,57 @@ export interface RemoveBackgroundResult {
   backgroundFraction: number;
 }
 
+/** A colour in CIELAB: lightness 0..100, then the two opponent axes. */
+type Lab = [number, number, number];
+
 interface Cluster {
-  r: number;
-  g: number;
-  b: number;
+  centre: Lab;
   count: number;
 }
 
+/** sRGB byte → linear light. Table because it runs once per channel per pixel. */
+const SRGB_TO_LINEAR = (() => {
+  const table = new Float64Array(256);
+  for (let v = 0; v < 256; v++) {
+    const c = v / 255;
+    table[v] = c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  }
+  return table;
+})();
+
+/** CIE standard illuminant D65, the sRGB white point. */
+const WHITE_X = 0.95047;
+const WHITE_Y = 1.0;
+const WHITE_Z = 1.08883;
+
+function labF(t: number): number {
+  return t > 216 / 24389 ? Math.cbrt(t) : (841 / 108) * t + 4 / 29;
+}
+
+/** sRGB (0..255) → CIELAB, D65, the standard two-step through XYZ. */
+export function rgbToLab(r: number, g: number, b: number): Lab {
+  const rl = SRGB_TO_LINEAR[r | 0];
+  const gl = SRGB_TO_LINEAR[g | 0];
+  const bl = SRGB_TO_LINEAR[b | 0];
+  const x = labF((0.4124564 * rl + 0.3575761 * gl + 0.1804375 * bl) / WHITE_X);
+  const y = labF((0.2126729 * rl + 0.7151522 * gl + 0.072175 * bl) / WHITE_Y);
+  const z = labF((0.0193339 * rl + 0.119192 * gl + 0.9503041 * bl) / WHITE_Z);
+  return [116 * y - 16, 500 * (x - y), 200 * (y - z)];
+}
+
+/** Squared CIE76 ΔE — Euclidean distance in CIELAB. */
+function deltaE2(a: Lab, b: Lab): number {
+  return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2;
+}
+
 /** Cluster border pixels into up to two dominant colours (mini k-means). */
-function borderClusters(image: RawImage): Cluster[] {
+function borderClusters(image: RawImage, lab: Float32Array): Cluster[] {
   const { width: w, height: h, data } = image;
-  const samples: [number, number, number][] = [];
+  const samples: Lab[] = [];
   const push = (x: number, y: number): void => {
-    const i = (y * w + x) * 4;
-    if (data[i + 3] < 16) return; // already-transparent border counts as background anyway
-    samples.push([data[i], data[i + 1], data[i + 2]]);
+    const i = y * w + x;
+    if (data[i * 4 + 3] < 16) return; // already-transparent border counts as background anyway
+    samples.push([lab[i * 3], lab[i * 3 + 1], lab[i * 3 + 2]]);
   };
   for (let x = 0; x < w; x++) {
     push(x, 0);
@@ -65,7 +112,7 @@ function borderClusters(image: RawImage): Cluster[] {
   let far = samples[0];
   let farDist = -1;
   for (const s of samples) {
-    const d = dist2(s, c1);
+    const d = deltaE2(s, c1);
     if (d > farDist) {
       farDist = d;
       far = s;
@@ -75,37 +122,46 @@ function borderClusters(image: RawImage): Cluster[] {
 
   let assign = new Array<number>(samples.length).fill(0);
   for (let iter = 0; iter < 6; iter++) {
-    assign = samples.map((s) => (dist2(s, c1) <= dist2(s, c2) ? 0 : 1));
-    const sums: Cluster[] = [
-      { r: 0, g: 0, b: 0, count: 0 },
-      { r: 0, g: 0, b: 0, count: 0 },
+    assign = samples.map((s) => (deltaE2(s, c1) <= deltaE2(s, c2) ? 0 : 1));
+    const sums: [Lab, Lab] = [
+      [0, 0, 0],
+      [0, 0, 0],
     ];
+    const counts = [0, 0];
     samples.forEach((s, i) => {
       const c = sums[assign[i]];
-      c.r += s[0];
-      c.g += s[1];
-      c.b += s[2];
-      c.count++;
+      c[0] += s[0];
+      c[1] += s[1];
+      c[2] += s[2];
+      counts[assign[i]]++;
     });
-    if (sums[0].count > 0) c1 = [sums[0].r / sums[0].count, sums[0].g / sums[0].count, sums[0].b / sums[0].count];
-    if (sums[1].count > 0) c2 = [sums[1].r / sums[1].count, sums[1].g / sums[1].count, sums[1].b / sums[1].count];
+    if (counts[0] > 0) c1 = [sums[0][0] / counts[0], sums[0][1] / counts[0], sums[0][2] / counts[0]];
+    if (counts[1] > 0) c2 = [sums[1][0] / counts[1], sums[1][1] / counts[1], sums[1][2] / counts[1]];
   }
 
   const n0 = assign.filter((a) => a === 0).length;
   const n1 = assign.length - n0;
   const clusters: Cluster[] = [];
-  if (n0 > 0) clusters.push({ r: c1[0], g: c1[1], b: c1[2], count: n0 });
+  if (n0 > 0) clusters.push({ centre: c1, count: n0 });
   // Keep the second cluster only when it is a meaningful share of the border.
-  if (n1 > assign.length * 0.15) clusters.push({ r: c2[0], g: c2[1], b: c2[2], count: n1 });
+  if (n1 > assign.length * 0.15) clusters.push({ centre: c2, count: n1 });
   return clusters;
 }
 
-function dist2(a: [number, number, number], b: [number, number, number] | Cluster): number {
-  const br = Array.isArray(b) ? b[0] : b.r;
-  const bg = Array.isArray(b) ? b[1] : b.g;
-  const bb = Array.isArray(b) ? b[2] : b.b;
-  return (a[0] - br) ** 2 + (a[1] - bg) ** 2 + (a[2] - bb) ** 2;
-}
+/**
+ * The 0..100 tolerance in ΔE units.
+ *
+ * The scale is a stored/user-facing number whose meaning was defined by the
+ * old squared-RGB mapping (`tolerance × 4.42` RGB units), so the metric could
+ * not change without redefining every value already in use. Along the grey
+ * axis — where most backgrounds live, and where the two metrics can be
+ * compared directly — an RGB distance of `tolerance × 4.42` works out at very
+ * nearly `tolerance` ΔE: at the default 24 the old threshold spans RGB 106,
+ * which is ΔE 27 at grey 40, 23 at grey 128 and 22 at grey 180. So the
+ * mapping is 1:1, and the default keeps doing what it did. Off the grey axis
+ * the two deliberately part company — that is the entire point of the change.
+ */
+const DELTA_E_PER_TOLERANCE_UNIT = 1;
 
 /**
  * Compute a background mask for the image. 255 = foreground (keep).
@@ -118,17 +174,26 @@ export function removeBackgroundAuto(
   const total = w * h;
   const mask = new Uint8Array(total).fill(255);
   const tolerance = Math.max(1, Math.min(100, options.tolerance));
-  // Map the 0..100 tolerance to a squared RGB distance.
-  const maxDist2 = (tolerance * 4.42) ** 2;
+  const maxDeltaE2 = (tolerance * DELTA_E_PER_TOLERANCE_UNIT) ** 2;
 
-  const clusters = borderClusters(image);
+  // One conversion per pixel, held for the whole run: the flood fill retests
+  // a rejected pixel once per neighbour that reaches it.
+  const lab = new Float32Array(total * 3);
+  for (let i = 0; i < total; i++) {
+    const [L, a, b] = rgbToLab(data[i * 4], data[i * 4 + 1], data[i * 4 + 2]);
+    lab[i * 3] = L;
+    lab[i * 3 + 1] = a;
+    lab[i * 3 + 2] = b;
+  }
+
+  const clusters = borderClusters(image, lab);
   options.onProgress?.(0.1);
 
   const isBackgroundColor = (i: number): boolean => {
     if (data[i * 4 + 3] < 16) return true; // transparent already
-    const px: [number, number, number] = [data[i * 4], data[i * 4 + 1], data[i * 4 + 2]];
+    const px: Lab = [lab[i * 3], lab[i * 3 + 1], lab[i * 3 + 2]];
     for (const c of clusters) {
-      if (dist2(px, c) <= maxDist2) return true;
+      if (deltaE2(px, c.centre) <= maxDeltaE2) return true;
     }
     return false;
   };
