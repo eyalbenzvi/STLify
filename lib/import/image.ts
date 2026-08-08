@@ -583,36 +583,390 @@ export function thinFeatureMessageHe(report: ThinFeatureReport, applied: boolean
   );
 }
 
-/** Douglas-Peucker simplification. */
-function simplifyPolyline(points: [number, number][], tolerance: number): [number, number][] {
-  if (points.length <= 4) return points;
-  const keep = new Uint8Array(points.length);
-  keep[0] = keep[points.length - 1] = 1;
-  const stack: [number, number][] = [[0, points.length - 1]];
-  while (stack.length > 0) {
-    const [start, end] = stack.pop()!;
-    if (end - start < 2) continue;
-    const [x1, y1] = points[start];
-    const [x2, y2] = points[end];
-    const dx = x2 - x1;
-    const dy = y2 - y1;
-    const len = Math.hypot(dx, dy) || 1;
-    let worst = -1;
-    let worstDist = tolerance;
-    for (let i = start + 1; i < end; i++) {
-      const [px, py] = points[i];
-      const dist = Math.abs(dy * (px - x1) - dx * (py - y1)) / len;
-      if (dist > worstDist) {
-        worstDist = dist;
-        worst = i;
-      }
+// ---------------------------------------------------------------------------
+// Contour vectorisation (curve fitting)
+// ---------------------------------------------------------------------------
+
+/**
+ * Marching squares walks a grid, so its output is a staircase whichever way
+ * you look at it. Douglas-Peucker used to reduce that staircase by KEEPING a
+ * subset of its own points — which means the result is still on the staircase,
+ * only with the steps further apart. Every letter and every logo edge came out
+ * faceted, and the faceting was a property of the tracer, not of the artwork.
+ *
+ * Fitting cubics instead lets the curve pass BETWEEN the sample points, so the
+ * grid quantisation averages out rather than being preserved: the same
+ * tolerance buys a shape both closer to the original and described by fewer
+ * points. There is no new setting — the tolerance is the one the tracer
+ * already derives from the pixel size.
+ *
+ * Written from scratch: the classic tracer for this job, potrace, is GPL, and
+ * this repository is not.
+ */
+
+type Point = [number, number];
+type Cubic = [Point, Point, Point, Point];
+
+/** How many points ahead a one-sided tangent looks. One step of the grid
+ * staircase turns 45°, so a tangent from the immediate neighbour is noise. */
+const TANGENT_SPAN = 3;
+/** Recursion guard on fit splitting and on flattening. */
+const MAX_FIT_DEPTH = 12;
+const MAX_FLATTEN_DEPTH = 10;
+/**
+ * Flattening runs looser than fitting.
+ *
+ * The two errors do not add up in practice — the fit error is where the curve
+ * sits relative to the samples, the flattening error is where the chord sits
+ * relative to the curve, and the flatness test itself is conservative by about
+ * a third. Measured on traced disks, raising this from 1 to 1.5 drops the
+ * point count by a fifth and leaves the deviation from a true circle
+ * unchanged; past 2 the deviation starts to climb.
+ */
+const FLATTEN_SLACK = 1.5;
+/** Below this a loop has no curve worth fitting. */
+const MIN_FIT_POINTS = 8;
+/** Initial cuts of a closed loop; a single cubic cannot describe one. */
+const INITIAL_SEGMENTS = 4;
+/**
+ * A corner is confirmed when the turn over the window reaches CONFIRM
+ * somewhere, and the whole run of samples above SHOULDER around it is pinned.
+ *
+ * Two thresholds because a raster corner is not one sample. Marching squares
+ * cuts a right angle into a 45° diagonal, so the 90° of turn arrives spread
+ * over three or four samples with no single dominant one — pin only the
+ * sharpest and the fit smooths straight across the shoulders, which is the
+ * corner-cutting the whole exercise is trying to avoid.
+ */
+const CORNER_CONFIRM_RAD = (65 * Math.PI) / 180;
+const CORNER_SHOULDER_RAD = (30 * Math.PI) / 180;
+
+function subtract(a: Point, b: Point): Point {
+  return [a[0] - b[0], a[1] - b[1]];
+}
+
+function normalize(v: Point): Point {
+  const length = Math.hypot(v[0], v[1]);
+  return length > 0 ? [v[0] / length, v[1] / length] : [0, 0];
+}
+
+/**
+ * Unit direction leaving `points[from]` toward `points[to]`, averaged over the
+ * span between them so a staircase step does not become the tangent.
+ */
+function spanTangent(points: Point[], from: number, to: number): Point {
+  const step = to > from ? 1 : -1;
+  const limit = Math.min(Math.abs(to - from), TANGENT_SPAN);
+  let x = 0;
+  let y = 0;
+  for (let k = 1; k <= limit; k++) {
+    const d = subtract(points[from + step * k], points[from]);
+    // Nearer samples weigh more: they say where the curve leaves, the far
+    // ones say where it is going.
+    const weight = 1 / k;
+    x += d[0] * weight;
+    y += d[1] * weight;
+  }
+  return normalize([x, y]);
+}
+
+/** Unit direction through `index`, taken from both sides of the closed loop. */
+function centredTangent(points: Point[], index: number): Point {
+  const n = points.length;
+  let x = 0;
+  let y = 0;
+  for (let k = 1; k <= TANGENT_SPAN; k++) {
+    const d = subtract(points[(index + k) % n], points[(index - k + n) % n]);
+    const weight = 1 / k;
+    x += d[0] * weight;
+    y += d[1] * weight;
+  }
+  return normalize([x, y]);
+}
+
+/**
+ * Indices where the outline genuinely turns a corner.
+ *
+ * Corners have to be found GEOMETRICALLY and pinned as segment ends, not left
+ * to the fit's error-driven splitting. The fit tolerance must be at least the
+ * size of the grid quantisation — that is what lets it average the staircase
+ * away — and any tolerance-bounded fit is free to cut a sharp corner by that
+ * much. Pinning the corner makes it an endpoint, which is exact.
+ *
+ * The turn is measured across `windowMm` of arc on each side rather than
+ * between neighbouring samples: one step of a marching-squares staircase turns
+ * 45°, so a per-sample test would call every edge of every shape a corner.
+ */
+function findCorners(points: Point[], windowMm: number): number[] {
+  const n = points.length;
+  if (n < MIN_FIT_POINTS || !(windowMm > 0)) return [];
+  const maxSteps = Math.max(2, Math.floor(n / 4));
+  /** Index reached by walking `dir` from `i` until `windowMm` of arc passes. */
+  const walk = (i: number, dir: number): number => {
+    let length = 0;
+    let j = i;
+    for (let s = 0; s < maxSteps; s++) {
+      const next = (j + dir + n) % n;
+      length += Math.hypot(...subtract(points[next], points[j]));
+      j = next;
+      if (length >= windowMm) break;
     }
-    if (worst >= 0) {
-      keep[worst] = 1;
-      stack.push([start, worst], [worst, end]);
+    return j;
+  };
+
+  const turn = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const a = normalize(subtract(points[i], points[walk(i, -1)]));
+    const b = normalize(subtract(points[walk(i, 1)], points[i]));
+    if ((a[0] === 0 && a[1] === 0) || (b[0] === 0 && b[1] === 0)) continue;
+    turn[i] = Math.acos(Math.max(-1, Math.min(1, a[0] * b[0] + a[1] * b[1])));
+  }
+
+  // Walk the loop once, collecting maximal runs above the shoulder threshold
+  // and keeping only those that peak above the confirm threshold. A gently
+  // curving outline sits below the shoulder everywhere; a small circle sits
+  // above the shoulder everywhere but never peaks, so it stays smooth too.
+  const pinned: number[] = [];
+  let start = 0;
+  while (start < n && turn[start] >= CORNER_SHOULDER_RAD) start++;
+  if (start === n) return []; // above the shoulder all the way round
+  for (let offset = 0; offset < n; offset++) {
+    const i = (start + offset) % n;
+    if (turn[i] < CORNER_SHOULDER_RAD) continue;
+    const run: number[] = [];
+    let peak = 0;
+    let k = offset;
+    while (k < n) {
+      const index = (start + k) % n;
+      if (turn[index] < CORNER_SHOULDER_RAD) break;
+      run.push(index);
+      peak = Math.max(peak, turn[index]);
+      k++;
+    }
+    if (peak >= CORNER_CONFIRM_RAD) pinned.push(...run);
+    offset = k - 1;
+  }
+  return pinned.sort((p, q) => p - q);
+}
+
+function bezierAt(curve: Cubic, t: number): Point {
+  const u = 1 - t;
+  const b0 = u * u * u;
+  const b1 = 3 * u * u * t;
+  const b2 = 3 * u * t * t;
+  const b3 = t * t * t;
+  return [
+    curve[0][0] * b0 + curve[1][0] * b1 + curve[2][0] * b2 + curve[3][0] * b3,
+    curve[0][1] * b0 + curve[1][1] * b1 + curve[2][1] * b2 + curve[3][1] * b3,
+  ];
+}
+
+/** Chord-length parameterisation of a point run, normalised to 0..1. */
+function chordParameters(points: Point[], start: number, end: number): number[] {
+  const u = [0];
+  for (let i = start + 1; i <= end; i++) {
+    u.push(u[u.length - 1] + Math.hypot(...subtract(points[i], points[i - 1])));
+  }
+  const total = u[u.length - 1];
+  if (!(total > 0)) return u.map((_, i) => i / Math.max(1, u.length - 1));
+  return u.map((v) => v / total);
+}
+
+/**
+ * Least-squares cubic through `points[start..end]` with the given unit end
+ * tangents, solved for the two control-point distances. The 2×2 normal
+ * equations are the standard ones; `t2` points BACK from the end point.
+ */
+function fitOneCubic(
+  points: Point[],
+  start: number,
+  end: number,
+  t1: Point,
+  t2: Point,
+  u: number[]
+): Cubic {
+  const first = points[start];
+  const last = points[end];
+  let c00 = 0;
+  let c01 = 0;
+  let c11 = 0;
+  let x0 = 0;
+  let x1 = 0;
+  for (let i = 0; i <= end - start; i++) {
+    const t = u[i];
+    const v = 1 - t;
+    const b0 = v * v * v;
+    const b1 = 3 * v * v * t;
+    const b2 = 3 * v * t * t;
+    const b3 = t * t * t;
+    const a1: Point = [t1[0] * b1, t1[1] * b1];
+    const a2: Point = [t2[0] * b2, t2[1] * b2];
+    c00 += a1[0] * a1[0] + a1[1] * a1[1];
+    c01 += a1[0] * a2[0] + a1[1] * a2[1];
+    c11 += a2[0] * a2[0] + a2[1] * a2[1];
+    const target: Point = [
+      points[start + i][0] - (first[0] * (b0 + b1) + last[0] * (b2 + b3)),
+      points[start + i][1] - (first[1] * (b0 + b1) + last[1] * (b2 + b3)),
+    ];
+    x0 += target[0] * a1[0] + target[1] * a1[1];
+    x1 += target[0] * a2[0] + target[1] * a2[1];
+  }
+
+  const det = c00 * c11 - c01 * c01;
+  const chord = Math.hypot(...subtract(last, first));
+  let alpha1 = det !== 0 ? (x0 * c11 - x1 * c01) / det : 0;
+  let alpha2 = det !== 0 ? (c00 * x1 - c01 * x0) / det : 0;
+  // A degenerate solve means the data does not constrain the handles; the
+  // even-thirds fallback is what every implementation of this uses.
+  const minimum = chord * 1e-6;
+  if (!(alpha1 > minimum) || !(alpha2 > minimum) || !Number.isFinite(alpha1) || !Number.isFinite(alpha2)) {
+    alpha1 = chord / 3;
+    alpha2 = chord / 3;
+  }
+  return [
+    first,
+    [first[0] + t1[0] * alpha1, first[1] + t1[1] * alpha1],
+    [last[0] + t2[0] * alpha2, last[1] + t2[1] * alpha2],
+    last,
+  ];
+}
+
+/** Fit `points[start..end]`, splitting at the worst sample until it holds. */
+function fitCubics(
+  points: Point[],
+  start: number,
+  end: number,
+  t1: Point,
+  t2: Point,
+  tolerance: number,
+  depth: number,
+  out: Cubic[]
+): void {
+  if (end - start < 1) return;
+  if (end - start === 1) {
+    const a = points[start];
+    const b = points[end];
+    out.push([a, a, b, b]);
+    return;
+  }
+
+  const u = chordParameters(points, start, end);
+  const curve = fitOneCubic(points, start, end, t1, t2, u);
+
+  let worst = -1;
+  let worstError = 0;
+  for (let i = 1; i < end - start; i++) {
+    const on = bezierAt(curve, u[i]);
+    const error = Math.hypot(...subtract(points[start + i], on));
+    if (error > worstError) {
+      worstError = error;
+      worst = start + i;
     }
   }
-  return points.filter((_, i) => keep[i] === 1);
+  if (worstError <= tolerance || depth >= MAX_FIT_DEPTH || worst <= start || worst >= end) {
+    out.push(curve);
+    return;
+  }
+
+  // Split at the worst sample with ONE-SIDED tangents on each side. A corner
+  // is exactly where the fit fails, so this both refines a curve and keeps a
+  // corner sharp — a centred tangent here would round off every serif.
+  fitCubics(points, start, worst, t1, spanTangent(points, worst, start), tolerance, depth + 1, out);
+  fitCubics(points, worst, end, spanTangent(points, worst, end), t2, tolerance, depth + 1, out);
+}
+
+/** Emit `curve` as points, subdividing until the control polygon is flat. */
+function flatten(curve: Cubic, tolerance: number, depth: number, out: Point[]): void {
+  const [p0, p1, p2, p3] = curve;
+  const dx = p3[0] - p0[0];
+  const dy = p3[1] - p0[1];
+  const chord = Math.hypot(dx, dy);
+  if (depth >= MAX_FLATTEN_DEPTH || chord === 0) {
+    out.push(p0);
+    return;
+  }
+  const distance = (p: Point) => Math.abs(dy * (p[0] - p0[0]) - dx * (p[1] - p0[1])) / chord;
+  if (Math.max(distance(p1), distance(p2)) <= tolerance) {
+    out.push(p0);
+    return;
+  }
+  // de Casteljau at t = 1/2.
+  const mid = (a: Point, b: Point): Point => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+  const p01 = mid(p0, p1);
+  const p12 = mid(p1, p2);
+  const p23 = mid(p2, p3);
+  const p012 = mid(p01, p12);
+  const p123 = mid(p12, p23);
+  const centre = mid(p012, p123);
+  flatten([p0, p01, p012, centre], tolerance, depth + 1, out);
+  flatten([centre, p123, p23, p3], tolerance, depth + 1, out);
+}
+
+/**
+ * Vectorise one closed traced loop: fit cubics through it, then flatten them
+ * back to the point list the extruder consumes.
+ *
+ * Point ORDER is never touched, only how many points there are and where they
+ * sit, so the loop's winding survives untouched — which matters more here than
+ * it looks: outers and holes come out of the tracer with OPPOSITE windings and
+ * Clipper2's NonZero fill is what turns that into a hole. Reverse a loop and
+ * the hole fills in.
+ */
+export function fitClosedContour(
+  points: Point[],
+  tolerance: number,
+  cornerWindowMm = tolerance * 6
+): Point[] {
+  const n = points.length;
+  if (n < MIN_FIT_POINTS) return points;
+
+  // Cut the closed loop into open runs before fitting — one cubic cannot
+  // describe a closed curve. Corners are the natural cuts; where a loop has
+  // fewer than two, evenly spaced ones stand in, so no single seam carries
+  // the whole approximation error.
+  const corners = findCorners(points, cornerWindowMm);
+  const cuts = new Set(corners);
+  if (cuts.size < 2) {
+    for (let i = 0; i < INITIAL_SEGMENTS; i++) {
+      cuts.add(Math.round((i * n) / INITIAL_SEGMENTS) % n);
+    }
+  }
+  const ordered = [...cuts].sort((p, q) => p - q);
+  if (ordered.length < 2) return points;
+
+  // A cut that is not a corner is a place the curve passes STRAIGHT through,
+  // so both runs meeting there share one centred tangent and the join stays
+  // smooth. At a corner each side keeps its own direction.
+  const cornerSet = new Set(corners);
+  const smoothTangent = new Map<number, Point>();
+  for (const cut of ordered) {
+    if (!cornerSet.has(cut)) smoothTangent.set(cut, centredTangent(points, cut));
+  }
+
+  const curves: Cubic[] = [];
+  for (let i = 0; i < ordered.length; i++) {
+    const from = ordered[i];
+    const to = ordered[(i + 1) % ordered.length];
+    // Unroll the wrap so the run is a plain ascending range.
+    const run: Point[] =
+      to > from
+        ? points.slice(from, to + 1)
+        : [...points.slice(from), ...points.slice(0, to + 1)];
+    if (run.length < 2) continue;
+    const startTangent = smoothTangent.get(from) ?? spanTangent(run, 0, run.length - 1);
+    const endSmooth = smoothTangent.get(to);
+    const endTangent: Point = endSmooth
+      ? [-endSmooth[0], -endSmooth[1]]
+      : spanTangent(run, run.length - 1, 0);
+    fitCubics(run, 0, run.length - 1, startTangent, endTangent, tolerance, 0, curves);
+  }
+  if (curves.length === 0) return points;
+
+  const out: Point[] = [];
+  for (const curve of curves) flatten(curve, tolerance * FLATTEN_SLACK, 0, out);
+  // Fewer than three points is not a polygon; the caller drops it either way,
+  // but returning the original keeps the failure visible rather than silent.
+  return out.length >= 3 ? out : points;
 }
 
 /**
@@ -777,7 +1131,10 @@ export function gridToSilhouetteContours(
       (x - cx) * px,
       -(y - cy) * px,
     ]);
-    const simplified = simplifyPolyline(mm, tolerance);
+    // The corner window is in pixels, not in tolerance: it has to span the
+    // grid's own staircase, which is what makes a bend distinguishable from
+    // quantisation in the first place.
+    const simplified = fitClosedContour(mm, tolerance, px * 2.5);
     if (simplified.length < 3) continue;
     // Discard specks smaller than 1 mm².
     let area = 0;

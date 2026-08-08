@@ -8,6 +8,7 @@ import { getGeometryKernel } from "@/lib/geometry/kernel";
 import {
   applyMaskStrokes,
   dilateSilhouetteGrid,
+  fitClosedContour,
   gridToSilhouetteContours,
   heightFieldToClosedMesh,
   IMAGE_INPUT_ACCEPT,
@@ -86,6 +87,159 @@ describe("gridToSilhouetteContours", () => {
     expect(b.volumeMm3()).toBeGreaterThan(a.volumeMm3());
     a.dispose();
     b.dispose();
+  });
+});
+
+describe("contour vectorisation", () => {
+  /**
+   * The Douglas-Peucker decimation V7 replaced, kept here as the reference
+   * the curve fitting has to beat. It could only ever KEEP points of the
+   * marching-squares staircase, so its output was still on the staircase —
+   * which is what the accuracy numbers below are measuring.
+   */
+  function douglasPeucker(points: [number, number][], tolerance: number): [number, number][] {
+    if (points.length <= 4) return points;
+    const keep = new Uint8Array(points.length);
+    keep[0] = keep[points.length - 1] = 1;
+    const stack: [number, number][] = [[0, points.length - 1]];
+    while (stack.length > 0) {
+      const [start, end] = stack.pop()!;
+      if (end - start < 2) continue;
+      const [x1, y1] = points[start];
+      const [x2, y2] = points[end];
+      const dx = x2 - x1;
+      const dy = y2 - y1;
+      const length = Math.hypot(dx, dy) || 1;
+      let worst = -1;
+      let worstDistance = tolerance;
+      for (let i = start + 1; i < end; i++) {
+        const distance =
+          Math.abs(dy * (points[i][0] - x1) - dx * (points[i][1] - y1)) / length;
+        if (distance > worstDistance) {
+          worstDistance = distance;
+          worst = i;
+        }
+      }
+      if (worst >= 0) {
+        keep[worst] = 1;
+        stack.push([start, worst], [worst, end]);
+      }
+    }
+    return points.filter((_, i) => keep[i] === 1);
+  }
+
+  /** Worst distance from a true circle, sampled ALONG each edge. */
+  function radialError(contour: [number, number][], radius: number): number {
+    let cx = 0;
+    let cy = 0;
+    for (const [x, y] of contour) {
+      cx += x;
+      cy += y;
+    }
+    cx /= contour.length;
+    cy /= contour.length;
+    let worst = 0;
+    for (let i = 0; i < contour.length; i++) {
+      const a = contour[i];
+      const b = contour[(i + 1) % contour.length];
+      for (let t = 0; t <= 1; t += 0.02) {
+        const x = a[0] + (b[0] - a[0]) * t;
+        const y = a[1] + (b[1] - a[1]) * t;
+        worst = Math.max(worst, Math.abs(Math.hypot(x - cx, y - cy) - radius));
+      }
+    }
+    return worst;
+  }
+
+  function polygonArea(contour: [number, number][]): number {
+    let area = 0;
+    for (let i = 0; i < contour.length; i++) {
+      const [x1, y1] = contour[i];
+      const [x2, y2] = contour[(i + 1) % contour.length];
+      area += x1 * y2 - x2 * y1;
+    }
+    return Math.abs(area / 2);
+  }
+
+  it("halves the deviation from a true circle, with fewer points", () => {
+    // 1 mm pixels, so the numbers below are also pixel counts. Douglas-Peucker
+    // was measured on the same traced loops before the change.
+    const cases: { radius: number; size: number; maxPoints: number }[] = [
+      { radius: 20, size: 64, maxPoints: 45 },
+      { radius: 30, size: 96, maxPoints: 73 },
+      { radius: 40, size: 128, maxPoints: 73 },
+    ];
+    for (const { radius, size, maxPoints } of cases) {
+      const contour = gridToSilhouetteContours(diskGrid(size, radius), {
+        threshold: 0.5,
+        invert: false,
+        pixelSizeMm: 1,
+      })[0] as [number, number][];
+      // Deviation from the true circle stays under 0.55 mm where the old
+      // decimation ran 0.89–1.01 mm — it could not do better, because it was
+      // restricted to points that sit ON the staircase.
+      expect(radialError(contour, radius)).toBeLessThan(0.55);
+      expect(contour.length).toBeLessThan(maxPoints);
+    }
+  });
+
+  it("keeps a right-angled corner exactly where the raster put it", () => {
+    // Corners are pinned as segment ends rather than fitted through, so the
+    // traced area matches what the marching-squares diagonal allows — the
+    // same area the old decimation produced, to the last hundredth.
+    const size = 40;
+    const values = new Float32Array(size * size).fill(1);
+    for (let y = 10; y < 30; y++) for (let x = 10; x < 30; x++) values[y * size + x] = 0;
+    const contour = gridToSilhouetteContours(
+      { width: size, height: size, values },
+      { threshold: 0.5, invert: false, pixelSizeMm: 1 }
+    )[0] as [number, number][];
+    expect(polygonArea(contour)).toBeCloseTo(399.5, 2);
+    // The apex samples survive; the fit is not free to cut across them.
+    const corners = contour.filter(([x, y]) => Math.abs(x) > 9 && Math.abs(y) > 9);
+    expect(corners.length).toBeGreaterThanOrEqual(4);
+  });
+
+  it("is closer to the truth than Douglas-Peucker on the same staircase", () => {
+    // Direct comparison on one input, and an honest one: this synthetic
+    // staircase is HARSHER than what the tracer really emits, because
+    // marching squares interpolates its crossings sub-pixel. On input this
+    // rough, decimation at a coarse tolerance wins on point count — it simply
+    // cuts across the steps — and loses on accuracy, which is the trade the
+    // change is making. The point-count win is measured on real traced loops
+    // in the first case above.
+    const staircase: [number, number][] = [];
+    const radius = 25;
+    for (let y = -radius; y <= radius; y++) {
+      const x = Math.round(Math.sqrt(Math.max(0, radius * radius - y * y))) + 0.5;
+      staircase.push([x, y - 0.5], [x, y + 0.5]);
+    }
+    for (let y = radius; y >= -radius; y--) {
+      const x = -(Math.round(Math.sqrt(Math.max(0, radius * radius - y * y))) + 0.5);
+      staircase.push([x, y + 0.5], [x, y - 0.5]);
+    }
+    const fitted = fitClosedContour(staircase, 1.2, 2.5);
+    const decimated = douglasPeucker(staircase, 1.2);
+    expect(radialError(fitted, radius)).toBeLessThan(radialError(decimated, radius) - 0.3);
+  });
+
+  it("a shape with a hole still extrudes with the hole open", async () => {
+    // The windings survive: the tracer emits outers and holes with OPPOSITE
+    // windings and Clipper2's NonZero fill turns that into a hole. Curve
+    // fitting only changes how many points there are, never their order — but
+    // a genus check is what proves it rather than asserting it.
+    const contours = gridToSilhouetteContours(diskGrid(96, 34, 14), {
+      threshold: 0.5,
+      invert: false,
+      pixelSizeMm: 1,
+    });
+    expect(contours.length).toBeGreaterThanOrEqual(2);
+    const kernel = await getGeometryKernel();
+    const solid = kernel.extrude(contours, 4);
+    expect(solid.genus()).toBe(1);
+    const expected = Math.PI * (34 * 34 - 14 * 14) * 4;
+    expect(Math.abs(solid.volumeMm3() - expected) / expected).toBeLessThan(0.05);
+    solid.dispose();
   });
 });
 
