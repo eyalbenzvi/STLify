@@ -288,16 +288,130 @@ describe("heightFieldToClosedMesh", () => {
 });
 
 describe("smoothGrid", () => {
-  it("reduces variance", () => {
+  /**
+   * The 3×3 box blur smoothGrid used to be, kept here as the reference the
+   * bilateral filter has to beat. The old test asserted only "variance goes
+   * down", which the box blur achieved by smearing edges as readily as noise
+   * — the exact behaviour V7 replaces — so it could not have caught this.
+   */
+  function boxBlur(grid: LuminanceGrid, passes: number): LuminanceGrid {
+    const { width, height } = grid;
+    let src = new Float32Array(grid.values);
+    let dst = new Float32Array(src.length);
+    for (let pass = 0; pass < passes; pass++) {
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          let sum = 0;
+          let count = 0;
+          for (let dy = -1; dy <= 1; dy++) {
+            const yy = y + dy;
+            if (yy < 0 || yy >= height) continue;
+            for (let dx = -1; dx <= 1; dx++) {
+              const xx = x + dx;
+              if (xx < 0 || xx >= width) continue;
+              sum += src[yy * width + xx];
+              count++;
+            }
+          }
+          dst[y * width + x] = sum / count;
+        }
+      }
+      const tmp = src;
+      src = dst;
+      dst = tmp;
+    }
+    return { width, height, values: src };
+  }
+
+  /** Left half dark, right half light: a vertical step edge at x = size/2. */
+  function stepGrid(size: number): LuminanceGrid {
+    const values = new Float32Array(size * size);
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) values[y * size + x] = x < size / 2 ? 0 : 1;
+    }
+    return { width: size, height: size, values };
+  }
+
+  it("keeps a step edge the box blur measurably smears", () => {
+    const size = 16;
+    const grid = stepGrid(size);
+    const at = (g: LuminanceGrid, x: number) => g.values[(size / 2) * size + x];
+    const bilateral = smoothGrid(grid, 2);
+    const box = boxBlur(grid, 2);
+
+    // The dark column touching the edge, and the light column touching it.
+    expect(at(box, size / 2 - 1)).toBeGreaterThan(0.3); // pulled toward light
+    expect(at(box, size / 2)).toBeLessThan(0.7); // pulled toward dark
+    expect(at(bilateral, size / 2 - 1)).toBeLessThan(0.01);
+    expect(at(bilateral, size / 2)).toBeGreaterThan(0.99);
+  });
+
+  it("still removes noise", () => {
+    // A smooth ramp plus deterministic ±0.05 noise. The filter must move the
+    // grid back toward the clean ramp, which is what "smoothing" is for.
+    const size = 32;
+    const clean = new Float32Array(size * size);
+    const noisy = new Float32Array(size * size);
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const i = y * size + x;
+        clean[i] = x / (size - 1);
+        const jitter = (((i * 2654435761) % 1000) / 1000 - 0.5) * 0.1;
+        noisy[i] = Math.max(0, Math.min(1, clean[i] + jitter));
+      }
+    }
+    const error = (a: Float32Array) => {
+      let sum = 0;
+      for (let i = 0; i < a.length; i++) sum += Math.abs(a[i] - clean[i]);
+      return sum / a.length;
+    };
+    const smoothed = smoothGrid({ width: size, height: size, values: noisy }, 2);
+    expect(error(smoothed.values)).toBeLessThan(error(noisy) * 0.7);
+  });
+
+  it("stops the tracer rounding off a corner", () => {
+    // A square's corner: the box blur pulls it toward the background until
+    // the traced contour clips it. Measure the traced area against the ideal.
+    const size = 40;
+    const values = new Float32Array(size * size).fill(1);
+    for (let y = 10; y < 30; y++) for (let x = 10; x < 30; x++) values[y * size + x] = 0;
+    const grid = { width: size, height: size, values };
+    const trace = (g: LuminanceGrid) =>
+      gridToSilhouetteContours(g, { threshold: 0.5, invert: false, pixelSizeMm: 1 });
+    const area = (contour: [number, number][]) => {
+      let a = 0;
+      for (let i = 0; i < contour.length; i++) {
+        const [x1, y1] = contour[i];
+        const [x2, y2] = contour[(i + 1) % contour.length];
+        a += x1 * y2 - x2 * y1;
+      }
+      return Math.abs(a / 2);
+    };
+    const ideal = 20 * 20;
+    const bilateralArea = area(trace(smoothGrid(grid, 3))[0]);
+    const boxArea = area(trace(boxBlur(grid, 3))[0]);
+    // 0.5 mm² of the ideal is the marching-squares corner cell itself, which
+    // is a diagonal whatever the filter does; anything beyond that is the
+    // smoothing eating the corner.
+    expect(ideal - bilateralArea).toBeLessThanOrEqual(0.5);
+    expect(ideal - boxArea).toBeGreaterThan(3);
+  });
+
+  it("preserves a full-amplitude alternating pattern — the accepted trade", () => {
+    // Amplitude alone cannot tell 1-bit dither from real structure, so an
+    // edge-preserving filter keeps both. The decode downsamples to at most
+    // 512 px first, which turns a scanned halftone into greys before this
+    // ever runs; this test exists so the trade is stated, not discovered.
     const size = 16;
     const values = new Float32Array(size * size);
-    for (let i = 0; i < values.length; i++) values[i] = i % 2; // checkerboard
+    for (let i = 0; i < values.length; i++) values[i] = i % 2;
     const smoothed = smoothGrid({ width: size, height: size, values }, 2);
-    const variance = (arr: Float32Array) => {
-      const mean = arr.reduce((s, v) => s + v, 0) / arr.length;
-      return arr.reduce((s, v) => s + (v - mean) ** 2, 0) / arr.length;
-    };
-    expect(variance(smoothed.values)).toBeLessThan(variance(values));
+    expect(smoothed.values[size * 8 + 8]).toBeCloseTo(values[size * 8 + 8], 3);
+  });
+
+  it("returns the grid untouched at zero passes", () => {
+    const grid = stepGrid(8);
+    expect(smoothGrid(grid, 0)).toBe(grid);
   });
 });
 

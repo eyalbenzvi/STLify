@@ -78,7 +78,54 @@ export function validateImageFile(file: {
 // Grid utilities
 // ---------------------------------------------------------------------------
 
-/** 3×3 box blur with clamped edges, `passes` times. */
+/**
+ * How far apart two luminances have to be before the filter stops treating
+ * them as the same surface. 0.2 sits well above sensor/JPEG noise and well
+ * below the contrast of any edge a silhouette is traced from.
+ */
+const BILATERAL_RANGE_SIGMA = 0.2;
+
+/** exp(-d²/2σ²) for the 3×3 neighbourhood, σ = 1 pixel. Row-major, centre 4. */
+const BILATERAL_SPATIAL = [
+  Math.exp(-1), Math.exp(-0.5), Math.exp(-1),
+  Math.exp(-0.5), 1, Math.exp(-0.5),
+  Math.exp(-1), Math.exp(-0.5), Math.exp(-1),
+];
+
+/**
+ * Range weights by quantised luminance difference. A lookup table rather than
+ * a call to exp per tap: a 512×512 grid at five passes is twelve million
+ * taps, and the table makes the filter cost the same as the box blur it
+ * replaced.
+ */
+const BILATERAL_RANGE = (() => {
+  const table = new Float64Array(256);
+  for (let k = 0; k < 256; k++) {
+    const d = k / 255;
+    table[k] = Math.exp(-(d * d) / (2 * BILATERAL_RANGE_SIGMA * BILATERAL_RANGE_SIGMA));
+  }
+  return table;
+})();
+
+/**
+ * Edge-preserving 3×3 smoothing, `passes` times.
+ *
+ * This used to be a box blur, which reduced noise by pulling every pixel
+ * toward its neighbours — including the pixels ON an edge, whose neighbours
+ * are the background. The corner of a letter would drift toward the threshold
+ * and the tracer would round it off, so the control labelled "smoothing" was
+ * quietly also a control for "lose the corners".
+ *
+ * A bilateral filter weights each neighbour by BOTH distance and luminance
+ * similarity, so a pixel is averaged with its own side of an edge and not
+ * across it. Noise still goes; corners stay.
+ *
+ * The deliberate trade: a full-amplitude 1-bit dither pattern is
+ * indistinguishable from real structure by amplitude alone, so this filter
+ * preserves it where the box blur merged it. In practice the decode
+ * downsamples to at most 512 px first, which turns a scanned halftone into
+ * greys before it ever reaches here.
+ */
 export function smoothGrid(grid: LuminanceGrid, passes: number): LuminanceGrid {
   if (passes <= 0) return grid;
   const { width, height } = grid;
@@ -87,19 +134,24 @@ export function smoothGrid(grid: LuminanceGrid, passes: number): LuminanceGrid {
   for (let pass = 0; pass < passes; pass++) {
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
+        const centre = src[y * width + x];
         let sum = 0;
-        let count = 0;
+        let weight = 0;
         for (let dy = -1; dy <= 1; dy++) {
           const yy = y + dy;
           if (yy < 0 || yy >= height) continue;
           for (let dx = -1; dx <= 1; dx++) {
             const xx = x + dx;
             if (xx < 0 || xx >= width) continue;
-            sum += src[yy * width + xx];
-            count++;
+            const value = src[yy * width + xx];
+            const delta = value - centre;
+            const bin = Math.min(255, Math.round((delta < 0 ? -delta : delta) * 255));
+            const w = BILATERAL_SPATIAL[(dy + 1) * 3 + (dx + 1)] * BILATERAL_RANGE[bin];
+            sum += value * w;
+            weight += w;
           }
         }
-        dst[y * width + x] = sum / count;
+        dst[y * width + x] = weight > 0 ? sum / weight : centre;
       }
     }
     const tmp = src;
