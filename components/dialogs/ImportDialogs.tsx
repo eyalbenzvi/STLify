@@ -396,6 +396,7 @@ function AiRunControls({
           {hasResult && provider && (
             <span className="text-xs text-slate-500">
               המנוע שרץ: {provider === "webgpu" ? "WebGPU" : "WASM (איטי יותר)"}
+              {state.ranOn === "main" && " · רץ בחלון הראשי (ללא Worker)"}
             </span>
           )}
         </div>

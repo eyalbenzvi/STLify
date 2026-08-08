@@ -70,6 +70,15 @@ export function useCloudModelImport(context: CloudModelImportContext) {
   } | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
+  // Generation takes minutes and the user keeps editing meanwhile. The new
+  // layer must land on the document as it is THEN, not as it was at upload
+  // time — a captured `doc` would silently revert every edit made while the
+  // provider worked. The ref tracks the latest committed document.
+  const docRef = useRef(doc);
+  useEffect(() => {
+    docRef.current = doc;
+  }, [doc]);
+
   // One availability probe per editor mount; the dialog shows "checking…"
   // until it lands and a disabled mode with the reason when it says no.
   useEffect(() => {
@@ -173,7 +182,9 @@ export function useCloudModelImport(context: CloudModelImportContext) {
         if (budgeted.noticeHe) noticesHe.push(budgeted.noticeHe);
         if (controller.signal.aborted) return;
 
-        // 5. Into the document as a mesh layer.
+        // 5. Into the document as a mesh layer — the document as it is NOW,
+        //    after whatever the user edited while the provider worked.
+        const currentDoc = docRef.current;
         const meshId = storeMesh(budgeted.mesh);
         const baseName = stripImageExtension(file.name) || "מודל מתמונה";
         const layer: ImportedMeshLayer = {
@@ -182,7 +193,7 @@ export function useCloudModelImport(context: CloudModelImportContext) {
           name: `${baseName} (ענן)`,
           visible: true,
           locked: false,
-          materialSlotId: primaryMaterialSlotId(doc),
+          materialSlotId: primaryMaterialSlotId(currentDoc),
           transform: {
             x: 0, y: 0, z: 0,
             rotationX: 0, rotationY: 0, rotationZ: 0,
@@ -200,7 +211,10 @@ export function useCloudModelImport(context: CloudModelImportContext) {
           originalMeshId: meshId,
           combine: "standalone",
         };
-        applyDocument({ ...doc, layers: [...doc.layers, layer] }, "מודל מתמונה (ענן)");
+        applyDocument(
+          { ...currentDoc, layers: [...currentDoc.layers, layer] },
+          "מודל מתמונה (ענן)"
+        );
         dispatch({ type: "ui/select", selection: [layer.id] });
 
         // 6. Printability analysis, as soon as the rebuild lands.
@@ -229,7 +243,7 @@ export function useCloudModelImport(context: CloudModelImportContext) {
         setProgress(null);
       }
     },
-    [doc, dispatch, applyDocument, setMessage, showError, requestAutoAnalysis, providerNameHe]
+    [dispatch, applyDocument, setMessage, showError, requestAutoAnalysis, providerNameHe]
   );
 
   /** Entry point from the dialog: consent gate first, then the run. */

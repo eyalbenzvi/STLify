@@ -175,14 +175,37 @@ export async function handleCreateTask(
     return errorResponse(429, "יותר מדי בקשות יצירה — המתינו מעט ונסו שוב");
   }
 
-  // The header is only a fast-path refusal; the real cap is on actual bytes.
+  // The header is only a fast-path refusal; the real cap is enforced while
+  // the bytes arrive, so a lying content-length cannot buffer a huge body.
   const declared = Number(request.headers.get("content-length") ?? "0");
   if (Number.isFinite(declared) && declared > MAX_UPLOAD_BYTES) {
     return errorResponse(413, "התמונה גדולה מדי לשליחה לענן (מקסימום 8MB)");
   }
   let bytes: Uint8Array;
   try {
-    bytes = new Uint8Array(await request.arrayBuffer());
+    if (request.body) {
+      const reader = request.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let received = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        received += value.byteLength;
+        if (received > MAX_UPLOAD_BYTES) {
+          await reader.cancel().catch(() => undefined);
+          return errorResponse(413, "התמונה גדולה מדי לשליחה לענן (מקסימום 8MB)");
+        }
+        chunks.push(value);
+      }
+      bytes = new Uint8Array(received);
+      let offset = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+    } else {
+      bytes = new Uint8Array(await request.arrayBuffer());
+    }
   } catch {
     return errorResponse(400, "לא ניתן היה לקרוא את גוף הבקשה");
   }
