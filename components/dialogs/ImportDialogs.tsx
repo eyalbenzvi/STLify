@@ -150,6 +150,13 @@ export interface ImageImportOptionsValue {
   minThicknessMm: number;
   resolution: number;
   smoothingLevel: number;
+  /**
+   * Silhouette only: thicken strokes the printer cannot resolve, up to the
+   * machine's minimum. Default on — a stroke thinner than two extrusion
+   * widths does not come out at all, so leaving it alone produces a file that
+   * looks right and prints wrong.
+   */
+  thickenThinFeatures: boolean;
   removeBackground: boolean;
   bgToleranceMm: number;
   brightness: number;
@@ -177,6 +184,7 @@ export function ImageImportDialog({
     minThicknessMm: 1,
     resolution: 200,
     smoothingLevel: 1,
+    thickenThinFeatures: true,
     removeBackground: false,
     bgToleranceMm: 24,
     brightness: 0,
@@ -215,6 +223,18 @@ export function ImageImportDialog({
         <>
           <NumberField label="סף בהירות" value={options.threshold} min={0.05} max={0.95} step={0.05} unit="" onChange={(threshold) => patch({ threshold })} />
           <NumberField label="עובי" value={options.extrudeMm} min={0.4} max={100} step={0.5} onChange={(extrudeMm) => patch({ extrudeMm })} />
+          <label className="flex items-center justify-between text-sm">
+            <span className="text-slate-600">עיבוי קווים דקים לפי המדפסת</span>
+            <input
+              type="checkbox"
+              checked={options.thickenThinFeatures}
+              onChange={(e) => patch({ thickenThinFeatures: e.target.checked })}
+            />
+          </label>
+          <p className="text-xs text-slate-500">
+            קו דק משתי רצועות פיה לא ייצא בהדפסה. כשנמצא קו כזה הוא יעובה
+            אוטומטית עד למינימום של המדפסת, ותוצג הודעה עם המידה שנמדדה.
+          </p>
         </>
       ) : (
         <>

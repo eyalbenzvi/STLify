@@ -6,11 +6,14 @@
 import { describe, expect, it } from "vitest";
 import { getGeometryKernel } from "@/lib/geometry/kernel";
 import {
+  dilateSilhouetteGrid,
   gridToSilhouetteContours,
   heightFieldToClosedMesh,
   IMAGE_INPUT_ACCEPT,
+  measureThinnestFeature,
   smoothGrid,
   stripImageExtension,
+  thinFeatureMessageHe,
   validateImageFile,
   type LuminanceGrid,
 } from "../image";
@@ -79,6 +82,116 @@ describe("gridToSilhouetteContours", () => {
     expect(b.volumeMm3()).toBeGreaterThan(a.volumeMm3());
     a.dispose();
     b.dispose();
+  });
+});
+
+describe("measureThinnestFeature", () => {
+  /** Light grid with a dark horizontal stroke `thickness` pixels tall. */
+  function strokeGrid(size: number, thickness: number): LuminanceGrid {
+    const values = new Float32Array(size * size).fill(1);
+    const y0 = Math.floor((size - thickness) / 2);
+    for (let y = y0; y < y0 + thickness; y++) {
+      for (let x = 8; x <= size - 9; x++) values[y * size + x] = 0;
+    }
+    return { width: size, height: size, values };
+  }
+
+  // 0.3 mm pixels against a 0.4 mm nozzle: one pixel is well under the two
+  // extrusion widths the machine needs, so the check can actually resolve it.
+  const px = 0.3;
+  const minimumMm = 0.8;
+
+  it("reports a hairline stroke with its measured width and the machine minimum", () => {
+    const report = measureThinnestFeature(strokeGrid(64, 1), {
+      threshold: 0.5,
+      invert: false,
+      pixelSizeMm: px,
+      minimumMm,
+    });
+    expect(report.violates).toBe(true);
+    expect(report.thinnestMm).toBeCloseTo(0.3, 6);
+    expect(report.minimumMm).toBe(0.8);
+    expect(report.suggestedDilationMm).toBeCloseTo(0.25, 6);
+    const message = thinFeatureMessageHe(report, true);
+    expect(message).toContain("0.30");
+    expect(message).toContain("0.80");
+  });
+
+  it("stays quiet on a shape the machine can resolve", () => {
+    const report = measureThinnestFeature(diskGrid(64, 20), {
+      threshold: 0.5,
+      invert: false,
+      pixelSizeMm: px,
+      minimumMm,
+    });
+    expect(report.violates).toBe(false);
+    expect(report.suggestedDilationMm).toBe(0);
+    expect(report.thinnestMm).toBeGreaterThan(minimumMm);
+  });
+
+  it("ignores a tapering tip — thin by design, thin in every artwork", () => {
+    // A 29-pixel-tall bar running to a 45° point. The tip is a single pixel,
+    // but no thin STROKE exists anywhere in it — a serif, an arrowhead or a
+    // letter terminal all look like this, and flagging them would make the
+    // check fire on every piece of artwork.
+    const size = 48;
+    const values = new Float32Array(size * size).fill(1);
+    const cy = size / 2;
+    for (let x = 4; x <= 30; x++) {
+      const half = Math.min(14, 30 - x);
+      for (let y = cy - half; y <= cy + half; y++) values[y * size + x] = 0;
+    }
+    const report = measureThinnestFeature(
+      { width: size, height: size, values },
+      { threshold: 0.5, invert: false, pixelSizeMm: px, minimumMm }
+    );
+    expect(report.violates).toBe(false);
+  });
+
+  it("reports nothing when the image has no solid area at all", () => {
+    const values = new Float32Array(32 * 32).fill(1);
+    const report = measureThinnestFeature(
+      { width: 32, height: 32, values },
+      { threshold: 0.5, invert: false, pixelSizeMm: px, minimumMm }
+    );
+    expect(report.thinnestMm).toBeNull();
+    expect(report.violates).toBe(false);
+  });
+
+  it("thickening lifts the traced contour above the nozzle minimum", () => {
+    const grid = strokeGrid(64, 1);
+    const options = { threshold: 0.5, invert: false, pixelSizeMm: px };
+    const report = measureThinnestFeature(grid, { ...options, minimumMm });
+
+    const strokeHeightMm = (contours: [number, number][][]): number => {
+      expect(contours.length).toBe(1);
+      const ys = contours[0].map(([, y]) => y);
+      return Math.max(...ys) - Math.min(...ys);
+    };
+
+    expect(strokeHeightMm(gridToSilhouetteContours(grid, options))).toBeCloseTo(px, 4);
+
+    const thickened = dilateSilhouetteGrid(grid, options, report.suggestedDilationMm);
+    const after = gridToSilhouetteContours(thickened, options);
+    expect(strokeHeightMm(after)).toBeGreaterThanOrEqual(minimumMm - 1e-6);
+    // Re-measuring the thickened grid must also clear the machine minimum.
+    expect(
+      measureThinnestFeature(thickened, { ...options, minimumMm }).violates
+    ).toBe(false);
+  });
+
+  it("honours invert when deciding which side is solid", () => {
+    // Same stroke, but light-on-dark: only the inverted read finds it thin.
+    const grid = strokeGrid(64, 1);
+    for (let i = 0; i < grid.values.length; i++) grid.values[i] = 1 - grid.values[i];
+    const inverted = measureThinnestFeature(grid, {
+      threshold: 0.5,
+      invert: true,
+      pixelSizeMm: px,
+      minimumMm,
+    });
+    expect(inverted.violates).toBe(true);
+    expect(inverted.thinnestMm).toBeCloseTo(0.3, 6);
   });
 });
 

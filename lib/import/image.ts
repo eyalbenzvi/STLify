@@ -113,12 +113,241 @@ export function smoothGrid(grid: LuminanceGrid, passes: number): LuminanceGrid {
 // Marching squares silhouette
 // ---------------------------------------------------------------------------
 
-interface SilhouetteOptions {
+export interface SilhouetteOptions {
   /** Luminance threshold 0..1; darker-than-threshold is solid. */
   threshold: number;
   invert: boolean;
   /** Physical size of one grid pixel, mm. */
   pixelSizeMm: number;
+}
+
+// ---------------------------------------------------------------------------
+// Minimum-feature check (thin strokes the nozzle cannot resolve)
+// ---------------------------------------------------------------------------
+
+/**
+ * The solid/background mask the silhouette tracer sees, padded by one
+ * "outside" pixel on every side exactly as `gridToSilhouetteContours` pads
+ * its field. Sharing the padding is what makes a measurement taken here
+ * describe the contours that come out of there.
+ */
+function silhouetteMask(
+  grid: LuminanceGrid,
+  options: Pick<SilhouetteOptions, "threshold" | "invert">
+): { mask: Uint8Array; width: number; height: number } {
+  const pw = grid.width + 2;
+  const ph = grid.height + 2;
+  const mask = new Uint8Array(pw * ph);
+  for (let y = 0; y < grid.height; y++) {
+    for (let x = 0; x < grid.width; x++) {
+      const lum = grid.values[y * grid.width + x];
+      const inside = options.invert ? lum > options.threshold : lum < options.threshold;
+      if (inside) mask[(y + 1) * pw + (x + 1)] = 1;
+    }
+  }
+  return { mask, width: pw, height: ph };
+}
+
+const EDT_INF = 1e20;
+
+/** Felzenszwalb–Huttenlocher lower-envelope transform of one 1D sample row. */
+function edt1d(f: Float64Array, n: number, out: Float64Array): void {
+  const v = new Int32Array(n);
+  const z = new Float64Array(n + 1);
+  let k = 0;
+  v[0] = 0;
+  z[0] = -EDT_INF;
+  z[1] = EDT_INF;
+  for (let q = 1; q < n; q++) {
+    let s = (f[q] + q * q - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+    while (s <= z[k]) {
+      k--;
+      s = (f[q] + q * q - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+    }
+    k++;
+    v[k] = q;
+    z[k] = s;
+    z[k + 1] = EDT_INF;
+  }
+  k = 0;
+  for (let q = 0; q < n; q++) {
+    while (z[k + 1] < q) k++;
+    out[q] = (q - v[k]) * (q - v[k]) + f[v[k]];
+  }
+}
+
+/**
+ * Exact Euclidean distance, in pixels, from every pixel to the nearest pixel
+ * whose `mask` value is `target`. Exact rather than a chamfer approximation
+ * because a half-pixel error here is a tenth of a millimetre on a typical
+ * import, which is the same order as the thing being measured.
+ */
+function distanceToValue(
+  mask: Uint8Array,
+  width: number,
+  height: number,
+  target: 0 | 1
+): Float64Array {
+  const f = new Float64Array(Math.max(width, height));
+  const g = new Float64Array(Math.max(width, height));
+  const sq = new Float64Array(width * height);
+  for (let i = 0; i < sq.length; i++) sq[i] = mask[i] === target ? 0 : EDT_INF;
+  for (let x = 0; x < width; x++) {
+    for (let y = 0; y < height; y++) f[y] = sq[y * width + x];
+    edt1d(f, height, g);
+    for (let y = 0; y < height; y++) sq[y * width + x] = g[y];
+  }
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) f[x] = sq[y * width + x];
+    edt1d(f, width, g);
+    for (let x = 0; x < width; x++) sq[y * width + x] = g[x];
+  }
+  for (let i = 0; i < sq.length; i++) sq[i] = Math.sqrt(sq[i]);
+  return sq;
+}
+
+/** What the minimum-feature check found on a traced silhouette. */
+export interface ThinFeatureReport {
+  /** Narrowest stroke found, mm. `null` when the shape has no solid area. */
+  thinnestMm: number | null;
+  /** Narrowest stroke this machine can lay down, mm (two extrusion widths). */
+  minimumMm: number;
+  /** One grid pixel in mm — the resolution the measurement itself has. */
+  pixelSizeMm: number;
+  /** True when a real feature is below what the machine can resolve. */
+  violates: boolean;
+  /** Outward offset that lifts the thinnest stroke to `minimumMm`, mm. */
+  suggestedDilationMm: number;
+}
+
+/**
+ * Measure the narrowest stroke in the silhouette and compare it with what the
+ * machine can actually lay down.
+ *
+ * Why here and not in the wall-thickness analysis, which finds the same
+ * defect: by the time that analysis runs the user has a solid, and the three
+ * things that would have fixed it cheaply — the threshold, the resolution and
+ * the artwork itself — are all behind them. The cost of the check is the same;
+ * only the timing differs, and the timing is the whole point.
+ *
+ * Method: an exact distance transform of the solid mask, restricted to its
+ * ridge (pixels no lower than all eight neighbours). The ridge restriction is
+ * deliberate — it measures elongated strokes and ignores the tapering tip of a
+ * serif or an arrowhead, which is thin by design and thin in every artwork, so
+ * flagging it would make the check fire on everything and mean nothing.
+ */
+export function measureThinnestFeature(
+  grid: LuminanceGrid,
+  options: SilhouetteOptions & { minimumMm: number }
+): ThinFeatureReport {
+  const { mask, width, height } = silhouetteMask(grid, options);
+  const px = options.pixelSizeMm;
+  const empty: ThinFeatureReport = {
+    thinnestMm: null,
+    minimumMm: options.minimumMm,
+    pixelSizeMm: px,
+    violates: false,
+    suggestedDilationMm: 0,
+  };
+  if (!mask.some((v) => v === 1)) return empty;
+
+  const inner = distanceToValue(mask, width, height, 0);
+  let thinnestPx = Infinity;
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const i = y * width + x;
+      if (mask[i] !== 1) continue;
+      const d = inner[i];
+      let isRidge = true;
+      for (let dy = -1; dy <= 1 && isRidge; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (inner[i + dy * width + dx] > d) {
+            isRidge = false;
+            break;
+          }
+        }
+      }
+      if (isRidge && d < thinnestPx) thinnestPx = d;
+    }
+  }
+  if (!Number.isFinite(thinnestPx)) return empty;
+
+  // A stroke n pixels wide puts its ridge (n+1)/2 pixel centres from the
+  // background, so the width the ridge distance implies is 2d − 1.
+  const widthPx = Math.max(1, 2 * thinnestPx - 1);
+  const thinnestMm = widthPx * px;
+  const violates = thinnestMm < options.minimumMm;
+  return {
+    thinnestMm,
+    minimumMm: options.minimumMm,
+    pixelSizeMm: px,
+    violates,
+    // Dilation adds twice its radius to a stroke's width.
+    suggestedDilationMm: violates ? (options.minimumMm - thinnestMm) / 2 : 0,
+  };
+}
+
+/**
+ * Morphological dilation of the silhouette by `dilationMm`, returned as a
+ * luminance grid the caller re-traces with its ORIGINAL threshold and invert.
+ *
+ * The offset is encoded as a signed distance scaled into luminance around the
+ * caller's threshold rather than as a pixel-snapped mask, so the marching
+ * squares interpolation still lands the boundary between pixel centres. A
+ * pixel-snapped dilation would quantise a 0.15 mm correction up to a whole
+ * 0.3 mm pixel and put back the faceting the rest of this module removes.
+ */
+export function dilateSilhouetteGrid(
+  grid: LuminanceGrid,
+  options: SilhouetteOptions,
+  dilationMm: number
+): LuminanceGrid {
+  if (!(dilationMm > 0)) return grid;
+  const { mask, width, height } = silhouetteMask(grid, options);
+  const toOutside = distanceToValue(mask, width, height, 0);
+  const toInside = distanceToValue(mask, width, height, 1);
+  const radiusPx = dilationMm / options.pixelSizeMm;
+
+  // Keep the encoded luminance inside [0,1] whatever threshold the caller
+  // chose; only cells straddling the new boundary matter, and adjacent
+  // distance samples differ by at most ~1.42 px, so clamping farther out is
+  // harmless.
+  const t = options.threshold;
+  const scale = Math.max(0.01, Math.min(0.25, t * 0.4, (1 - t) * 0.4));
+
+  const values = new Float32Array(grid.width * grid.height);
+  for (let y = 0; y < grid.height; y++) {
+    for (let x = 0; x < grid.width; x++) {
+      const pi = (y + 1) * width + (x + 1);
+      // Signed distance to the original boundary, which sits half a pixel
+      // from the centre of the last solid pixel.
+      const signed = mask[pi] === 1 ? -(toOutside[pi] - 0.5) : toInside[pi] - 0.5;
+      const d = signed - radiusPx;
+      const lum = options.invert ? t - scale * d : t + scale * d;
+      values[y * grid.width + x] = Math.max(0, Math.min(1, lum));
+    }
+  }
+  return { width: grid.width, height: grid.height, values };
+}
+
+/** Hebrew report for the minimum-feature check. `applied` = we thickened. */
+export function thinFeatureMessageHe(report: ThinFeatureReport, applied: boolean): string {
+  const thin = (report.thinnestMm ?? 0).toFixed(2);
+  const min = report.minimumMm.toFixed(2);
+  const head =
+    `הקו הדק ביותר בצללית הוא כ-${thin} מ״מ, ` +
+    `והמדפסת הזו יכולה להדפיס לפחות ${min} מ״מ (שתי רצועות פיה).`;
+  if (applied) {
+    return (
+      `${head} הקווים עובו אוטומטית ב-${report.suggestedDilationMm.toFixed(2)} מ״מ ` +
+      `לכל צד כדי שיודפסו. אם זה שינה את הצורה יותר מדי — בטלו את הסימון ` +
+      `״עיבוי קווים דקים״ בחלון הייבוא, או השתמשו בציור מקורי עבה יותר.`
+    );
+  }
+  return (
+    `${head} קווים דקים מזה ייעלמו או ייצאו גל בהדפסה. סמנו ״עיבוי קווים דקים״ ` +
+    `בחלון הייבוא, או עבו את הציור המקורי.`
+  );
 }
 
 /** Douglas-Peucker simplification. */

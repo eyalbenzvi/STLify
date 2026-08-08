@@ -27,13 +27,17 @@ import { parseSvgToContours, SvgImportError } from "@/lib/import/svg";
 import { sanitizeSvg } from "@/lib/import/svgSanitize";
 import {
   decodeImageToGrid,
+  dilateSilhouetteGrid,
   gridToSilhouetteContours,
   heightFieldToClosedMesh,
   ImageImportError,
+  measureThinnestFeature,
   smoothGrid,
   stripImageExtension,
+  thinFeatureMessageHe,
   validateImageFile,
 } from "@/lib/import/image";
+import { documentNozzleDiameterMm } from "@/lib/geometry/calibration";
 import { importDesignFile } from "@/lib/serialization/designFile";
 import type {
   ImageImportOptionsValue,
@@ -220,22 +224,39 @@ export function useImportHandlers(context: ImportHandlersContext) {
           brightness: options.brightness,
           contrast: options.contrast,
         });
+        const noticesHe: string[] = [];
         if (options.removeBackground && decoded.backgroundRemovedFraction < 0.01) {
-          setMessage({
-            titleHe: "הסרת רקע",
-            bodyHe: "כמעט שלא זוהה רקע להסרה — נסו להגדיל את סבילות הצבע",
-            kind: "info",
-          });
+          noticesHe.push("כמעט שלא זוהה רקע להסרה — נסו להגדיל את סבילות הצבע");
         }
         const grid = smoothGrid(decoded.grid, options.smoothingLevel);
         const pixelSizeMm = options.targetWidthMm / grid.width;
         let layer: DesignLayer;
         if (options.mode === "silhouette") {
-          const contours = gridToSilhouetteContours(grid, {
+          const silhouette = {
             threshold: options.threshold,
             invert: options.invert,
             pixelSizeMm,
+          };
+          let contours = gridToSilhouetteContours(grid, silhouette);
+          // Minimum-feature check while the threshold, the resolution and the
+          // artwork are all still changeable — the wall-thickness analysis
+          // finds the same defect, but only once none of them are.
+          const thin = measureThinnestFeature(grid, {
+            ...silhouette,
+            minimumMm: documentNozzleDiameterMm(doc) * 2,
           });
+          if (thin.violates) {
+            if (options.thickenThinFeatures) {
+              const thickened = dilateSilhouetteGrid(
+                grid,
+                silhouette,
+                thin.suggestedDilationMm
+              );
+              const retraced = gridToSilhouetteContours(thickened, silhouette);
+              if (retraced.length > 0) contours = retraced;
+            }
+            noticesHe.push(thinFeatureMessageHe(thin, options.thickenThinFeatures));
+          }
           if (contours.length === 0) {
             throw new ImageImportError(
               "לא נמצאה צורה בתמונה — נסו לשנות את סף הבהירות או להפעיל היפוך"
@@ -310,6 +331,13 @@ export function useImportHandlers(context: ImportHandlersContext) {
         }
         applyDocument({ ...doc, layers: [...doc.layers, layer] }, "ייבוא תמונה");
         dispatch({ type: "ui/select", selection: [layer.id] });
+        if (noticesHe.length > 0) {
+          setMessage({
+            titleHe: "ייבוא תמונה — הערות",
+            bodyHe: noticesHe.join("\n\n"),
+            kind: "info",
+          });
+        }
       });
     },
     [imagePending, setImagePending, doc, applyDocument, dispatch, runOp, setMessage]
