@@ -95,18 +95,21 @@ async function getSession(
 
   const factory = context.sessionFactory ?? createOnnxSession;
   const promise = (async () => {
-    const bytes = await loadModelBytes(spec, {
-      signal: context.signal,
-      onProgress: (loaded, total) => {
-        const fraction = total ? Math.min(1, loaded / total) : 0;
-        context.onProgress(
-          0.05 + fraction * 0.55,
-          total
-            ? `מוריד את המודל (${formatModelSize(loaded)} מתוך ${formatModelSize(total)})`
-            : `מוריד את המודל (${formatModelSize(loaded)})`
-        );
-      },
-    });
+    // An injected factory (tests) brings its own model — nothing to fetch.
+    const bytes = context.sessionFactory
+      ? new ArrayBuffer(0)
+      : await loadModelBytes(spec, {
+          signal: context.signal,
+          onProgress: (loaded, total) => {
+            const fraction = total ? Math.min(1, loaded / total) : 0;
+            context.onProgress(
+              0.05 + fraction * 0.55,
+              total
+                ? `מוריד את המודל (${formatModelSize(loaded)} מתוך ${formatModelSize(total)})`
+                : `מוריד את המודל (${formatModelSize(loaded)})`
+            );
+          },
+        });
     context.throwIfCancelled();
     context.onProgress(0.62, "טוען את המודל");
     try {
