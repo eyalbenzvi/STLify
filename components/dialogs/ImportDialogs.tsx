@@ -694,6 +694,54 @@ export interface CloudModeAvailability {
   providerNameHe: string;
 }
 
+/**
+ * The explicit consent gate for the cloud mode: shown before the FIRST
+ * upload of a browser session, naming the third-party recipient. Approve
+ * proceeds and is remembered for the session; cancel sends nothing.
+ */
+export function CloudConsentDialog({
+  open,
+  providerNameHe,
+  onApprove,
+  onCancel,
+}: {
+  open: boolean;
+  providerNameHe: string;
+  onApprove: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <Modal
+      title="שליחת התמונה לשירות ענן"
+      open={open}
+      onClose={onCancel}
+      footer={
+        <>
+          <ModalButton onClick={onCancel}>ביטול — לא לשלוח</ModalButton>
+          <ModalButton variant="primary" onClick={onApprove}>
+            אני מאשר/ת לשלוח
+          </ModalButton>
+        </>
+      }
+    >
+      <p className="text-sm text-slate-700">
+        כדי ליצור מודל תלת-ממדי מלא, התמונה תישלח לשירות הצד-שלישי{" "}
+        <b>{providerNameHe}</b> ותעובד בשרתים שלו, בכפוף לתנאי השימוש ומדיניות
+        הפרטיות שלו. זהו חריג מכוון מהתנהלות האפליקציה, שבה הכל רץ מקומית.
+      </p>
+      <ul className="list-disc pe-5 text-xs text-slate-600">
+        <li>נשלחת התמונה בלבד — לא העיצוב, לא קבצים אחרים.</li>
+        <li>המודל שיתקבל ייבדק ויתוקן מקומית לפני שיצטרף לעיצוב.</li>
+        <li>האישור נשמר להפעלה הנוכחית של הדפדפן בלבד.</li>
+      </ul>
+      <p className="text-xs text-slate-500">
+        ביטול לא ישלח דבר — אפשר להשתמש במצבים המקומיים (צללית, תבליט, תבליט
+        חכם) שרצים כולם במכשיר.
+      </p>
+    </Modal>
+  );
+}
+
 export function ImageImportDialog({
   open,
   file,
