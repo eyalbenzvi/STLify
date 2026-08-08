@@ -10,7 +10,9 @@ import {
   gridToSilhouetteContours,
   heightFieldToClosedMesh,
   IMAGE_INPUT_ACCEPT,
+  isBimodalEnough,
   measureThinnestFeature,
+  otsuThreshold,
   smoothGrid,
   stripImageExtension,
   thinFeatureMessageHe,
@@ -82,6 +84,73 @@ describe("gridToSilhouetteContours", () => {
     expect(b.volumeMm3()).toBeGreaterThan(a.volumeMm3());
     a.dispose();
     b.dispose();
+  });
+});
+
+describe("otsuThreshold", () => {
+  /** Grid whose pixels are `dark` with probability `share`, else `light`. */
+  function bimodal(dark: number, light: number, share: number): LuminanceGrid {
+    const size = 64;
+    const values = new Float32Array(size * size);
+    for (let i = 0; i < values.length; i++) {
+      values[i] = i % 100 < share * 100 ? dark : light;
+    }
+    return { width: size, height: size, values };
+  }
+
+  it("splits a bimodal image between its two populations", () => {
+    // Two clean populations at 0.2 and 0.8: the analytic split is 0.5, and
+    // Otsu's between-class variance is flat across the empty gap, so the
+    // tolerance is the width of that gap.
+    const t = otsuThreshold(bimodal(0.2, 0.8, 0.35));
+    expect(t).toBeGreaterThan(0.2);
+    expect(t).toBeLessThanOrEqual(0.8);
+    // The split must actually separate the populations.
+    expect(0.2 < t && 0.8 >= t).toBe(true);
+  });
+
+  it("finds the split even when the classes are lopsided", () => {
+    // 4% ink on 96% paper — the case a fixed 0.5 threshold handles by luck.
+    const t = otsuThreshold(bimodal(0.1, 0.95, 0.04));
+    expect(t).toBeGreaterThan(0.1);
+    expect(t).toBeLessThanOrEqual(0.95);
+  });
+
+  it("beats the old fixed 0.5 on a washed-out scan", () => {
+    // Both populations sit above 0.5, so a fixed threshold sees no shape.
+    const grid = bimodal(0.62, 0.9, 0.3);
+    expect(otsuThreshold(grid)).toBeGreaterThan(0.62);
+    const traced = gridToSilhouetteContours(grid, {
+      threshold: 0.5,
+      invert: false,
+      pixelSizeMm: 1,
+    });
+    expect(traced.length).toBe(0); // what the user used to get
+  });
+
+  it("falls back to 0.5 on a flat image, where every split is arbitrary", () => {
+    const values = new Float32Array(32 * 32).fill(0.4);
+    expect(otsuThreshold({ width: 32, height: 32, values })).toBe(0.5);
+  });
+
+  it("stays inside the range the manual control offers", () => {
+    for (const [dark, light] of [
+      [0, 0.01],
+      [0.99, 1],
+      [0, 1],
+    ]) {
+      const t = otsuThreshold(bimodal(dark, light, 0.5));
+      expect(t).toBeGreaterThanOrEqual(0.05);
+      expect(t).toBeLessThanOrEqual(0.95);
+    }
+  });
+
+  it("reports when an image has no two populations to split", () => {
+    const flat = new Float32Array(32 * 32).fill(0.4);
+    const grid = { width: 32, height: 32, values: flat };
+    expect(isBimodalEnough(grid, otsuThreshold(grid))).toBe(false);
+    const real = bimodal(0.2, 0.8, 0.35);
+    expect(isBimodalEnough(real, otsuThreshold(real))).toBe(true);
   });
 });
 

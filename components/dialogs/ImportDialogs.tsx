@@ -143,6 +143,13 @@ export function SvgImportDialog({
 export interface ImageImportOptionsValue {
   mode: "silhouette" | "relief";
   targetWidthMm: number;
+  /**
+   * "auto" computes the silhouette threshold from the image (Otsu) at import
+   * time; "manual" uses `threshold` below. Auto is the default because the
+   * threshold used to be the first thing the user had to guess, sight unseen,
+   * and it governs the entire shape.
+   */
+  thresholdMode: "auto" | "manual";
   threshold: number;
   invert: boolean;
   extrudeMm: number;
@@ -177,6 +184,7 @@ export function ImageImportDialog({
   const [options, setOptions] = useState<ImageImportOptionsValue>({
     mode: "silhouette",
     targetWidthMm: 60,
+    thresholdMode: "auto",
     threshold: 0.5,
     invert: false,
     extrudeMm: 3,
@@ -221,7 +229,23 @@ export function ImageImportDialog({
       <NumberField label="רוחב יעד" value={options.targetWidthMm} min={5} max={400} onChange={(targetWidthMm) => patch({ targetWidthMm })} />
       {options.mode === "silhouette" ? (
         <>
-          <NumberField label="סף בהירות" value={options.threshold} min={0.05} max={0.95} step={0.05} unit="" onChange={(threshold) => patch({ threshold })} />
+          <ToggleGroup
+            label="סף בהירות"
+            value={options.thresholdMode}
+            options={[
+              { value: "auto", label: "אוטומטי" },
+              { value: "manual", label: "ידני" },
+            ]}
+            onChange={(thresholdMode) => patch({ thresholdMode })}
+          />
+          {options.thresholdMode === "manual" ? (
+            <NumberField label="ערך הסף" value={options.threshold} min={0.05} max={0.95} step={0.05} unit="" onChange={(threshold) => patch({ threshold })} />
+          ) : (
+            <p className="text-xs text-slate-500">
+              הסף מחושב מהתמונה עצמה (שיטת Otsu) ברגע הייבוא, ונשמר בשכבה.
+              עברו ל״ידני״ אם ההפרדה שיצאה אינה מה שרציתם.
+            </p>
+          )}
           <NumberField label="עובי" value={options.extrudeMm} min={0.4} max={100} step={0.5} onChange={(extrudeMm) => patch({ extrudeMm })} />
           <label className="flex items-center justify-between text-sm">
             <span className="text-slate-600">עיבוי קווים דקים לפי המדפסת</span>

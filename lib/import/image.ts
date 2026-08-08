@@ -121,6 +121,93 @@ export interface SilhouetteOptions {
   pixelSizeMm: number;
 }
 
+/** Below this the two classes are the same colour and Otsu has nothing to say. */
+const OTSU_MIN_SEPARATION = 1 / 256;
+
+/**
+ * Otsu's method: the luminance split that maximises between-class variance.
+ *
+ * The threshold used to be the first thing the user had to guess, before they
+ * had seen a single contour — and the guess governs the whole shape. Otsu
+ * answers it from the image itself, deterministically and with no model.
+ *
+ * IMPORTANT: this runs at IMPORT time only. The silhouette threshold is a
+ * stored field, and re-deriving it on a rebuild would change the geometry of
+ * every design already saved. The computed value is written into the layer's
+ * stored `threshold`; the rebuild keeps reading that value.
+ *
+ * The grid handed in should be the one that will actually be thresholded
+ * (after brightness/contrast and smoothing), so the split lands where the
+ * tracer will use it.
+ *
+ * Returns 0.5 for a flat image, where every split is equally arbitrary. The
+ * result is clamped to the same 0.05..0.95 range the manual control offers,
+ * so switching to manual afterwards shows a value that control can hold.
+ */
+export function otsuThreshold(grid: LuminanceGrid): number {
+  const bins = 256;
+  const histogram = new Float64Array(bins);
+  for (let i = 0; i < grid.values.length; i++) {
+    const v = grid.values[i];
+    const bin = v <= 0 ? 0 : v >= 1 ? bins - 1 : Math.floor(v * bins);
+    histogram[bin]++;
+  }
+  const total = grid.values.length;
+  if (total === 0) return 0.5;
+
+  let sumAll = 0;
+  for (let b = 0; b < bins; b++) sumAll += b * histogram[b];
+
+  let weightLow = 0;
+  let sumLow = 0;
+  let best = -1;
+  let bestBin = -1;
+  for (let b = 0; b < bins - 1; b++) {
+    weightLow += histogram[b];
+    if (weightLow === 0) continue;
+    const weightHigh = total - weightLow;
+    if (weightHigh === 0) break;
+    sumLow += b * histogram[b];
+    const meanLow = sumLow / weightLow;
+    const meanHigh = (sumAll - sumLow) / weightHigh;
+    const between = weightLow * weightHigh * (meanLow - meanHigh) ** 2;
+    if (between > best) {
+      best = between;
+      bestBin = b;
+    }
+  }
+  if (bestBin < 0) return 0.5;
+  // Split at the upper edge of the darker class, so `lum < threshold`
+  // selects exactly the pixels Otsu assigned to it.
+  const threshold = (bestBin + 1) / bins;
+  if (best <= 0) return 0.5;
+  return Math.max(0.05, Math.min(0.95, threshold));
+}
+
+/**
+ * Whether an image has two distinguishable luminance populations at all. A
+ * photo of a wall does not, and an automatic split of it is a coin toss the
+ * user should hear about rather than discover in the geometry.
+ */
+export function isBimodalEnough(grid: LuminanceGrid, threshold: number): boolean {
+  let low = 0;
+  let lowSum = 0;
+  let high = 0;
+  let highSum = 0;
+  for (let i = 0; i < grid.values.length; i++) {
+    const v = grid.values[i];
+    if (v < threshold) {
+      low++;
+      lowSum += v;
+    } else {
+      high++;
+      highSum += v;
+    }
+  }
+  if (low === 0 || high === 0) return false;
+  return highSum / high - lowSum / low > OTSU_MIN_SEPARATION * 8;
+}
+
 // ---------------------------------------------------------------------------
 // Minimum-feature check (thin strokes the nozzle cannot resolve)
 // ---------------------------------------------------------------------------

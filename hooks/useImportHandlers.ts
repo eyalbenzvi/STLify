@@ -31,7 +31,9 @@ import {
   gridToSilhouetteContours,
   heightFieldToClosedMesh,
   ImageImportError,
+  isBimodalEnough,
   measureThinnestFeature,
+  otsuThreshold,
   smoothGrid,
   stripImageExtension,
   thinFeatureMessageHe,
@@ -232,8 +234,21 @@ export function useImportHandlers(context: ImportHandlersContext) {
         const pixelSizeMm = options.targetWidthMm / grid.width;
         let layer: DesignLayer;
         if (options.mode === "silhouette") {
+          // Otsu runs HERE and nowhere else: the value it produces is stored
+          // on the layer, and the rebuild path keeps reading the stored
+          // value. Re-deriving it on rebuild would reshape every saved design.
+          const threshold =
+            options.thresholdMode === "auto"
+              ? otsuThreshold(grid)
+              : options.threshold;
+          if (options.thresholdMode === "auto" && !isBimodalEnough(grid, threshold)) {
+            noticesHe.push(
+              "לתמונה אין הפרדה ברורה בין כהה לבהיר, כך שהסף האוטומטי הוא ניחוש — " +
+                "עברו ל״סף בהירות: ידני״ בחלון הייבוא, או הגדילו את הניגודיות."
+            );
+          }
           const silhouette = {
-            threshold: options.threshold,
+            threshold,
             invert: options.invert,
             pixelSizeMm,
           };
@@ -277,7 +292,9 @@ export function useImportHandlers(context: ImportHandlersContext) {
             meshId: null,
             settings: {
               targetWidthMm: options.targetWidthMm,
-              threshold: options.threshold,
+              // The value Otsu produced, not the dialog's unused default —
+              // this is what the layer reports and what a regeneration reuses.
+              threshold,
               invert: options.invert,
               reliefHeightMm: options.reliefHeightMm,
               minThicknessMm: options.minThicknessMm,
