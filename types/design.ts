@@ -227,6 +227,13 @@ export interface ImageReliefLayer extends LayerCommon {
 /** Provenance of an imported/computed mesh layer. */
 export interface MeshProvenance {
   kind:
+    /**
+     * Any imported mesh FILE — STL, OBJ, or a body out of a 3MF build. The
+     * name predates the other two formats and stays because it is what the
+     * design file's sanitizer stores: every kind except the print aids below
+     * collapses to this one on save, so a new name would not survive a round
+     * trip. `fileName` is where the actual format lives.
+     */
     | "stlImport"
     | "booleanResult"
     | "cutResult"
@@ -244,7 +251,7 @@ export interface MeshProvenance {
     | "supportResult"
     | "brimResult"
     | "raftResult";
-  /** Original file name for stlImport. */
+  /** Original file name for an imported mesh file. */
   fileName?: string;
   /** Hebrew description of the producing operation. */
   descriptionHe?: string;

@@ -42,7 +42,7 @@ export function StlImportDialog({
 }) {
   return (
     <Modal
-      title="ייבוא קובץ STL"
+      title="ייבוא קובץ מודל"
       open={preview !== null}
       onClose={onClose}
       footer={

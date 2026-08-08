@@ -76,7 +76,7 @@ export interface EditorHeaderProps {
   onRedo: () => void;
   onApplyTemplate: (document: DesignDocument) => void;
   onRequestBaseMode: (mode: BaseMode) => void;
-  onStlFile: (file: File) => void;
+  onMeshFile: (file: File) => void;
   onSvgFile: (file: File) => void;
   onImageFile: (file: File) => void;
   onDesignFile: (file: File) => void;
@@ -94,7 +94,7 @@ export function EditorHeader({
   onRedo,
   onApplyTemplate,
   onRequestBaseMode,
-  onStlFile,
+  onMeshFile,
   onSvgFile,
   onImageFile,
   onDesignFile,
@@ -171,10 +171,10 @@ export function EditorHeader({
 
       <div className="ms-auto flex flex-wrap items-center gap-1.5">
         <FilePickerButton
-          labelHe="ייבוא STL"
-          accept=".stl"
-          ariaLabel="קובץ STL"
-          onFile={onStlFile}
+          labelHe="ייבוא מודל"
+          accept=".stl,.3mf,.obj"
+          ariaLabel="קובץ מודל"
+          onFile={onMeshFile}
         />
         <FilePickerButton
           labelHe="ייבוא SVG"
