@@ -36,6 +36,7 @@ import { cleanupComponents } from "../repair/cleanup";
 import { diagnoseMesh, repairMesh, type RepairOptions } from "../repair/diagnose";
 import { voxelRemesh } from "../repair/voxelRemesh";
 import { isotropicRemesh, type RemeshSettings } from "../operations/remesh";
+import { parseObj } from "@/lib/import/obj";
 import { findSelfIntersections } from "../repair/selfIntersection";
 import { latticeFill, type LatticeSettings } from "../operations/lattice";
 import { roundEdges, shellSolid, type FilletSettings, type ShellSettings } from "../operations/fillet";
@@ -185,6 +186,15 @@ export interface GeometryJobMap {
   cleanupComponents: {
     payload: { mesh: MeshData };
     result: ReturnType<typeof cleanupComponents>;
+  };
+  /**
+   * Hardened OBJ parse as a job: a cloud-generated model can be tens of
+   * megabytes, and parsing that much text on the main thread would freeze
+   * the editor right after a minutes-long wait.
+   */
+  parseObjText: {
+    payload: { text: string };
+    result: ReturnType<typeof parseObj>;
   };
   latticeFill: {
     payload: { mesh: MeshData; settings: LatticeSettings };
@@ -382,6 +392,14 @@ export const JOB_HANDLERS: Handlers = {
     ctx.onProgress(0.1, "מנקה רכיבים");
     ctx.throwIfCancelled();
     return cleanupComponents(mesh);
+  },
+
+  parseObjText: async ({ text }, ctx) => {
+    ctx.onProgress(0.1, "קורא את קובץ המודל");
+    ctx.throwIfCancelled();
+    const parsed = parseObj(text);
+    ctx.onProgress(1, "הושלם");
+    return parsed;
   },
 
   latticeFill: async ({ mesh, settings }, ctx) => {

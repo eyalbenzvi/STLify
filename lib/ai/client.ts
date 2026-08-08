@@ -149,9 +149,13 @@ export async function runAiJob<K extends AiJobName>(
 
 /** Tear the AI worker down (editor unmount). */
 export function disposeAiWorker(): void {
+  // In-flight jobs must settle — a terminated worker will never answer, and
+  // an unsettled promise would hang its awaiting caller forever. Treated as
+  // a cancellation, which callers already handle silently.
+  for (const [, job] of pending) job.reject(new AiJobCancelledError());
+  pending.clear();
   workerInstance?.terminate();
   workerInstance = null;
-  pending.clear();
 }
 
 export { AiJobCancelledError };

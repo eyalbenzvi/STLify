@@ -208,6 +208,8 @@ export interface ImageImportOptionsValue {
    */
   aiMask: AiInferenceResult | null;
   aiDepth: AiInferenceResult | null;
+  /** Source image width/height, recorded when the AI ran (for previews). */
+  aiImageAspect: number | null;
   /** Smart relief: flip the height mapping (lithophane-style). */
   depthInvert: boolean;
   /** Smart relief: floor the background found by the segmentation model. */
@@ -264,7 +266,9 @@ function useAiInference(
       try {
         const rgba = await decodeImageToRgba(file);
         let ranOn: "worker" | "main" = "worker";
-        const patch: Partial<ImageImportOptionsValue> = {};
+        const patch: Partial<ImageImportOptionsValue> = {
+          aiImageAspect: rgba.width / rgba.height,
+        };
         for (let i = 0; i < jobs.length; i++) {
           const name = jobs[i];
           const outcome = await runAiJob(
@@ -414,13 +418,21 @@ function AiRunControls({
 /** Grayscale preview of the smart-relief height field (taller = brighter). */
 function DepthPreview({ options }: { options: ImageImportOptionsValue }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const { aiDepth, aiMask, maskWithSegmentation, depthInvert } = options;
+  const { aiDepth, aiMask, maskWithSegmentation, depthInvert, aiImageAspect } = options;
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !aiDepth) return;
+    // The model output is aspect-squashed; the import resamples it onto the
+    // image-aspect grid, so the preview must too — a square preview of a 2:1
+    // photo would misrepresent the relief's proportions.
+    const gridWidth = aiDepth.width;
+    const gridHeight = Math.max(
+      2,
+      Math.round(aiImageAspect ? gridWidth / aiImageAspect : aiDepth.height)
+    );
     const grid = depthToReliefGrid(aiDepth.map, aiDepth.width, aiDepth.height, {
-      gridWidth: aiDepth.width,
-      gridHeight: aiDepth.height,
+      gridWidth,
+      gridHeight,
       mask:
         maskWithSegmentation && aiMask
           ? { map: aiMask.map, width: aiMask.width, height: aiMask.height }
@@ -441,7 +453,7 @@ function DepthPreview({ options }: { options: ImageImportOptionsValue }) {
       image.data[i * 4 + 3] = 255;
     }
     ctx.putImageData(image, 0, 0);
-  }, [aiDepth, aiMask, maskWithSegmentation, depthInvert]);
+  }, [aiDepth, aiMask, maskWithSegmentation, depthInvert, aiImageAspect]);
   if (!aiDepth) return null;
   return (
     <div className="flex flex-col gap-1">
@@ -778,6 +790,7 @@ export function ImageImportDialog({
     maskStrokes: [],
     aiMask: null,
     aiDepth: null,
+    aiImageAspect: null,
     depthInvert: false,
     maskWithSegmentation: true,
     cloudTargetSizeMm: 80,
@@ -795,8 +808,8 @@ export function ImageImportDialog({
   const [lastFile, setLastFile] = useState<File | null>(file);
   if (file !== lastFile) {
     setLastFile(file);
-    if (options.aiMask || options.aiDepth) {
-      setOptions((o) => ({ ...o, aiMask: null, aiDepth: null }));
+    if (options.aiMask || options.aiDepth || options.aiImageAspect !== null) {
+      setOptions((o) => ({ ...o, aiMask: null, aiDepth: null, aiImageAspect: null }));
     }
   }
 

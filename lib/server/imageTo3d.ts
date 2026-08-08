@@ -25,6 +25,15 @@ const CREATE_WINDOW_MS = 60 * 60 * 1000;
 /** Status polls per client per minute (a 4s poll uses 15). */
 const POLL_LIMIT = 120;
 const POLL_WINDOW_MS = 60 * 1000;
+/**
+ * Backstops across ALL clients. The per-client key comes from
+ * x-forwarded-for, which an attacker who can reach the instance directly
+ * controls — so a spoofed header must never buy unlimited paid provider
+ * tasks, and the hit maps must never grow without bound.
+ */
+const GLOBAL_CREATE_LIMIT = 30;
+const GLOBAL_POLL_LIMIT = 1200;
+const MAX_TRACKED_CLIENTS = 10_000;
 /** How long a finished/abandoned task mapping is kept. */
 const TASK_TTL_MS = 2 * 60 * 60 * 1000;
 const TASK_MAP_CAP = 500;
@@ -81,14 +90,27 @@ function rateLimited(
   hits: Map<string, number[]>,
   key: string,
   limit: number,
-  windowMs: number
+  windowMs: number,
+  globalLimit: number
 ): boolean {
   const now = Date.now();
-  const recent = (hits.get(key) ?? []).filter((t) => now - t < windowMs);
-  if (recent.length >= limit) {
-    hits.set(key, recent);
-    return true;
+  // Prune the whole map every call: entries with no recent hits go away, so
+  // the map tracks only clients active inside the window (bounded below).
+  let total = 0;
+  for (const [k, times] of hits) {
+    const recent = times.filter((t) => now - t < windowMs);
+    if (recent.length === 0) hits.delete(k);
+    else {
+      hits.set(k, recent);
+      total += recent.length;
+    }
   }
+  // Fail closed on the backstops: a flood of spoofed client keys hits the
+  // global budget (or the tracking cap) instead of minting fresh buckets.
+  if (total >= globalLimit) return true;
+  if (hits.size >= MAX_TRACKED_CLIENTS && !hits.has(key)) return true;
+  const recent = hits.get(key) ?? [];
+  if (recent.length >= limit) return true;
   recent.push(now);
   hits.set(key, recent);
   return false;
@@ -171,7 +193,7 @@ export async function handleCreateTask(
   provider: MeshGenProvider | null
 ): Promise<Response> {
   if (!provider) return errorResponse(503, NO_PROVIDER_HE);
-  if (rateLimited(state.createHits, clientKey(request), CREATE_LIMIT, CREATE_WINDOW_MS)) {
+  if (rateLimited(state.createHits, clientKey(request), CREATE_LIMIT, CREATE_WINDOW_MS, GLOBAL_CREATE_LIMIT)) {
     return errorResponse(429, "יותר מדי בקשות יצירה — המתינו מעט ונסו שוב");
   }
 
@@ -243,7 +265,7 @@ export async function handleTaskStatus(
   provider: MeshGenProvider | null
 ): Promise<Response> {
   if (!provider) return errorResponse(503, NO_PROVIDER_HE);
-  if (rateLimited(state.pollHits, clientKey(request), POLL_LIMIT, POLL_WINDOW_MS)) {
+  if (rateLimited(state.pollHits, clientKey(request), POLL_LIMIT, POLL_WINDOW_MS, GLOBAL_POLL_LIMIT)) {
     return errorResponse(429, "יותר מדי בקשות סטטוס — האטו את הקצב");
   }
   const record = lookupTask(taskId);
@@ -297,7 +319,7 @@ export async function handleTaskModel(
   fetchImpl: typeof fetch = fetch
 ): Promise<Response> {
   if (!provider) return errorResponse(503, NO_PROVIDER_HE);
-  if (rateLimited(state.pollHits, clientKey(request), POLL_LIMIT, POLL_WINDOW_MS)) {
+  if (rateLimited(state.pollHits, clientKey(request), POLL_LIMIT, POLL_WINDOW_MS, GLOBAL_POLL_LIMIT)) {
     return errorResponse(429, "יותר מדי בקשות — האטו את הקצב");
   }
   const record = lookupTask(taskId);

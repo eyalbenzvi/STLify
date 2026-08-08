@@ -23,7 +23,6 @@ import { getGeometryKernel } from "@/lib/geometry/kernel";
 import { meshDataBounds, transformMeshData } from "@/lib/geometry/meshData";
 import { storeMesh } from "@/lib/geometry/meshStore";
 import { runGeometryJob, JobCancelledError } from "@/lib/geometry/jobs/client";
-import { parseObj } from "@/lib/import/obj";
 import { applyImportTriangleBudget } from "@/lib/import/triangleBudget";
 import { stripImageExtension } from "@/lib/import/image";
 import { fetchCloudAvailability, generateCloudModel } from "@/lib/ai/cloudClient";
@@ -127,9 +126,19 @@ export function useCloudModelImport(context: CloudModelImportContext) {
 
         // --- The print-readiness funnel -----------------------------------
         // 1. Hardened import: the provider's bytes go through the same
-        //    validated OBJ parser as any user file.
+        //    validated OBJ parser as any user file — as a job, because a
+        //    generated OBJ can be tens of megabytes and parsing that much
+        //    text on the main thread would freeze the editor right after a
+        //    minutes-long wait.
         stage(0.76, "קורא את קובץ המודל…");
-        const parsed = parseObj(objText);
+        const { result: parsed } = await runGeometryJob(
+          "parseObjText",
+          { text: objText },
+          {
+            signal: controller.signal,
+            onProgress: (fraction, stageHe) => stage(0.76 + fraction * 0.03, stageHe),
+          }
+        );
         const noticesHe = [...parsed.warningsHe];
 
         // 2. Physical size: the provider has no units, so the footprint is

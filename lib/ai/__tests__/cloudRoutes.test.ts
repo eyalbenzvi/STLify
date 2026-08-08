@@ -115,6 +115,19 @@ describe("create task", () => {
     expect((await handleCreateTask(createRequest(PNG, "5.6.7.8"), provider)).status).toBe(200);
   });
 
+  it("caps creations globally, so spoofed client keys buy nothing", async () => {
+    const provider = fakeProvider();
+    // 30 creations across freshly-invented "clients" exhaust the global
+    // budget; the 31st is refused even from a never-seen key.
+    for (let i = 0; i < 30; i++) {
+      const response = await handleCreateTask(createRequest(PNG, `10.9.${i}.1`), provider);
+      expect(response.status).toBe(200);
+    }
+    expect(
+      (await handleCreateTask(createRequest(PNG, "99.99.99.99"), provider)).status
+    ).toBe(429);
+  });
+
   it("maps provider errors to statuses with Hebrew messages", async () => {
     const quota = fakeProvider({
       async createTask() {
