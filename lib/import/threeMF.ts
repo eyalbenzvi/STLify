@@ -41,11 +41,20 @@ export class ThreeMfImportError extends Error {
   }
 }
 
+/**
+ * The triangle cap is lower than the STL importer's 1.5 M on purpose. A binary
+ * STL triangle costs 50 bytes to hold; a 3MF triangle is an XML element, which
+ * measures about 234 bytes once parsed into a tree. The caps below are chosen
+ * so the parsed document stays inside the XML scanner's element budget rather
+ * than being refused halfway through by it.
+ */
 export const THREE_MF_LIMITS = {
   maxFileBytes: 100 * 1024 * 1024,
   maxObjects: 512,
-  maxVerticesPerObject: 2_000_000,
-  maxTrianglesTotal: 2_000_000,
+  maxVerticesPerObject: 1_000_000,
+  /** Across the whole file, not per object — vertices are the memory cost. */
+  maxVerticesTotal: 1_000_000,
+  maxTrianglesTotal: 1_000_000,
   /** How deep a component hierarchy may nest before we call it hostile. */
   maxComponentDepth: 32,
   /** Total component references followed, so a DAG cannot blow up combinatorially. */
@@ -102,15 +111,24 @@ function composeTransforms(outer: Transform12, inner: Transform12): number[] {
   return out;
 }
 
-/** Millimetres per unit, per the Core spec's `unit` attribute. */
-const UNIT_SCALE: Record<string, number> = {
-  micron: 0.001,
-  millimeter: 1,
-  centimeter: 10,
-  inch: 25.4,
-  foot: 304.8,
-  meter: 1000,
-};
+/**
+ * Millimetres per unit, per the Core spec's `unit` attribute.
+ *
+ * A Map, not an object literal, and the reason is a real bug this had: a plain
+ * object answers `UNIT_SCALE["constructor"]` with `Object` — a truthy function
+ * — so `unit="constructor"` sailed past both the `?? 1` fallback and the
+ * `in`-based "unknown unit" warning, made `unitScale` a function, and turned
+ * every coordinate in the file into NaN with no warning at all. A Map has no
+ * inherited keys to walk into.
+ */
+const UNIT_SCALE = new Map<string, number>([
+  ["micron", 0.001],
+  ["millimeter", 1],
+  ["centimeter", 10],
+  ["inch", 25.4],
+  ["foot", 304.8],
+  ["meter", 1000],
+]);
 
 interface MeshResource {
   positions: Float64Array;
@@ -226,9 +244,10 @@ export async function parseThreeMf(buffer: ArrayBuffer): Promise<ThreeMfImportRe
   }
 
   const warningsHe: string[] = [];
-  const unitScale = UNIT_SCALE[model.attrs.unit ?? "millimeter"] ?? 1;
-  if (model.attrs.unit && !(model.attrs.unit in UNIT_SCALE)) {
-    warningsHe.push(`יחידת המידה "${model.attrs.unit}" אינה מוכרת — הקובץ נקרא כמילימטרים`);
+  const declaredUnit = model.attrs.unit ?? "millimeter";
+  const unitScale = UNIT_SCALE.get(declaredUnit) ?? 1;
+  if (!UNIT_SCALE.has(declaredUnit)) {
+    warningsHe.push(`יחידת המידה "${declaredUnit}" אינה מוכרת — הקובץ נקרא כמילימטרים`);
   }
 
   const resources = childNamed(model, "resources");
@@ -250,13 +269,23 @@ export async function parseThreeMf(buffer: ArrayBuffer): Promise<ThreeMfImportRe
 
   const objects = new Map<string, ObjectResource>();
   let totalTriangles = 0;
+  let totalVertices = 0;
+  let objectElements = 0;
   for (const node of childrenNamed(resources, "object")) {
     const id = node.attrs.id;
     if (!id) continue;
-    if (objects.size >= THREE_MF_LIMITS.maxObjects) {
+    // Count ELEMENTS, not map entries. Duplicate ids overwrote each other, so
+    // `objects.size` stayed at 1 while three thousand objects were parsed in
+    // full — the cap measured the wrong thing entirely.
+    if (++objectElements > THREE_MF_LIMITS.maxObjects) {
       throw new ThreeMfImportError(
         `קובץ ה-3MF מכיל יותר מדי אובייקטים (מקסימום ${THREE_MF_LIMITS.maxObjects})`
       );
+    }
+    // The Core spec requires object ids to be unique. Refusing a duplicate is
+    // both correct and what keeps the overwrite path from existing.
+    if (objects.has(id)) {
+      throw new ThreeMfImportError("קובץ ה-3MF פגום — מזהה אובייקט מופיע יותר מפעם אחת");
     }
     const name = node.attrs.name ?? `object ${id}`;
     const meshNode = childNamed(node, "mesh");
@@ -265,6 +294,11 @@ export async function parseThreeMf(buffer: ArrayBuffer): Promise<ThreeMfImportRe
       totalTriangles += mesh.indices.length / 3;
       if (totalTriangles > THREE_MF_LIMITS.maxTrianglesTotal) {
         throw new ThreeMfImportError("קובץ ה-3MF מכיל יותר מדי משולשים לייבוא");
+      }
+      // Per-object caps alone let 512 objects each sit just under the limit.
+      totalVertices += mesh.positions.length / 3;
+      if (totalVertices > THREE_MF_LIMITS.maxVerticesTotal) {
+        throw new ThreeMfImportError("קובץ ה-3MF מכיל יותר מדי קודקודים לייבוא");
       }
     }
     const componentsNode = childNamed(node, "components");
@@ -295,6 +329,30 @@ export async function parseThreeMf(buffer: ArrayBuffer): Promise<ThreeMfImportRe
   // support wrapper disappear instead of arriving as a duplicate part.
   const placed: { object: ObjectResource; transform: Transform12 }[] = [];
   let expansions = 0;
+  /**
+   * The geometry budget has to be spent on what comes OUT, not on what was
+   * parsed. Counting each object's mesh once at parse time left the component
+   * graph free to place it any number of times: a 2.8 KB file with a 140×140
+   * fan-out DAG — no cycle, well inside the expansion cap — produced 19,600
+   * bodies and 5.9 million triangles against a declared 1 million cap, and
+   * 141 MB of mesh from a file 50,000 times smaller.
+   */
+  let placedTriangles = 0;
+  let placedVertices = 0;
+  const place = (object: ObjectResource, transform: Transform12): void => {
+    if (!object.mesh) return;
+    placedTriangles += object.mesh.indices.length / 3;
+    placedVertices += object.mesh.positions.length / 3;
+    if (
+      placedTriangles > THREE_MF_LIMITS.maxTrianglesTotal ||
+      placedVertices > THREE_MF_LIMITS.maxVerticesTotal
+    ) {
+      throw new ThreeMfImportError(
+        "קובץ ה-3MF מייצר יותר גאומטריה ממה שניתן לייבא — ייתכן שהוא פגום או זדוני"
+      );
+    }
+    placed.push({ object, transform });
+  };
   const visit = (
     objectId: string,
     transform: Transform12,
@@ -315,7 +373,7 @@ export async function parseThreeMf(buffer: ArrayBuffer): Promise<ThreeMfImportRe
       warningsHe.push(`הפניה לאובייקט ${objectId} שאינו קיים בקובץ — דולגה`);
       return;
     }
-    if (object.mesh) placed.push({ object, transform });
+    place(object, transform);
     if (object.components.length === 0) return;
     const nextPath = new Set(path).add(objectId);
     for (const component of object.components) {
@@ -334,9 +392,7 @@ export async function parseThreeMf(buffer: ArrayBuffer): Promise<ThreeMfImportRe
     // A model with resources but no build is still usable geometry; the spec
     // just would not have printed it. Say so rather than refuse.
     warningsHe.push("לקובץ אין אלמנט build — כל האובייקטים יובאו במיקומם המקורי");
-    for (const object of objects.values()) {
-      if (object.mesh) placed.push({ object, transform: IDENTITY_12 });
-    }
+    for (const object of objects.values()) place(object, IDENTITY_12);
   } else {
     for (const item of items) {
       visit(item.attrs.objectid, parseTransform(item.attrs.transform), 0, new Set());

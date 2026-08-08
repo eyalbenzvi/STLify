@@ -131,7 +131,10 @@ export async function readZip(
   const decoder = new TextDecoder("utf-8", { fatal: false });
   const entries = new Map<string, Uint8Array>();
   let cursor = directoryOffset;
-  let totalBytes = 0;
+  /** Bytes actually produced. The only number an attacker does not choose. */
+  let actualBytes = 0;
+  /** Bytes the archive CLAIMS. Useful only to refuse an honest file early. */
+  let declaredBytes = 0;
 
   for (let i = 0; i < entryCount; i++) {
     if (cursor + 46 > bytes.length || view.getUint32(cursor, true) !== CENTRAL_HEADER_SIG) {
@@ -152,9 +155,12 @@ export async function readZip(
     }
     if (name.endsWith("/")) continue; // directory entry, no payload
 
-    // Bound BEFORE decompressing: refuse a file that merely claims to be huge.
-    totalBytes += uncompressedSize;
-    if (totalBytes > limits.maxTotalBytes) {
+    // A cheap early refusal for an honest file that is simply too big. It is
+    // NOT the budget: `uncompressedSize` is a number the archive chose, and an
+    // archive that declares 0 for every entry would sail past any check built
+    // on it. The budget below counts what we actually produce.
+    declaredBytes += uncompressedSize;
+    if (declaredBytes > limits.maxTotalBytes) {
       throw new ZipReadError("תוכן הארכיון גדול מדי — ייתכן שהקובץ פגום או זדוני");
     }
 
@@ -169,13 +175,24 @@ export async function readZip(
     }
     const payload = bytes.subarray(dataStart, dataStart + compressedSize);
 
+    // The real budget, spent against what actually comes out. Note that
+    // several central-directory records may point at ONE local header, so an
+    // archive of a few kilobytes can ask for the same payload many times —
+    // counting per entry is not enough, it has to be counted across them.
+    const remaining = limits.maxTotalBytes - actualBytes;
+    let data: Uint8Array;
     if (method === 0) {
-      entries.set(name, payload.slice());
+      if (compressedSize > remaining) {
+        throw new ZipReadError("תוכן הארכיון גדול מדי — ייתכן שהקובץ פגום או זדוני");
+      }
+      data = payload.slice();
     } else if (method === 8) {
-      entries.set(name, await inflateRaw(payload, limits.maxTotalBytes - (totalBytes - uncompressedSize)));
+      data = await inflateRaw(payload, remaining);
     } else {
       throw new ZipReadError(`שיטת דחיסה לא נתמכת בארכיון (${method})`);
     }
+    actualBytes += data.length;
+    entries.set(name, data);
   }
 
   return entries;

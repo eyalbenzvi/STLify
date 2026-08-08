@@ -458,6 +458,61 @@ describe("measureThinnestFeature", () => {
     expect(report.violates).toBe(false);
   });
 
+  it("ignores dust the tracer is going to discard anyway", () => {
+    // One stray pixel on a scan used to report a 0.30 mm "feature" and thicken
+    // the WHOLE artwork — a 60-pixel logo square grew 5.6% — to correct a mark
+    // that never reached the output, while the notice named a stroke width the
+    // user could not find in their drawing.
+    const size = 200;
+    const clean = new Float32Array(size * size).fill(1);
+    for (let y = 70; y < 130; y++) for (let x = 70; x < 130; x++) clean[y * size + x] = 0;
+    const dusty = new Float32Array(clean);
+    dusty[20 * size + 20] = 0; // a single dark pixel, far from the logo
+    // 60 mm across 200 px, matching the dialog defaults.
+    const options = { threshold: 0.5, invert: false, pixelSizeMm: 0.3, minimumMm: 0.8 };
+
+    expect(
+      measureThinnestFeature({ width: size, height: size, values: clean }, options).violates
+    ).toBe(false);
+    expect(
+      measureThinnestFeature({ width: size, height: size, values: dusty }, options).violates
+    ).toBe(false);
+
+    // And the geometry is genuinely untouched: same contour count, same area.
+    const trace = (values: Float32Array) =>
+      gridToSilhouetteContours({ width: size, height: size, values }, options);
+    const area = (contour: [number, number][]) => {
+      let a = 0;
+      for (let i = 0; i < contour.length; i++) {
+        const [x1, y1] = contour[i];
+        const [x2, y2] = contour[(i + 1) % contour.length];
+        a += x1 * y2 - x2 * y1;
+      }
+      return Math.abs(a / 2);
+    };
+    const before = trace(clean);
+    const after = trace(dusty);
+    expect(after.length).toBe(before.length);
+    expect(area(after[0] as [number, number][])).toBeCloseTo(
+      area(before[0] as [number, number][]),
+      6
+    );
+  });
+
+  it("still finds a thin stroke that is large enough to be traced", () => {
+    // The speck filter must not silence a real hairline: a 1-pixel stroke long
+    // enough to survive the tracer's own area threshold still reports.
+    const size = 200;
+    const values = new Float32Array(size * size).fill(1);
+    for (let x = 20; x < 180; x++) values[100 * size + x] = 0; // 160 px x 1 px
+    const report = measureThinnestFeature(
+      { width: size, height: size, values },
+      { threshold: 0.5, invert: false, pixelSizeMm: 0.3, minimumMm: 0.8 }
+    );
+    expect(report.violates).toBe(true);
+    expect(report.thinnestMm).toBeCloseTo(0.3, 6);
+  });
+
   it("reports nothing when the image has no solid area at all", () => {
     const values = new Float32Array(32 * 32).fill(1);
     const report = measureThinnestFeature(

@@ -97,13 +97,22 @@ mainstream model formats could not be read at all.
   file marks as a support keeps that meaning through a re-export. OBJ reads
   all four index forms including negative indices, fan-triangulates polygon
   faces, and welds like the STL importer welds.
-- **Imported files are treated as hostile.** The ZIP reader counts bytes as
-  they arrive rather than trusting declared sizes (a 64 MB-of-zeros bomb is
-  refused mid-stream); the XML is read by a scanner with no DTD subsystem and
-  no resolver, so DOCTYPE and entity declarations are refused rather than
-  skipped; object, vertex, triangle, depth and recursion counts are all
-  capped; circular component graphs are detected. Every refusal is a Hebrew
-  message, and none escape as a raw throw.
+- **Imported files are treated as hostile**, and the claim has been attacked
+  rather than asserted. The ZIP reader spends its budget on bytes that actually
+  arrive, never on the sizes the archive declares — an archive can lie about
+  those, and one that did turned 41 KB into 335 MB before this was fixed. The
+  XML scanner has no DTD subsystem and no resolver, refuses DOCTYPE and entity
+  declarations rather than skipping them, rejects out-of-range and illegal
+  characters in Hebrew instead of letting the platform throw an English error,
+  and scans attributes in linear time (the first version was quadratic: a
+  200 KB tag blocked the main thread for 43 seconds). The 3MF geometry budget
+  is spent per PLACEMENT, so a component graph cannot multiply one small mesh
+  past the cap. Unit lookups and attribute records cannot be walked into
+  JavaScript's prototype chain. Object, vertex, triangle, depth, expansion,
+  line-length and face-corner counts are all capped, duplicate object ids and
+  circular component graphs are refused, and every refusal is a Hebrew message.
+  The regression suite for all of this is
+  `lib/import/__tests__/importSecurity.test.ts`.
 - **A triangle budget on import.** Above 250,000 triangles a mesh is
   simplified automatically, with a notice naming both counts and saying
   plainly that simplification loses fine detail. It runs after repair, since

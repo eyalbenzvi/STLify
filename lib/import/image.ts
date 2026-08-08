@@ -439,6 +439,64 @@ function distanceToValue(
   return sq;
 }
 
+/**
+ * Traced contours below this area are dropped as specks. Shared with the
+ * minimum-feature check on purpose: a measurement that reports a feature the
+ * tracer then throws away is a measurement of nothing.
+ */
+const MIN_CONTOUR_AREA_MM2 = 1;
+
+/**
+ * Area in mm² of the solid component each pixel belongs to, 0 for background.
+ *
+ * 8-connected, which matters: a one-pixel-wide DIAGONAL stroke is a real
+ * hairline and is 8-connected but not 4-connected, so labelling it by
+ * 4-connectivity would shatter it into single pixels and the check would miss
+ * exactly the defect it exists to find.
+ */
+function componentAreasMm2(
+  mask: Uint8Array,
+  width: number,
+  height: number,
+  pixelAreaMm2: number
+): Float64Array {
+  const label = new Int32Array(mask.length).fill(-1);
+  const areas: number[] = [];
+  const stack: number[] = [];
+  for (let start = 0; start < mask.length; start++) {
+    if (mask[start] !== 1 || label[start] >= 0) continue;
+    const id = areas.length;
+    let count = 0;
+    label[start] = id;
+    stack.push(start);
+    while (stack.length > 0) {
+      const i = stack.pop()!;
+      count++;
+      const x = i % width;
+      const y = (i / width) | 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= height) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx;
+          if (xx < 0 || xx >= width) continue;
+          const j = yy * width + xx;
+          if (mask[j] === 1 && label[j] < 0) {
+            label[j] = id;
+            stack.push(j);
+          }
+        }
+      }
+    }
+    areas.push(count * pixelAreaMm2);
+  }
+  const out = new Float64Array(mask.length);
+  for (let i = 0; i < mask.length; i++) {
+    if (label[i] >= 0) out[i] = areas[label[i]];
+  }
+  return out;
+}
+
 /** What the minimum-feature check found on a traced silhouette. */
 export interface ThinFeatureReport {
   /** Narrowest stroke found, mm. `null` when the shape has no solid area. */
@@ -485,11 +543,18 @@ export function measureThinnestFeature(
   if (!mask.some((v) => v === 1)) return empty;
 
   const inner = distanceToValue(mask, width, height, 0);
+  // Specks the tracer is going to discard must not be measured. Without this,
+  // ONE dust pixel on a scan reported a 0.3 mm "feature" and thickened the
+  // whole artwork — a 60-pixel logo square grew by 5.6% — to fix a mark that
+  // never appeared in the output at all, and the notice explaining it named a
+  // stroke width the user could not find anywhere in their drawing.
+  const componentArea = componentAreasMm2(mask, width, height, px * px);
   let thinnestPx = Infinity;
   for (let y = 1; y < height - 1; y++) {
     for (let x = 1; x < width - 1; x++) {
       const i = y * width + x;
       if (mask[i] !== 1) continue;
+      if (componentArea[i] < MIN_CONTOUR_AREA_MM2) continue;
       const d = inner[i];
       let isRidge = true;
       for (let dy = -1; dy <= 1 && isRidge; dy++) {
@@ -1136,14 +1201,14 @@ export function gridToSilhouetteContours(
     // quantisation in the first place.
     const simplified = fitClosedContour(mm, tolerance, px * 2.5);
     if (simplified.length < 3) continue;
-    // Discard specks smaller than 1 mm².
+    // Discard specks — the same threshold measureThinnestFeature ignores.
     let area = 0;
     for (let i = 0; i < simplified.length; i++) {
       const [x1, y1] = simplified[i];
       const [x2, y2] = simplified[(i + 1) % simplified.length];
       area += x1 * y2 - x2 * y1;
     }
-    if (Math.abs(area / 2) < 1) continue;
+    if (Math.abs(area / 2) < MIN_CONTOUR_AREA_MM2) continue;
     contours.push(simplified);
   }
   return contours;

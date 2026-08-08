@@ -32,6 +32,14 @@ export const OBJ_LIMITS = {
   maxTriangles: 1_500_000,
   /** A single face this large is malformed, not a model. */
   maxFaceCorners: 1024,
+  /**
+   * A single line this long is malformed too, and the cap has to come BEFORE
+   * the line is split: `maxFaceCorners` was checked after `split()` had already
+   * materialised the array, so one `f` line of five million tokens allocated
+   * tens of megabytes and burned a second before being refused. A 1024-corner
+   * face needs a few kilobytes; 64 KB is generous.
+   */
+  maxLineChars: 64 * 1024,
 } as const;
 
 /** Welding quantum: coordinates within 1e-4 mm collapse to one vertex. */
@@ -91,7 +99,20 @@ export function parseObj(text: string): ObjParseResult {
     return index;
   };
 
-  for (const rawLine of text.split(/\r?\n/)) {
+  // Walked by index rather than `text.split(/\r?\n/)`: the split materialises
+  // one array entry per line before any of them is looked at, so a 20 MB file
+  // of nothing but newlines cost 300 MB of heap on the way to being refused.
+  let lineStart = 0;
+  while (lineStart <= text.length) {
+    let lineEnd = text.indexOf("\n", lineStart);
+    if (lineEnd < 0) lineEnd = text.length;
+    const rawLength = lineEnd - lineStart;
+    if (rawLength > OBJ_LIMITS.maxLineChars) {
+      throw new ObjImportError("קובץ ה-OBJ פגום — שורה ארוכה מדי");
+    }
+    const rawLine = text.slice(lineStart, lineEnd);
+    lineStart = lineEnd + 1;
+
     const line = rawLine.trim();
     if (line.length === 0 || line.startsWith("#")) continue;
     const space = line.search(/\s/);

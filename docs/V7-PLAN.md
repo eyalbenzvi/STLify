@@ -202,6 +202,80 @@ the marching-squares staircase.
   is GPL.
 
 - **Numbers.** Baseline on arrival: 39 test files, 482 tests, lint and
-  typecheck clean. On completion: 43 test files, 540 tests, 29 e2e journeys,
+  typecheck clean. On completion: 44 test files, 561 tests, 29 e2e journeys,
   lint clean with zero warnings, typecheck clean, `npm run bench` inside its
   thresholds.
+
+## Review round — what the audit found after the fact
+
+Everything above shipped green, and then a code review plus an adversarial
+security pass over the same diff found nine defects. Eight were in item 6, the
+part of the work whose module headers make the loudest safety claims, which is
+the lesson: the files that assert they are hardened are the files to distrust.
+Each is now a regression test in `lib/import/__tests__/importSecurity.test.ts`,
+and eleven of those eighteen cases fail against the pre-review parsers.
+
+- **The ZIP budget was computed from numbers the attacker supplies.** The
+  running total summed the DECLARED `uncompressedSize` of each entry, so an
+  archive declaring 0 everywhere never advanced it and every entry was handed
+  the full budget. With several central-directory records aliased onto one
+  local header, a **41 KB** file delivered **335 MB** past a 256 MB limit. The
+  budget now counts bytes as they actually arrive; the declared total survives
+  only as a cheap early refusal for honest files.
+- **The XML attribute scan was quadratic.** A global regex whose name pattern
+  backtracked at every start position: 4× the input cost 14.5× the time, and a
+  200 KB tag body — a legal size for a file this importer otherwise accepts —
+  blocked the main thread for **43 seconds**. Replaced by a hand-rolled linear
+  scan: the same input now takes **2 ms**.
+- **A raw English `RangeError` escaped to the UI.** `String.fromCodePoint` on
+  an out-of-range numeric character reference (`&#x110000;`) threw "Invalid
+  code point 1114112" straight past the "every refusal is a Hebrew message"
+  claim. Out-of-range references, surrogates and control characters are now
+  refused in Hebrew instead of being thrown on or carried into layer names.
+- **`unit="constructor"` produced NaN geometry, silently.** `UNIT_SCALE` was
+  an object literal, so the lookup walked the prototype chain and answered with
+  `Object` — truthy, so the `?? 1` fallback never fired and the scale became a
+  function. Every coordinate came out NaN, and `"constructor" in UNIT_SCALE`
+  was also true so even the unknown-unit warning was skipped. It is a Map now,
+  and attribute records are null-prototype.
+- **The 3MF geometry cap bounded parsing, not output.** Triangles were counted
+  once per object at parse time, leaving the component graph free to place that
+  object any number of times. A **2.8 KB** file with a 140×140 fan-out DAG — no
+  cycle, inside the expansion budget — produced 19,600 bodies and **5.9 million
+  triangles against a 1 million cap**, and 141 MB of mesh. The budget is now
+  spent per placement.
+- **`maxObjects` measured the wrong thing.** It compared against the object
+  map's `size`, and duplicate ids overwrote each other, so 3,000 fully parsed
+  objects passed a cap of 512. It counts elements now, and duplicate ids are
+  refused outright, which the Core spec requires anyway.
+- **OBJ allocated before it checked.** `maxFaceCorners` was enforced after
+  `split()` had already materialised the array, and lines came from
+  `text.split(/\r?\n/)`, which builds one entry per line before reading any of
+  them: 20 M newlines cost 300 MB and 3.7 s. Lines are now walked by index with
+  a length cap — 8.7 MB and 369 ms.
+- **`triangleBudget.ts` ignored the kernel's own instruction.** `kernel.ts`
+  says new multi-step pipelines should use `withSolidScope` rather than a
+  manual dispose chain, and this was a manual chain that leaked the live handle
+  when `simplify` threw. It runs in a scope now, with a `liveSolidCount()`
+  assertion on the happy path, the early return and the throwing path.
+- **The new error classes were not registered in `hebrewMessageOf`.** Their
+  Hebrew text reached the user only because each passes `messageHe` to
+  `super()` — the guarantee was an accident of construction rather than
+  something the error handler stated. Registered.
+
+And one product defect, outside item 6, that only a full-pipeline test could
+see: **a single dust pixel silently thickened the whole artwork.** The
+minimum-feature check measured the global thinnest ridge, so one stray dark
+pixel on a scan reported a 0.30 mm "feature" and dilated everything — a
+60-pixel logo square grew 5.6% — to correct a mark the tracer discarded before
+it reached the output, while the notice named a stroke width the user could not
+find anywhere in their drawing. The check now ignores components below the same
+speck area the tracer drops, sharing one constant so the two cannot drift, and
+labels them 8-connected so a genuine one-pixel DIAGONAL hairline is still
+caught.
+
+Worth stating plainly: the two reviewers were run in parallel and both died
+before reporting. What they left behind was their throwaway probe files, and
+those probes are where six of the nine findings came from — including the two
+worst. The findings were re-derived and re-confirmed from the probes rather
+than taken on trust, and the probes themselves were deleted.

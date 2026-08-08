@@ -37,16 +37,55 @@ export interface XmlLiteLimits {
   maxDepth: number;
 }
 
+/**
+ * The element cap is a MEMORY budget, not a stylistic one. Each element is a
+ * JS object with an attribute record and a child array, measured at about 234
+ * bytes; 1.6 million is roughly 375 MB of heap and a couple of seconds to
+ * parse, which is as far as a browser tab should be pushed by a file it was
+ * handed. It also sits comfortably above the triangle+vertex element count of
+ * the largest 3MF this importer accepts.
+ */
 export const XML_LITE_LIMITS: XmlLiteLimits = {
-  maxElements: 4_000_000,
+  maxElements: 1_600_000,
   maxDepth: 64,
 };
 
+/** The largest code point Unicode defines; above it `fromCodePoint` throws. */
+const MAX_CODE_POINT = 0x10ffff;
+
+/**
+ * Reject the code points XML 1.0 does not allow as characters.
+ *
+ * `String.fromCodePoint` throws a RangeError — a raw, English one — for
+ * anything above the Unicode maximum, which would have escaped this parser to
+ * the UI as `Invalid code point 1114112`. Surrogates and most control
+ * characters are accepted by `fromCodePoint` but are not legal XML content,
+ * and they end up in layer names and material names, so they are refused here
+ * rather than carried into the document.
+ */
+function codePointFromReference(value: number): string {
+  const valid =
+    Number.isInteger(value) &&
+    value >= 0 &&
+    value <= MAX_CODE_POINT &&
+    !(value >= 0xd800 && value <= 0xdfff) &&
+    (value === 0x9 ||
+      value === 0xa ||
+      value === 0xd ||
+      (value >= 0x20 && value !== 0xfffe && value !== 0xffff));
+  if (!valid) {
+    throw new XmlLiteError("קובץ ה-XML מכיל תו לא חוקי (הפניה מספרית מחוץ לתחום)");
+  }
+  return String.fromCodePoint(value);
+}
+
 /** The five predefined entities, plus numeric character references. */
 function decodeText(raw: string): string {
+  // Fast path: the overwhelming majority of 3MF attribute values are numbers.
+  if (!raw.includes("&")) return raw;
   return raw.replace(/&(#x[0-9a-fA-F]+|#[0-9]+|[a-zA-Z]+);/g, (match, body: string) => {
-    if (body.startsWith("#x")) return String.fromCodePoint(parseInt(body.slice(2), 16));
-    if (body.startsWith("#")) return String.fromCodePoint(parseInt(body.slice(1), 10));
+    if (body.startsWith("#x")) return codePointFromReference(parseInt(body.slice(2), 16));
+    if (body.startsWith("#")) return codePointFromReference(parseInt(body.slice(1), 10));
     switch (body) {
       case "lt":
         return "<";
@@ -73,14 +112,53 @@ function localName(name: string): string {
   return colon < 0 ? name : name.slice(colon + 1);
 }
 
-const ATTRIBUTE_RE = /([A-Za-z_:][-\w.:]*)\s*=\s*("([^"]*)"|'([^']*)')/g;
+function isSpace(ch: string): boolean {
+  return ch === " " || ch === "\t" || ch === "\n" || ch === "\r";
+}
 
+/**
+ * Scan `name="value"` pairs in a single forward pass.
+ *
+ * This was a global regex, and it was the parser's worst weakness: the name
+ * pattern's trailing `*` backtracks at every start position when no `=`
+ * follows, so the scan was QUADRATIC in the length of the tag. Measured on the
+ * regex version, 4× the input cost 14.5× the time, and a 200 KB tag body — a
+ * legal size for a file this importer otherwise accepts — blocked the main
+ * thread for 43 seconds. A hand-rolled scan is linear and cannot backtrack.
+ *
+ * Every branch advances `i` by at least one character, so the loop terminates
+ * on any input, malformed included.
+ */
 function parseAttributes(source: string): Record<string, string> {
-  const attrs: Record<string, string> = {};
-  ATTRIBUTE_RE.lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = ATTRIBUTE_RE.exec(source)) !== null) {
-    attrs[localName(match[1])] = decodeText(match[3] ?? match[4] ?? "");
+  // Null-prototype: attribute names come from the file, and a plain object
+  // would answer `attrs.constructor` with something inherited. Callers read
+  // these by name, so the map must contain only what the file actually said.
+  const attrs: Record<string, string> = Object.create(null);
+  const n = source.length;
+  let i = 0;
+  while (i < n) {
+    while (i < n && isSpace(source[i])) i++;
+    if (i >= n) break;
+    const nameStart = i;
+    while (i < n && !isSpace(source[i]) && source[i] !== "=") i++;
+    const name = source.slice(nameStart, i);
+    while (i < n && isSpace(source[i])) i++;
+    if (i >= n) break;
+    if (source[i] !== "=") continue; // a bare token; `i` already moved past it
+    i++;
+    while (i < n && isSpace(source[i])) i++;
+    const quote = source[i];
+    if (quote !== '"' && quote !== "'") {
+      // Unquoted attribute values are not well-formed XML, and guessing where
+      // one ends is how a parser starts disagreeing with every other parser.
+      throw new XmlLiteError("קובץ ה-XML פגום — ערך תכונה ללא מרכאות");
+    }
+    const valueStart = ++i;
+    while (i < n && source[i] !== quote) i++;
+    if (i >= n) throw new XmlLiteError("קובץ ה-XML פגום — ערך תכונה שלא נסגר");
+    const value = source.slice(valueStart, i);
+    i++;
+    if (name.length > 0) attrs[localName(name)] = decodeText(value);
   }
   return attrs;
 }
@@ -149,7 +227,7 @@ export function parseXmlLite(
     }
     const element: XmlElement = {
       name,
-      attrs: space < 0 ? {} : parseAttributes(body.slice(space)),
+      attrs: space < 0 ? Object.create(null) : parseAttributes(body.slice(space)),
       children: [],
     };
 

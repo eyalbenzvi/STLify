@@ -25,6 +25,10 @@ import { PatternError } from "@/lib/geometry/operations/pattern";
 import { StlImportError } from "@/lib/import/stl";
 import { SvgImportError } from "@/lib/import/svg";
 import { ImageImportError } from "@/lib/import/image";
+import { ObjImportError } from "@/lib/import/obj";
+import { ThreeMfImportError } from "@/lib/import/threeMF";
+import { ZipReadError } from "@/lib/import/zipRead";
+import { XmlLiteError } from "@/lib/import/xmlLite";
 import { DesignFileError } from "@/lib/serialization/designFile";
 
 /** What happens to the layers an operation consumed. */
@@ -70,6 +74,14 @@ function hebrewMessageOf(error: unknown): string | null {
     error instanceof StlImportError ||
     error instanceof SvgImportError ||
     error instanceof ImageImportError ||
+    // The mesh-file importers. They pass their Hebrew text to super(), so the
+    // fallback below happened to print it anyway — but that made the guarantee
+    // an accident of construction rather than something stated here, and the
+    // next error class written without that habit would have leaked English.
+    error instanceof ObjImportError ||
+    error instanceof ThreeMfImportError ||
+    error instanceof ZipReadError ||
+    error instanceof XmlLiteError ||
     error instanceof DesignFileError ||
     error instanceof GeneratorError ||
     error instanceof PatternError

@@ -4,7 +4,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { getGeometryKernel } from "@/lib/geometry/kernel";
+import { getGeometryKernel, liveSolidCount, type Solid } from "@/lib/geometry/kernel";
 import { applyImportTriangleBudget } from "../triangleBudget";
 
 /** A sphere refined until it carries `atLeast` triangles. */
@@ -49,6 +49,40 @@ describe("applyImportTriangleBudget", () => {
     const { solid, status } = kernel.fromMeshData(result.mesh);
     expect(status).toBe("NoError");
     solid.dispose();
+  });
+
+  it("frees every kernel handle, including when simplify throws", async () => {
+    // The kernel contract says an operation consumes its input and the caller
+    // disposes what it abandons; this used to be a manual chain, which leaked
+    // the live handle if the kernel threw mid-way. It now runs in a solid
+    // scope, so the sweep covers the throwing path too.
+    const { kernel, mesh } = await heavySphere(3000);
+
+    const baseline = liveSolidCount();
+    await applyImportTriangleBudget(kernel, mesh, 800);
+    expect(liveSolidCount(), "happy path").toBe(baseline);
+
+    const broken = {
+      positions: new Float32Array([0, 0, 0, 10, 0, 0, 0, 10, 0]),
+      indices: new Uint32Array([0, 1, 2]),
+    };
+    await applyImportTriangleBudget(kernel, broken, 0);
+    expect(liveSolidCount(), "non-manifold early return").toBe(baseline);
+
+    // Make simplify fail on the real handle the budget is holding.
+    const failing = {
+      ...kernel,
+      fromMeshData: (data: typeof mesh) => {
+        const made = kernel.fromMeshData(data);
+        const solid = made.solid as Solid & { simplify: unknown };
+        solid.simplify = () => {
+          throw new Error("Manifold: simplify() failed");
+        };
+        return made;
+      },
+    };
+    await expect(applyImportTriangleBudget(failing, mesh, 800)).rejects.toThrow(/simplify/);
+    expect(liveSolidCount(), "throwing simplify").toBe(baseline);
   });
 
   it("says the reduction did not happen when the mesh is not watertight", async () => {

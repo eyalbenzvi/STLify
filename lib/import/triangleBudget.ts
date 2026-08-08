@@ -15,6 +15,7 @@
 import type { GeometryKernel } from "@/lib/geometry/kernel";
 import type { MeshData } from "@/lib/geometry/meshData";
 import { meshDataBounds } from "@/lib/geometry/meshData";
+import { withSolidScope } from "@/lib/geometry/solidScope";
 
 /** Above this a mesh is simplified on import. */
 export const IMPORT_TRIANGLE_BUDGET = 250_000;
@@ -54,42 +55,46 @@ export async function applyImportTriangleBudget(
   );
   if (!(diagonal > 0)) return { mesh, noticeHe: null };
 
-  const { solid, status } = kernel.fromMeshData(mesh);
-  if (status !== "NoError") {
-    solid.dispose();
+  // The kernel's own instruction (kernel.ts): new multi-step pipelines use the
+  // scope rather than a manual dispose chain. `simplify` CONSUMES its receiver,
+  // and dispose() is idempotent, so tracking each handle frees whatever is
+  // still live — including when the kernel throws mid-chain, which a manual
+  // chain would have leaked.
+  return withSolidScope(async (scope) => {
+    const { solid, status } = kernel.fromMeshData(mesh);
+    scope.track(solid);
+    if (status !== "NoError") {
+      return {
+        mesh,
+        noticeHe:
+          `הקובץ מכיל ${before.toLocaleString()} משולשים, יותר מהמומלץ ` +
+          `(${budget.toLocaleString()}), אך לא ניתן היה לפשט אותו כי הרשת אינה ` +
+          `אטומה. נסו ״תיקון״ ואז ״פישוט״ מתפריט הכלים אם העריכה איטית.`,
+      };
+    }
+
+    let current = solid;
+    let tolerance = diagonal * START_TOLERANCE_FRACTION;
+    let best: MeshData | null = null;
+    let after = before;
+    for (let pass = 0; pass < MAX_PASSES; pass++) {
+      current = scope.track(current.simplify(tolerance));
+      best = current.toMeshData();
+      after = best.indices.length / 3;
+      if (after <= budget) break;
+      tolerance *= 2;
+    }
+
+    // Nothing actually came off: keep the original rather than swap in an
+    // equivalent mesh and claim a reduction that did not happen.
+    if (!best || after >= before) return { mesh, noticeHe: null };
     return {
-      mesh,
+      mesh: best,
       noticeHe:
-        `הקובץ מכיל ${before.toLocaleString()} משולשים, יותר מהמומלץ ` +
-        `(${budget.toLocaleString()}), אך לא ניתן היה לפשט אותו כי הרשת אינה ` +
-        `אטומה. נסו ״תיקון״ ואז ״פישוט״ מתפריט הכלים אם העריכה איטית.`,
+        `הקובץ הכיל ${before.toLocaleString()} משולשים, יותר מהמומלץ ` +
+        `(${budget.toLocaleString()}), ולכן פושט אוטומטית ל-${after.toLocaleString()} ` +
+        `משולשים כדי שהעריכה תישאר זריזה. פישוט מאבד פרטים דקים — אם חשוב ` +
+        `לכם הפירוט המלא, בטלו את הייבוא וייבאו קובץ קל יותר.`,
     };
-  }
-
-  // `simplify` consumes its solid, so `current` is always the live handle and
-  // exactly one dispose closes the chain — success or early exit alike.
-  let current = solid;
-  let tolerance = diagonal * START_TOLERANCE_FRACTION;
-  let best: MeshData | null = null;
-  let after = before;
-  for (let pass = 0; pass < MAX_PASSES; pass++) {
-    current = current.simplify(tolerance);
-    best = current.toMeshData();
-    after = best.indices.length / 3;
-    if (after <= budget) break;
-    tolerance *= 2;
-  }
-  current.dispose();
-
-  // Nothing actually came off: keep the original rather than swap in an
-  // equivalent mesh and claim a reduction that did not happen.
-  if (!best || after >= before) return { mesh, noticeHe: null };
-  return {
-    mesh: best,
-    noticeHe:
-      `הקובץ הכיל ${before.toLocaleString()} משולשים, יותר מהמומלץ ` +
-      `(${budget.toLocaleString()}), ולכן פושט אוטומטית ל-${after.toLocaleString()} ` +
-      `משולשים כדי שהעריכה תישאר זריזה. פישוט מאבד פרטים דקים — אם חשוב ` +
-      `לכם הפירוט המלא, בטלו את הייבוא וייבאו קובץ קל יותר.`,
-  };
+  });
 }
