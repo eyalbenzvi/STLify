@@ -418,6 +418,18 @@ Gates: `npm test`, `npm run lint`, `npm run typecheck`, `npm run build`,
     localStorage flag no production code sets, and it still exercises the
     full downstream pipeline (grids → mesher → kernel → document).
 
+Post-implementation review passes added four more fixes (see the two
+review commits): the cloud layer lands on the LATEST document rather than
+the one captured at upload time; the upload cap is enforced while bytes
+arrive (streaming, not `arrayBuffer()`-then-check); the rate limiter got
+global creation/poll budgets + map pruning + a tracked-client cap because
+the per-client key (x-forwarded-for) is attacker-controllable; the
+generated OBJ is parsed as a geometry job (`parseObjText`) instead of on
+the main thread; the depth preview resamples to the image aspect; and
+`disposeAiWorker` settles in-flight promises. Two pre-existing defects
+found outside this feature's files are recorded in docs/AI-IMAGE-QA.md
+rather than fixed here.
+
 ## 11. Execution order
 
 1. Plan (this doc) — commit.
