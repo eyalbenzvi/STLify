@@ -16,8 +16,12 @@
  * splitting near-identical dark tones. Both errors show up as holes in the
  * subject or background left behind.
  *
- * When it fails (busy backgrounds), the UI offers threshold mode and manual
- * mask brushing as fallbacks — see the image dialog.
+ * When it fails (busy backgrounds), the image dialog offers the threshold
+ * controls and a manual mask brush over a live silhouette preview
+ * (`MaskBrush` in components/dialogs/ImportDialogs.tsx). Until V7 this
+ * paragraph named a brush that did not exist and the dialog had no recourse
+ * at all — which is why it now names the component, so the claim can be
+ * checked rather than believed.
  */
 
 /** RGBA raster, row-major, row 0 = top. */

@@ -261,6 +261,100 @@ export function isBimodalEnough(grid: LuminanceGrid, threshold: number): boolean
 }
 
 // ---------------------------------------------------------------------------
+// Manual mask brush
+// ---------------------------------------------------------------------------
+
+/**
+ * One painted stroke: the escape hatch for when automatic background removal
+ * and the threshold between them get the silhouette wrong.
+ *
+ * Coordinates are NORMALISED to the source image (0..1, x right, y down) and
+ * the radius is a fraction of the image's larger side — not grid pixels. That
+ * one choice settles both of the ways strokes could otherwise go stale:
+ *
+ * - Changing the resolution re-rasterises the same strokes at the new grid
+ *   size instead of leaving them pointing at pixels that no longer exist.
+ * - Brightness and contrast re-run the decode, and strokes do not depend on
+ *   the decode's output at all, so they survive every slider nudge.
+ */
+export interface MaskStroke {
+  /** Path points in normalised image space; a single point is a dab. */
+  points: [number, number][];
+  /** Brush radius as a fraction of the image's larger side. */
+  radius: number;
+  /** true = paint solid, false = erase to background. */
+  add: boolean;
+}
+
+/**
+ * Burn painted strokes into a luminance grid as hard solid/background values.
+ *
+ * Applied AFTER smoothing and BEFORE tracing: a correction the user drew by
+ * hand is a statement about the shape, not a measurement to be filtered, so
+ * nothing downstream is allowed to soften it back out.
+ */
+export function applyMaskStrokes(
+  grid: LuminanceGrid,
+  strokes: readonly MaskStroke[],
+  options: Pick<SilhouetteOptions, "threshold" | "invert">
+): LuminanceGrid {
+  if (strokes.length === 0) return grid;
+  const { width, height } = grid;
+  const values = new Float32Array(grid.values);
+  const solid = options.invert ? 1 : 0;
+  const background = options.invert ? 0 : 1;
+  const scale = Math.max(width, height);
+
+  for (const stroke of strokes) {
+    if (stroke.points.length === 0) continue;
+    const value = stroke.add ? solid : background;
+    const radiusPx = Math.max(0.5, stroke.radius * scale);
+    const r2 = radiusPx * radiusPx;
+    const paintSegment = (
+      ax: number,
+      ay: number,
+      bx: number,
+      by: number
+    ): void => {
+      const minX = Math.max(0, Math.floor(Math.min(ax, bx) - radiusPx));
+      const maxX = Math.min(width - 1, Math.ceil(Math.max(ax, bx) + radiusPx));
+      const minY = Math.max(0, Math.floor(Math.min(ay, by) - radiusPx));
+      const maxY = Math.min(height - 1, Math.ceil(Math.max(ay, by) + radiusPx));
+      const dx = bx - ax;
+      const dy = by - ay;
+      const lengthSq = dx * dx + dy * dy;
+      for (let y = minY; y <= maxY; y++) {
+        for (let x = minX; x <= maxX; x++) {
+          const px = x + 0.5;
+          const py = y + 0.5;
+          let t = lengthSq > 0 ? ((px - ax) * dx + (py - ay) * dy) / lengthSq : 0;
+          t = t < 0 ? 0 : t > 1 ? 1 : t;
+          const ox = px - (ax + dx * t);
+          const oy = py - (ay + dy * t);
+          if (ox * ox + oy * oy <= r2) values[y * width + x] = value;
+        }
+      }
+    };
+
+    const toPixel = (p: [number, number]): [number, number] => [
+      p[0] * width,
+      p[1] * height,
+    ];
+    if (stroke.points.length === 1) {
+      const [x, y] = toPixel(stroke.points[0]);
+      paintSegment(x, y, x, y);
+      continue;
+    }
+    for (let i = 1; i < stroke.points.length; i++) {
+      const [ax, ay] = toPixel(stroke.points[i - 1]);
+      const [bx, by] = toPixel(stroke.points[i]);
+      paintSegment(ax, ay, bx, by);
+    }
+  }
+  return { width, height, values };
+}
+
+// ---------------------------------------------------------------------------
 // Minimum-feature check (thin strokes the nozzle cannot resolve)
 // ---------------------------------------------------------------------------
 

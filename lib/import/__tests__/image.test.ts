@@ -6,6 +6,7 @@
 import { describe, expect, it } from "vitest";
 import { getGeometryKernel } from "@/lib/geometry/kernel";
 import {
+  applyMaskStrokes,
   dilateSilhouetteGrid,
   gridToSilhouetteContours,
   heightFieldToClosedMesh,
@@ -18,6 +19,7 @@ import {
   thinFeatureMessageHe,
   validateImageFile,
   type LuminanceGrid,
+  type MaskStroke,
 } from "../image";
 
 /** Grid with a dark disk (luminance 0) on a light background (1). */
@@ -84,6 +86,91 @@ describe("gridToSilhouetteContours", () => {
     expect(b.volumeMm3()).toBeGreaterThan(a.volumeMm3());
     a.dispose();
     b.dispose();
+  });
+});
+
+describe("applyMaskStrokes", () => {
+  const options = { threshold: 0.5, invert: false };
+
+  it("erases a region from the silhouette, changing the traced contours", () => {
+    // A disk plus a stray mark: the case the brush exists for.
+    const grid = diskGrid(64, 14);
+    for (let y = 3; y < 9; y++) for (let x = 3; x < 9; x++) grid.values[y * 64 + x] = 0;
+    const trace = (g: LuminanceGrid) =>
+      gridToSilhouetteContours(g, { ...options, pixelSizeMm: 1 });
+    expect(trace(grid).length).toBe(2);
+
+    const cleaned = applyMaskStrokes(
+      grid,
+      [{ points: [[6 / 64, 6 / 64]], radius: 8 / 64, add: false }],
+      options
+    );
+    expect(trace(cleaned).length).toBe(1);
+    // The disk itself is untouched.
+    expect(cleaned.values[32 * 64 + 32]).toBe(0);
+  });
+
+  it("paints solid where nothing was", () => {
+    const values = new Float32Array(64 * 64).fill(1);
+    const grid = { width: 64, height: 64, values };
+    const painted = applyMaskStrokes(
+      grid,
+      [
+        {
+          points: [
+            [0.2, 0.5],
+            [0.8, 0.5],
+          ],
+          radius: 0.1,
+          add: true,
+        },
+      ],
+      options
+    );
+    const contours = gridToSilhouetteContours(painted, { ...options, pixelSizeMm: 1 });
+    expect(contours.length).toBe(1);
+    expect(painted.values[32 * 64 + 32]).toBe(0);
+    expect(painted.values[5 * 64 + 5]).toBe(1);
+  });
+
+  it("honours invert, so painted solid stays solid either way", () => {
+    const dark = new Float32Array(16 * 16).fill(0);
+    const painted = applyMaskStrokes(
+      { width: 16, height: 16, values: dark },
+      [{ points: [[0.5, 0.5]], radius: 0.2, add: true }],
+      { threshold: 0.5, invert: true }
+    );
+    // Inverted: solid is the LIGHT side, so "add" writes 1.
+    expect(painted.values[8 * 16 + 8]).toBe(1);
+  });
+
+  it("lands the same marks at any resolution — strokes are normalised", () => {
+    // The trap: the mask lives at the downsampled grid size, so a stroke
+    // stored in pixels would point at nothing once the user changes it.
+    const stroke: MaskStroke = { points: [[0.25, 0.25]], radius: 0.1, add: true };
+    const covered = (size: number) => {
+      const values = new Float32Array(size * size).fill(1);
+      const painted = applyMaskStrokes(
+        { width: size, height: size, values },
+        [stroke],
+        options
+      );
+      let solid = 0;
+      for (const v of painted.values) if (v === 0) solid++;
+      return solid / (size * size);
+    };
+    // Same fraction of the image at 64 px and at 256 px, within rasterisation.
+    expect(Math.abs(covered(64) - covered(256))).toBeLessThan(0.005);
+    // And it is where it should be: the upper-left quadrant.
+    const values = new Float32Array(64 * 64).fill(1);
+    const painted = applyMaskStrokes({ width: 64, height: 64, values }, [stroke], options);
+    expect(painted.values[16 * 64 + 16]).toBe(0);
+    expect(painted.values[48 * 64 + 48]).toBe(1);
+  });
+
+  it("returns the grid untouched when nothing was painted", () => {
+    const grid = diskGrid(16, 5);
+    expect(applyMaskStrokes(grid, [], options)).toBe(grid);
   });
 });
 

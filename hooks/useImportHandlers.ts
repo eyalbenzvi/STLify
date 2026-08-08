@@ -26,6 +26,7 @@ import { attemptMeshRepair } from "@/lib/geometry/repair/repair";
 import { parseSvgToContours, SvgImportError } from "@/lib/import/svg";
 import { sanitizeSvg } from "@/lib/import/svgSanitize";
 import {
+  applyMaskStrokes,
   decodeImageToGrid,
   dilateSilhouetteGrid,
   gridToSilhouetteContours,
@@ -230,18 +231,25 @@ export function useImportHandlers(context: ImportHandlersContext) {
         if (options.removeBackground && decoded.backgroundRemovedFraction < 0.01) {
           noticesHe.push("כמעט שלא זוהה רקע להסרה — נסו להגדיל את סבילות הצבע");
         }
-        const grid = smoothGrid(decoded.grid, options.smoothingLevel);
-        const pixelSizeMm = options.targetWidthMm / grid.width;
+        const smoothed = smoothGrid(decoded.grid, options.smoothingLevel);
+        const pixelSizeMm = options.targetWidthMm / smoothed.width;
         let layer: DesignLayer;
         if (options.mode === "silhouette") {
           // Otsu runs HERE and nowhere else: the value it produces is stored
           // on the layer, and the rebuild path keeps reading the stored
           // value. Re-deriving it on rebuild would reshape every saved design.
+          // It reads the grid BEFORE the brush, so hand corrections — which
+          // are extreme black and white by construction — cannot skew it.
           const threshold =
             options.thresholdMode === "auto"
-              ? otsuThreshold(grid)
+              ? otsuThreshold(smoothed)
               : options.threshold;
-          if (options.thresholdMode === "auto" && !isBimodalEnough(grid, threshold)) {
+          // Same order the dialog's preview uses, so the preview is the file.
+          const grid = applyMaskStrokes(smoothed, options.maskStrokes, {
+            threshold,
+            invert: options.invert,
+          });
+          if (options.thresholdMode === "auto" && !isBimodalEnough(smoothed, threshold)) {
             noticesHe.push(
               "לתמונה אין הפרדה ברורה בין כהה לבהיר, כך שהסף האוטומטי הוא ניחוש — " +
                 "עברו ל״סף בהירות: ידני״ בחלון הייבוא, או הגדילו את הניגודיות."
@@ -306,7 +314,9 @@ export function useImportHandlers(context: ImportHandlersContext) {
             bevel: { enabled: false, sizeMm: 0.6, segments: 4 },
           };
         } else {
-          const mesh = heightFieldToClosedMesh(grid, {
+          // Relief reads the height field itself, so there is no silhouette
+          // mask for the brush to correct; the dialog hides it in this mode.
+          const mesh = heightFieldToClosedMesh(smoothed, {
             pixelSizeMm,
             minThicknessMm: options.minThicknessMm,
             reliefHeightMm: options.reliefHeightMm,

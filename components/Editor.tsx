@@ -1260,6 +1260,7 @@ function EditorInner() {
       />
       <ImageImportDialog
         open={imagePending !== null}
+        file={imagePending?.file ?? null}
         fileName={imagePending?.fileName ?? ""}
         onConfirm={handleImageConfirm}
         onClose={() => setImagePending(null)}
