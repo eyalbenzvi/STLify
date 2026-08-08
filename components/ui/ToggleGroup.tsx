@@ -3,6 +3,10 @@
 interface ToggleOption<T extends string> {
   value: T;
   label: string;
+  /** Render the option unclickable; pair with `title` to say why. */
+  disabled?: boolean;
+  /** Tooltip, mainly for explaining a disabled option. */
+  title?: string;
 }
 
 interface ToggleGroupProps<T extends string> {
@@ -40,7 +44,9 @@ export function ToggleGroup<T extends string>({
             type="button"
             role="radio"
             aria-checked={option.value === value}
-            className={`px-3 py-1 text-sm transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-500 ${
+            disabled={option.disabled}
+            title={option.title}
+            className={`px-3 py-1 text-sm transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-500 disabled:cursor-not-allowed disabled:opacity-40 ${
               option.value === value
                 ? "bg-blue-600 text-white"
                 : "bg-white text-slate-600 hover:bg-slate-100"

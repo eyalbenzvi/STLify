@@ -1262,6 +1262,7 @@ function EditorInner() {
         open={imagePending !== null}
         file={imagePending?.file ?? null}
         fileName={imagePending?.fileName ?? ""}
+        cloudAvailability={null}
         onConfirm={handleImageConfirm}
         onClose={() => setImagePending(null)}
       />
