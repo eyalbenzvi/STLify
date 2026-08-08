@@ -1,13 +1,15 @@
-# PrintCraft STL Studio — V6
+# PrintCraft STL Studio — V7
 
 A browser-only studio for designing genuinely 3D-printable models — text,
-SVG artwork, image silhouettes/reliefs and imported STL files — with a
-Hebrew, right-to-left UI. V3 added a layer-based 3D editor and print
+SVG artwork, image silhouettes/reliefs and imported STL, 3MF and OBJ files —
+with a Hebrew, right-to-left UI. V3 added a layer-based 3D editor and print
 preparation tools; V4 added real modelling — creating geometry from nothing,
 reshaping it, and repairing broken meshes. V5 connected that engine to the
 user, put a regression net under it, and made the output actually print.
-V6 moves the hot path off the main thread, makes exports slicer-honest,
-and adds the automation and persistence a small production shop needs.
+V6 moved the hot path off the main thread, made exports slicer-honest,
+and added the automation and persistence a small production shop needs.
+V7 rebuilds the import boundary — the place where a photo, a scan or someone
+else's model file becomes geometry.
 
 Everything runs locally, on this device. There is **no AI, no server-side
 generation, no accounts and no sync**: heuristics are deterministic and
@@ -37,6 +39,77 @@ Two additional commands arrived with V6:
 npm run bench      # performance budgets (fails above named thresholds)
 npm run batch -- --design x.formadesign.json --csv rows.csv --out batch.zip
 ```
+
+## V7 features
+
+Everything in V7 sits at the import boundary (`docs/V7-PLAN.md` is the plan it
+was executed against). That boundary was the weakest part of the app: the
+silhouette threshold was a guess made before seeing a single contour,
+"smoothing" quietly rounded off the corners it was meant to protect,
+background removal compared colours in a space that does not match how they
+look, the one escape hatch the code documented did not exist, and two
+mainstream model formats could not be read at all.
+
+### The image path
+
+- **The brightness threshold is computed, not asked for.** Otsu's method
+  derives it from the image at import time — deterministic, no model. The
+  manual slider is still there behind an "אוטומטי / ידני" toggle, but nobody
+  has to guess first. An image with no two populations to separate says so
+  rather than letting you discover it in the geometry. The value Otsu picks is
+  stored on the layer and the rebuild keeps reading the stored value, so no
+  design already on disk changes shape on load.
+- **Minimum feature size is checked while it can still be fixed.** After the
+  silhouette is traced, an exact distance transform measures the narrowest
+  stroke and compares it with two extrusion widths of the document's printer.
+  The wall-thickness analysis finds the same defect, but only once the
+  threshold, the resolution and the artwork are all behind you. Strokes under
+  the minimum are thickened automatically (default on, switchable off) with a
+  Hebrew notice naming the measured width and the machine's minimum.
+- **Smoothing is edge-preserving.** The 3×3 box blur became a bilateral
+  filter: noise still goes, corners stay. The control labelled "smoothing" is
+  no longer also a control for "lose the corners".
+- **Contours are curve-fitted, not decimated.** Douglas-Peucker could only
+  keep points that sit ON the marching-squares staircase, so every letter and
+  logo edge came out faceted. Least-squares cubics let the curve pass BETWEEN
+  the samples: measured on traced disks, roughly half the deviation from a
+  true circle at a fifth fewer points. Corners are found geometrically and
+  pinned, so a right angle stays a right angle. No new setting.
+- **Background removal compares colours perceptually.** Clustering and the
+  tolerance test moved to CIELAB with a ΔE distance. Squared RGB distance put
+  yellow and orange closer together than the default tolerance while splitting
+  near-identical dark tones; both errors showed up as holes in the subject or
+  background left standing. The 0..100 scale maps 1:1 onto ΔE so existing
+  tolerance values keep their meaning.
+- **A manual mask brush, with a live silhouette preview.** When the automatic
+  separation is wrong there is now somewhere to go: paint, erase, brush size,
+  reset. Strokes are stored in image coordinates, so changing the resolution,
+  brightness or contrast does not move or lose them. They apply to that import
+  only and are not saved in the design file — the dialog says so, because the
+  file stores traced contours, never the source image.
+
+### More formats in
+
+- **3MF and OBJ import**, through the same picker as STL ("ייבוא מודל").
+  3MF reads multiple objects, build transforms, nested component hierarchies,
+  units and materials — colours become material slots — so a multi-object
+  build arrives as one layer per body, each where the file put it. A body the
+  file marks as a support keeps that meaning through a re-export. OBJ reads
+  all four index forms including negative indices, fan-triangulates polygon
+  faces, and welds like the STL importer welds.
+- **Imported files are treated as hostile.** The ZIP reader counts bytes as
+  they arrive rather than trusting declared sizes (a 64 MB-of-zeros bomb is
+  refused mid-stream); the XML is read by a scanner with no DTD subsystem and
+  no resolver, so DOCTYPE and entity declarations are refused rather than
+  skipped; object, vertex, triangle, depth and recursion counts are all
+  capped; circular component graphs are detected. Every refusal is a Hebrew
+  message, and none escape as a raw throw.
+- **A triangle budget on import.** Above 250,000 triangles a mesh is
+  simplified automatically, with a notice naming both counts and saying
+  plainly that simplification loses fine detail. It runs after repair, since
+  simplification needs a watertight mesh; when the mesh cannot be made
+  watertight the notice says the reduction did not happen rather than quietly
+  shipping the heavy mesh.
 
 ## V6 features
 
@@ -336,7 +409,7 @@ the plan they were executed against.
 | Validation | `lib/geometry/documentValidation.ts` | Pure parameter checks with Hebrew messages |
 | Operations | `lib/geometry/operations/*` | Booleans, cut/split, connectors, hollow/drain, thicken/smooth/simplify, placement math |
 | Analysis | `lib/geometry/analysis/*` | Overhang, contact, floating parts, build volume, wall thickness, orientation scoring, estimates |
-| Import | `lib/import/{stl,svg,image}.ts` | Validated STL/SVG/image parsing → mesh data / contours |
+| Import | `lib/import/{stl,obj,threeMF,svg,image}.ts` + `{zipRead,xmlLite,triangleBudget}.ts` | Validated STL/OBJ/3MF/SVG/image parsing → mesh data / contours, with bounded readers for untrusted archives and XML |
 | Export | `lib/export/{stlData,threeMF,zip,package,exportDocument}.ts` | Binary STL, 3MF, dependency-free ZIP (STORE), multi-part package; `exportDocument.ts` picks between them |
 | Serialization | `lib/serialization/designFile.ts` | Portable `.formadesign.json` v3 with strict validation |
 | History | `lib/history/history.ts` | In-memory undo/redo (session only) |
@@ -411,11 +484,37 @@ interfaces so it can be swapped without touching the pipeline.
   they appear. The V6 estimate measures real slice geometry, but its speeds
   are documented workshop constants — always verify in your slicer.
 - Dovetail connectors assemble by sliding sideways (the UI explains this).
+- **Image import cannot see finer than one grid pixel.** The minimum-feature
+  check measures on the downsampled grid, so at 60 mm across 200 px it reads
+  in steps of 0.3 mm and cannot report anything thinner than that. Raise the
+  resolution when the artwork has hair-fine strokes; the cap is 512 px.
+- **The edge-preserving smoothing keeps 1-bit dither.** Amplitude alone cannot
+  tell a dither pattern from real structure, so a hard alternating pattern
+  survives where the old box blur merged it. In practice the decode
+  downsamples to at most 512 px first, which turns a scanned halftone into
+  greys before the filter runs.
+- **Mask-brush strokes are session-only.** The design file stores the traced
+  contours, not the source image, so strokes reloaded without the pixels they
+  were painted on would have nothing to apply to. The dialog says so before
+  you paint.
+- **3MF import bakes rotation into the mesh.** Each body is rebased (centred
+  in XY, resting on z=0) with the offset kept as the layer position, so a
+  multi-object file keeps its arrangement and every layer has a usable pivot —
+  but any rotation from the build transform lives in the geometry afterwards.
+  A mesh layer has no original rotation to preserve.
+- **OBJ groups are merged into one body**, and `.mtl` materials are not read;
+  both are reported as notes at import. 3MF is the format to use when
+  per-object colours matter.
+- **GLB/glTF is not imported.** Binary glTF means accessors, a node hierarchy
+  and possibly Draco; the use case that would have justified that weight does
+  not exist here. Export from your tool as 3MF, OBJ or STL.
+- **ZIP64 archives are refused.** A 3MF that large is past every other limit
+  in the importer anyway; the message says to save it smaller.
 
 ### Remaining caveats
 
-All V4/V5 features and all five V6 waves are implemented. The honest limits
-worth repeating, updated for V6:
+All V4/V5 features, all five V6 waves and all seven V7 items are implemented.
+The honest limits worth repeating:
 
 - **Per-edge fillet still does not exist — the local fillet is a
   workaround.** Manifold has no edge-select fillet operator. V6's "round
