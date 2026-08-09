@@ -18,6 +18,7 @@ import {
   type AiExecutionProvider,
   type AiSession,
   type AiSessionFactory,
+  type AiSessionOptions,
 } from "./onnx";
 import { AiError } from "./errors";
 
@@ -88,7 +89,8 @@ export async function disposeAiSessions(): Promise<void> {
 
 async function getSession(
   spec: AiModelSpec,
-  context: AiJobContext
+  context: AiJobContext,
+  sessionOptions?: AiSessionOptions
 ): Promise<AiSession> {
   const cached = sessionCache.get(spec.id);
   if (cached) return cached;
@@ -113,7 +115,7 @@ async function getSession(
     context.throwIfCancelled();
     context.onProgress(0.62, "טוען את המודל");
     try {
-      return await factory(bytes);
+      return await factory(bytes, sessionOptions);
     } catch (err) {
       // A cached file the runtime refuses would otherwise fail forever; drop
       // it so the next attempt re-downloads.
@@ -148,7 +150,7 @@ async function runModel(
 ): Promise<AiInferenceResult> {
   validatePayload(payload);
   const spec = AI_MODELS[modelId];
-  const session = await getSession(spec, context);
+  let session = await getSession(spec, context);
   context.throwIfCancelled();
 
   context.onProgress(0.7, "מכין את התמונה");
@@ -161,12 +163,31 @@ async function runModel(
   context.throwIfCancelled();
 
   context.onProgress(0.75, "מריץ את המודל");
+  const inputDims = [1, 3, spec.inputSize, spec.inputSize];
   let output;
   try {
-    output = await session.run(tensor, [1, 3, spec.inputSize, spec.inputSize]);
+    output = await session.run(tensor, inputDims);
   } catch (err) {
     if (err instanceof AiError) throw err;
-    throw new AiError("הרצת מודל ה-AI נכשלה — נסו שוב או עברו למצב הקלאסי");
+    // A WebGPU session can be created successfully and still fail on its
+    // FIRST run — driver and op-coverage problems only surface at inference.
+    // That must not strand the user (the broken session was cached): rebuild
+    // on WASM, retry once, and let the honest engine report say WASM ran.
+    if (session.provider === "webgpu") {
+      context.onProgress(0.75, "מנוע WebGPU נכשל — עובר ל-WASM");
+      sessionCache.delete(spec.id);
+      await session.dispose().catch(() => undefined);
+      session = await getSession(spec, context, { providers: ["wasm"] });
+      context.throwIfCancelled();
+      try {
+        output = await session.run(tensor, inputDims);
+      } catch (retryErr) {
+        if (retryErr instanceof AiError) throw retryErr;
+        throw new AiError("הרצת מודל ה-AI נכשלה — נסו שוב או עברו למצב הקלאסי");
+      }
+    } else {
+      throw new AiError("הרצת מודל ה-AI נכשלה — נסו שוב או עברו למצב הקלאסי");
+    }
   }
   context.throwIfCancelled();
 

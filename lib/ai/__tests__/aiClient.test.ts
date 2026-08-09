@@ -95,6 +95,50 @@ describe("runAiJob (in-process, injected session)", () => {
     ).rejects.toThrow(AiJobCancelledError);
   });
 
+  it("falls back to WASM when a WebGPU session fails at RUN time", async () => {
+    // Real GPUs do this: the session builds fine and the first inference
+    // throws. The job must rebuild on WASM and answer honestly.
+    const calls: (string[] | undefined)[] = [];
+    const sessionFactory: AiSessionFactory = async (_bytes, options) => {
+      calls.push(options?.providers);
+      if (!options?.providers) {
+        return {
+          provider: "webgpu",
+          async run() {
+            throw new Error("Device lost");
+          },
+          async dispose() {},
+        };
+      }
+      return fakeSession([1, 2, 3, 4]);
+    };
+    const { result } = await runAiJob("segmentImage", payload(), {
+      forceInProcess: true,
+      sessionFactory,
+    });
+    expect(result.provider).toBe("wasm");
+    expect(result.width).toBe(2);
+    expect(calls).toEqual([undefined, ["wasm"]]);
+
+    // The WASM session replaced the broken one in the cache: the next run
+    // uses it directly, with no third factory call.
+    await runAiJob("segmentImage", payload(), { forceInProcess: true, sessionFactory });
+    expect(calls.length).toBe(2);
+  });
+
+  it("reports a Hebrew failure when even the WASM retry fails", async () => {
+    const sessionFactory: AiSessionFactory = async (_bytes, options) => ({
+      provider: options?.providers ? "wasm" : "webgpu",
+      async run() {
+        throw new Error("kernel error");
+      },
+      async dispose() {},
+    });
+    await expect(
+      runAiJob("estimateDepth", payload(), { forceInProcess: true, sessionFactory })
+    ).rejects.toThrow(/הרצת מודל ה-AI נכשלה/);
+  });
+
   it("does not cache a session whose factory failed", async () => {
     let calls = 0;
     const failing: AiSessionFactory = async () => {
