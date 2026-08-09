@@ -28,13 +28,27 @@ export interface AiSession {
   dispose(): Promise<void>;
 }
 
-export type AiSessionFactory = (modelBytes: ArrayBuffer) => Promise<AiSession>;
+export interface AiSessionOptions {
+  /**
+   * Execution providers to try, in order. Default: WebGPU when the browser
+   * exposes it, then WASM. Callers pass ["wasm"] to force the fallback —
+   * notably after a WebGPU session was created successfully but then failed
+   * at RUN time, which real GPUs do (driver/op-coverage issues surface only
+   * on first inference).
+   */
+  providers?: AiExecutionProvider[];
+}
+
+export type AiSessionFactory = (
+  modelBytes: ArrayBuffer,
+  options?: AiSessionOptions
+) => Promise<AiSession>;
 
 /** Where the copied onnxruntime-web wasm artifacts are served from. */
 const ORT_WASM_BASE = "/ort/";
 
 /** Create a real onnxruntime-web session over the given model bytes. */
-export const createOnnxSession: AiSessionFactory = async (modelBytes) => {
+export const createOnnxSession: AiSessionFactory = async (modelBytes, options) => {
   let ort: typeof import("onnxruntime-web");
   try {
     ort = await import("onnxruntime-web");
@@ -57,31 +71,31 @@ export const createOnnxSession: AiSessionFactory = async (modelBytes) => {
       executionProviders: [provider],
     });
 
-  let session: import("onnxruntime-web").InferenceSession;
-  let provider: AiExecutionProvider;
-  try {
-    if (webGpuAvailable) {
-      try {
-        session = await tryCreate("webgpu");
-        provider = "webgpu";
-      } catch {
-        session = await tryCreate("wasm");
-        provider = "wasm";
-      }
-    } else {
-      session = await tryCreate("wasm");
-      provider = "wasm";
+  const requested =
+    options?.providers ?? (webGpuAvailable ? (["webgpu", "wasm"] as const) : (["wasm"] as const));
+
+  let session: import("onnxruntime-web").InferenceSession | null = null;
+  let provider: AiExecutionProvider = "wasm";
+  for (const candidate of requested) {
+    try {
+      session = await tryCreate(candidate);
+      provider = candidate;
+      break;
+    } catch {
+      // Try the next provider; an empty list at the end is the real failure.
     }
-  } catch {
+  }
+  if (!session) {
     throw new AiError(
       "הפעלת מנוע ה-AI נכשלה בדפדפן זה — ייתכן שקובץ המודל פגום או שהדפדפן אינו נתמך"
     );
   }
 
-  const inputName = session.inputNames[0];
-  const outputName = session.outputNames[0];
+  const live = session;
+  const inputName = live.inputNames[0];
+  const outputName = live.outputNames[0];
   if (!inputName || !outputName) {
-    await session.release().catch(() => undefined);
+    await live.release().catch(() => undefined);
     throw new AiError("מבנה מודל ה-AI אינו כצפוי — בדקו את כתובת המודל המוגדרת");
   }
 
@@ -91,7 +105,7 @@ export const createOnnxSession: AiSessionFactory = async (modelBytes) => {
       const feeds: Record<string, import("onnxruntime-web").Tensor> = {
         [inputName]: new ort.Tensor("float32", input, dims as number[]),
       };
-      const results = await session.run(feeds);
+      const results = await live.run(feeds);
       const output = results[outputName];
       if (!output) {
         throw new AiError("הרצת מודל ה-AI לא החזירה תוצאה — נסו שוב");
@@ -105,7 +119,7 @@ export const createOnnxSession: AiSessionFactory = async (modelBytes) => {
       return { data: array, dims: dimsOut };
     },
     async dispose() {
-      await session.release().catch(() => undefined);
+      await live.release().catch(() => undefined);
     },
   };
 };
