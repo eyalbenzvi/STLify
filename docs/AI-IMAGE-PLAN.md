@@ -113,6 +113,16 @@ Default URLs (verified reachable, `Content-Length` checked):
 Override: `NEXT_PUBLIC_AI_MODEL_BASE_URL` — when set, both models load from
 `${base}/<file name>` (self-hosting). Constant + env override as required.
 
+**Delivery correction (post-release fix):** GitHub's release-asset chain
+(github.com 302 → the asset host) sends no `Access-Control-Allow-Origin`
+header on any hop, so the BROWSER cannot fetch these URLs directly — the
+first real-browser run failed exactly there. The browser therefore loads
+models from our own origin (`/api/ai-models/<file>`, served by
+`lib/server/aiModelProxy.ts`, which streams the URLs above server-side with
+a size cap and only for registered file names). Side effect: the user's
+browser never contacts a third party at all. A configured base URL is still
+used directly and must be same-origin or CORS-enabled.
+
 **Autonomous decision #2 — u2netp over ISNet-general-use:** ISNet
 (~176 MB fp32) is somewhat better on hair/fuzz; u2netp is 4.6 MB and for
 silhouette tracing (a binary solid/background decision that then goes through

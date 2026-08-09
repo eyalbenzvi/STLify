@@ -73,11 +73,23 @@ export const AI_MODELS: Record<AiModelId, AiModelSpec> = {
  */
 export const MAX_MODEL_BYTES = 256 * 1024 * 1024;
 
-/** Where a model actually loads from: env base override, else the default. */
+/**
+ * Where the BROWSER loads a model from.
+ *
+ * By default this is our own origin (/api/ai-models/…): the public homes of
+ * the weights — GitHub release assets — send no Access-Control-Allow-Origin
+ * header on any hop of their redirect chain, so a direct cross-origin fetch
+ * is blocked by the browser before a single byte arrives. The same-origin
+ * route (lib/server/aiModelProxy.ts) streams `defaultUrl` through instead,
+ * which also means the user's browser never contacts a third party at all.
+ *
+ * A configured NEXT_PUBLIC_AI_MODEL_BASE_URL is used directly (self-hosting;
+ * that host is expected to be same-origin or CORS-enabled).
+ */
 export function modelUrl(spec: AiModelSpec): string {
   const base = process.env.NEXT_PUBLIC_AI_MODEL_BASE_URL;
   if (base) return `${base.replace(/\/+$/, "")}/${spec.fileName}`;
-  return spec.defaultUrl;
+  return `/api/ai-models/${spec.fileName}`;
 }
 
 /** "4.6MB" / "99.4MB" — for download notices. */
