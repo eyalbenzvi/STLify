@@ -11,13 +11,26 @@ and added the automation and persistence a small production shop needs.
 V7 rebuilds the import boundary — the place where a photo, a scan or someone
 else's model file becomes geometry.
 
-Everything runs locally, on this device. There is **no AI, no server-side
-generation, no accounts and no sync**: heuristics are deterministic and
-explained in Hebrew, the working document lives in the browser session, and
-the only storage is device-local — a single crash-recovery slot and an
+Everything runs locally, on this device, by default. There are **no
+accounts and no sync**: the working document lives in the browser session,
+and the only storage is device-local — a single crash-recovery slot and an
 optional local design library (IndexedDB), both of which can be switched
 off entirely and wiped entirely. Portable `.formadesign.json` files are how
 work leaves the device.
+
+The historical "no AI, no server" policy was lifted for the AI image
+import (docs/AI-IMAGE-PLAN.md), with the same local-first posture:
+
+- **On-device AI** (smart silhouette, smart relief): open models
+  (Apache-2.0) downloaded once by the browser and run locally via
+  onnxruntime-web (WebGPU, WASM fallback). No image ever leaves the
+  device; the only notice is the model download's name and size.
+- **Cloud image→3D** ("מודל מלא"): OFF until a server API key is
+  configured (`.env.example`), and every upload is behind an explicit
+  Hebrew consent naming the third-party provider. The returned mesh goes
+  through the same hostile-input funnel as any imported file: hardened
+  OBJ parse → staged repair (voxel fallback) → triangle budget →
+  printability analysis.
 
 ## Getting started
 

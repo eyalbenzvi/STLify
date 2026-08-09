@@ -30,6 +30,7 @@ import { ThreeMfImportError } from "@/lib/import/threeMF";
 import { ZipReadError } from "@/lib/import/zipRead";
 import { XmlLiteError } from "@/lib/import/xmlLite";
 import { DesignFileError } from "@/lib/serialization/designFile";
+import { AiError } from "@/lib/ai/errors";
 
 /** What happens to the layers an operation consumed. */
 export type SourceDisposition = "keep" | "hide" | "replace";
@@ -84,7 +85,9 @@ function hebrewMessageOf(error: unknown): string | null {
     error instanceof XmlLiteError ||
     error instanceof DesignFileError ||
     error instanceof GeneratorError ||
-    error instanceof PatternError
+    error instanceof PatternError ||
+    // The AI paths (on-device inference and the cloud proxy client alike).
+    error instanceof AiError
   ) {
     return error.messageHe;
   }

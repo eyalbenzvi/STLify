@@ -1,6 +1,9 @@
 # dependencies
 /node_modules
 
+# onnxruntime-web runtime, copied from node_modules by scripts/copyOrtAssets.mjs
+/public/ort/
+
 # next.js
 /.next/
 /out/
@@ -19,6 +22,7 @@ yarn-error.log*
 
 # env files
 .env*
+!.env.example
 
 # typescript
 *.tsbuildinfo

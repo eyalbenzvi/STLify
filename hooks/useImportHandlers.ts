@@ -44,6 +44,8 @@ import {
   validateImageFile,
 } from "@/lib/import/image";
 import { documentNozzleDiameterMm } from "@/lib/geometry/calibration";
+import { AI_MASK_THRESHOLD, saliencyToMaskGrid } from "@/lib/ai/segmentation";
+import { depthToReliefGrid } from "@/lib/ai/depth";
 import { importDesignFile } from "@/lib/serialization/designFile";
 import type {
   ImageImportOptionsValue,
@@ -326,32 +328,74 @@ export function useImportHandlers(context: ImportHandlersContext) {
       setImagePending(null);
       if (!pending) return;
       void runOp("ייבוא תמונה", async () => {
-        const decoded = await decodeImageToGrid(pending.file, options.resolution, {
-          removeBackgroundTolerance: options.removeBackground ? options.bgToleranceMm : null,
-          brightness: options.brightness,
-          contrast: options.contrast,
-        });
+        // The AI paths read only the decode's DIMENSIONS (their values come
+        // from the model maps), so the pixel adjustments are skipped there —
+        // running background removal on values nobody reads would only cost
+        // time and raise its "no background found" notice about nothing.
+        const classicDecode =
+          options.mode === "relief" ||
+          (options.mode === "silhouette" && options.thresholdMode !== "ai");
+        const decoded = await decodeImageToGrid(
+          pending.file,
+          options.resolution,
+          classicDecode
+            ? {
+                removeBackgroundTolerance: options.removeBackground
+                  ? options.bgToleranceMm
+                  : null,
+                brightness: options.brightness,
+                contrast: options.contrast,
+              }
+            : {}
+        );
         const noticesHe: string[] = [];
-        if (options.removeBackground && decoded.backgroundRemovedFraction < 0.01) {
+        if (
+          classicDecode &&
+          options.removeBackground &&
+          decoded.backgroundRemovedFraction < 0.01
+        ) {
           noticesHe.push("כמעט שלא זוהה רקע להסרה — נסו להגדיל את סבילות הצבע");
         }
-        const smoothed = smoothGrid(decoded.grid, options.smoothingLevel);
-        const pixelSizeMm = options.targetWidthMm / smoothed.width;
+        const pixelSizeMm = options.targetWidthMm / decoded.grid.width;
+        const engineNameHe = (provider: string) =>
+          provider === "webgpu" ? "WebGPU" : "WASM";
         let layer: DesignLayer;
         if (options.mode === "silhouette") {
-          // Otsu runs HERE and nowhere else: the value it produces is stored
-          // on the layer, and the rebuild path keeps reading the stored
-          // value. Re-deriving it on rebuild would reshape every saved design.
-          // It reads the grid BEFORE the brush, so hand corrections — which
-          // are extreme black and white by construction — cannot skew it.
-          const threshold =
-            options.thresholdMode === "auto"
+          const aiMask = options.thresholdMode === "ai" ? options.aiMask : null;
+          if (options.thresholdMode === "ai" && !aiMask) {
+            throw new ImageImportError(
+              "חסרה מסכת AI — הפעילו את ״זהה את הנושא (AI)״ בחלון הייבוא"
+            );
+          }
+          // The AI grid IS the mask (probability of subject encoded around
+          // 0.5); the classic grid is the smoothed luminance image. Otsu runs
+          // HERE and nowhere else: the value it produces is stored on the
+          // layer, and the rebuild path keeps reading the stored value.
+          // Re-deriving it on rebuild would reshape every saved design. It
+          // reads the grid BEFORE the brush, so hand corrections — which are
+          // extreme black and white by construction — cannot skew it.
+          const smoothed = aiMask
+            ? smoothGrid(
+                saliencyToMaskGrid(
+                  aiMask.map,
+                  aiMask.width,
+                  aiMask.height,
+                  decoded.grid.width,
+                  decoded.grid.height
+                ),
+                options.smoothingLevel
+              )
+            : smoothGrid(decoded.grid, options.smoothingLevel);
+          const threshold = aiMask
+            ? AI_MASK_THRESHOLD
+            : options.thresholdMode === "auto"
               ? otsuThreshold(smoothed)
               : options.threshold;
+          const invert = aiMask ? false : options.invert;
           // Same order the dialog's preview uses, so the preview is the file.
           const grid = applyMaskStrokes(smoothed, options.maskStrokes, {
             threshold,
-            invert: options.invert,
+            invert,
           });
           if (options.thresholdMode === "auto" && !isBimodalEnough(smoothed, threshold)) {
             noticesHe.push(
@@ -359,9 +403,14 @@ export function useImportHandlers(context: ImportHandlersContext) {
                 "עברו ל״סף בהירות: ידני״ בחלון הייבוא, או הגדילו את הניגודיות."
             );
           }
+          if (aiMask) {
+            noticesHe.push(
+              `הצללית חושבה במודל זיהוי נושא שרץ מקומית במכשיר (מנוע: ${engineNameHe(aiMask.provider)}).`
+            );
+          }
           const silhouette = {
             threshold,
-            invert: options.invert,
+            invert,
             pixelSizeMm,
           };
           let contours = gridToSilhouetteContours(grid, silhouette);
@@ -386,7 +435,9 @@ export function useImportHandlers(context: ImportHandlersContext) {
           }
           if (contours.length === 0) {
             throw new ImageImportError(
-              "לא נמצאה צורה בתמונה — נסו לשנות את סף הבהירות או להפעיל היפוך"
+              aiMask
+                ? "ה-AI לא זיהה נושא בתמונה — נסו את המצב הקלאסי או ציירו ידנית על התצוגה המקדימה"
+                : "לא נמצאה צורה בתמונה — נסו לשנות את סף הבהירות או להפעיל היפוך"
             );
           }
           layer = {
@@ -404,10 +455,11 @@ export function useImportHandlers(context: ImportHandlersContext) {
             meshId: null,
             settings: {
               targetWidthMm: options.targetWidthMm,
-              // The value Otsu produced, not the dialog's unused default —
-              // this is what the layer reports and what a regeneration reuses.
+              // The value Otsu produced (or the AI grid's fixed 0.5), not the
+              // dialog's unused default — this is what the layer reports and
+              // what a regeneration reuses.
               threshold,
-              invert: options.invert,
+              invert,
               reliefHeightMm: options.reliefHeightMm,
               minThicknessMm: options.minThicknessMm,
               resolution: options.resolution,
@@ -417,14 +469,54 @@ export function useImportHandlers(context: ImportHandlersContext) {
             combine: doc.baseMode === "withBase" ? "raised" : "standalone",
             bevel: { enabled: false, sizeMm: 0.6, segments: 4 },
           };
+        } else if (options.mode === "cloud") {
+          // Routed by the editor to the cloud-import flow before it reaches
+          // this handler; arriving here means a wiring bug, said plainly.
+          throw new ImageImportError("מצב הענן מטופל בנתיב נפרד — רעננו ונסו שוב");
         } else {
-          // Relief reads the height field itself, so there is no silhouette
-          // mask for the brush to correct; the dialog hides it in this mode.
-          const mesh = heightFieldToClosedMesh(smoothed, {
+          // Relief reads a height field, so there is no silhouette mask for
+          // the brush to correct; the dialog hides it in these modes. The
+          // classic path reads the smoothed luminance grid; the smart path
+          // reads the depth model's map, resampled onto the same grid.
+          const smartDepth = options.mode === "smartRelief" ? options.aiDepth : null;
+          if (options.mode === "smartRelief" && !smartDepth) {
+            throw new ImageImportError(
+              "חסרה מפת עומק — הפעילו את ״חשב מפת עומק (AI)״ בחלון הייבוא"
+            );
+          }
+          const grid = smartDepth
+            ? smoothGrid(
+                depthToReliefGrid(smartDepth.map, smartDepth.width, smartDepth.height, {
+                  gridWidth: decoded.grid.width,
+                  gridHeight: decoded.grid.height,
+                  mask:
+                    options.maskWithSegmentation && options.aiMask
+                      ? {
+                          map: options.aiMask.map,
+                          width: options.aiMask.width,
+                          height: options.aiMask.height,
+                        }
+                      : null,
+                }),
+                options.smoothingLevel
+              )
+            : smoothGrid(decoded.grid, options.smoothingLevel);
+          const invert = smartDepth ? options.depthInvert : options.invert;
+          if (smartDepth) {
+            noticesHe.push(
+              `מפת העומק חושבה מקומית במכשיר (מנוע: ${engineNameHe(smartDepth.provider)}).`
+            );
+            if (options.maskWithSegmentation && !options.aiMask) {
+              noticesHe.push(
+                "הרקע לא הוסר — מסכת הנושא לא חושבה. הריצו את ה-AI מחדש עם ״בידוד הנושא״ מסומן."
+              );
+            }
+          }
+          const mesh = heightFieldToClosedMesh(grid, {
             pixelSizeMm,
             minThicknessMm: options.minThicknessMm,
             reliefHeightMm: options.reliefHeightMm,
-            invert: options.invert,
+            invert,
           });
           const kernel = await getGeometryKernel();
           const { solid, status } = kernel.fromMeshData(mesh);
@@ -443,13 +535,16 @@ export function useImportHandlers(context: ImportHandlersContext) {
             transform: { x: 0, y: 0, z: 0, rotationX: 0, rotationY: 0, rotationZ: 0, scaleX: 1, scaleY: 1, scaleZ: 1 },
             previewOpacity: 1,
             sourceName: pending.fileName,
+            // Smart relief stores the SAME layer shape as the classic relief:
+            // a generated solid in the mesh store plus the settings used —
+            // no schema addition, so the file loads in any version.
             mode: "relief",
             contours: [],
             meshId,
             settings: {
               targetWidthMm: options.targetWidthMm,
               threshold: options.threshold,
-              invert: options.invert,
+              invert,
               reliefHeightMm: options.reliefHeightMm,
               minThicknessMm: options.minThicknessMm,
               resolution: options.resolution,

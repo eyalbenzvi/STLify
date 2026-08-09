@@ -8,7 +8,7 @@
  */
 
 import dynamic from "next/dynamic";
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type * as THREE from "three";
 import type {
   CutPlaneDefinition,
@@ -39,6 +39,7 @@ import { useBodyOperations } from "@/hooks/useBodyOperations";
 import { usePrintAids } from "@/hooks/usePrintAids";
 import { useRegionTools } from "@/hooks/useRegionTools";
 import { useImportHandlers } from "@/hooks/useImportHandlers";
+import { useCloudModelImport } from "@/hooks/useCloudModelImport";
 import { useAnalysisRunner } from "@/hooks/useAnalysisRunner";
 import { useSessionPersistence } from "@/hooks/useSessionPersistence";
 import { usePaintReanchor } from "@/hooks/usePaintReanchor";
@@ -116,6 +117,7 @@ import {
   type OpMessage,
 } from "@/components/dialogs/OperationDialogs";
 import {
+  CloudConsentDialog,
   ImageImportDialog,
   StlImportDialog,
   SvgImportDialog,
@@ -639,6 +641,31 @@ function EditorInner() {
       setOrientationCandidates,
     });
 
+  // ---- cloud image→3D ------------------------------------------------------
+
+  // A generated mesh must surface its printability immediately, but analysis
+  // needs the rebuilt parts — so the import raises a flag and the first
+  // finished build after it runs the analysis once.
+  const autoAnalysisRef = useRef(false);
+  const requestAutoAnalysis = useCallback(() => {
+    autoAnalysisRef.current = true;
+  }, []);
+  useEffect(() => {
+    if (!autoAnalysisRef.current) return;
+    if (build.status !== "ok" || build.parts.length === 0) return;
+    autoAnalysisRef.current = false;
+    runAnalysis();
+  }, [build.buildId, build.status, build.parts.length, runAnalysis]);
+
+  const cloudImport = useCloudModelImport({
+    doc,
+    dispatch,
+    applyDocument,
+    setMessage,
+    showError,
+    requestAutoAnalysis,
+  });
+
   // ---- imports --------------------------------------------------------------
 
   // Extracted to hooks/useImportHandlers.ts: STL, SVG, image and design-file
@@ -1117,6 +1144,9 @@ function EditorInner() {
             {panelOpen ? "הסתרת לוח הכלים ⌄" : "לוח הכלים ⌃"}
           </button>
           <JobProgressOverlay progress={jobs.progress} onCancel={jobs.cancel} />
+          {/* The cloud generation reuses the same overlay: stages, fraction
+              where known, and a cancel that actually aborts the flow. */}
+          <JobProgressOverlay progress={cloudImport.progress} onCancel={cloudImport.cancel} />
           <ErrorBoundary
             areaHe="תצוגה התלת־ממדית"
             action={{ labelHe: "הורד קובץ עיצוב", onClick: handleDownloadDesign }}
@@ -1262,8 +1292,28 @@ function EditorInner() {
         open={imagePending !== null}
         file={imagePending?.file ?? null}
         fileName={imagePending?.fileName ?? ""}
-        onConfirm={handleImageConfirm}
+        cloudAvailability={cloudImport.availability}
+        onConfirm={(imageOptions) => {
+          // The cloud mode uploads the ORIGINAL file, not the processed
+          // grid, so it leaves the image pipeline and takes its own flow
+          // (consent gate → provider → repair funnel).
+          if (imageOptions.mode === "cloud") {
+            const pending = imagePending;
+            setImagePending(null);
+            if (pending) {
+              void cloudImport.start(pending.file, imageOptions.cloudTargetSizeMm);
+            }
+            return;
+          }
+          handleImageConfirm(imageOptions);
+        }}
         onClose={() => setImagePending(null)}
+      />
+      <CloudConsentDialog
+        open={cloudImport.consentPending}
+        providerNameHe={cloudImport.providerNameHe}
+        onApprove={cloudImport.approveConsent}
+        onCancel={cloudImport.declineConsent}
       />
       <ExportDialog
         open={dialogs.isOpen("export")}

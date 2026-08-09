@@ -14,6 +14,11 @@ export default tseslint.config(
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
+    // Build-time node scripts (no bundler, no DOM).
+    files: ["scripts/**/*.mjs"],
+    languageOptions: { globals: { console: "readonly", process: "readonly" } },
+  },
+  {
     files: ["**/*.ts", "**/*.tsx"],
     plugins: { "react-hooks": reactHooks },
     rules: {
