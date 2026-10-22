@@ -126,6 +126,18 @@ mainstream model formats could not be read at all.
   circular component graphs are refused, and every refusal is a Hebrew message.
   The regression suite for all of this is
   `lib/import/__tests__/importSecurity.test.ts`.
+- **eDrawings import (`.easm` / `.eprt`)**, through the same picker. There is
+  no public specification for eDrawings, so the reader was written by decoding
+  a real SOLIDWORKS 2025 assembly; `docs/EDRAWINGS-PLAN.md` records the format
+  and every decision. An assembly opens a full-screen import step first:
+  choose components (those hidden in the file start unchecked), unit (metres,
+  checked against the file's own mass properties), up axis, scale (1:1 to
+  1:200, or fit to 200 mm) and separate layers or one body, with a live
+  preview — then confirm you own the model or have permission to use it,
+  because the file's "allow STL export" setting cannot be read yet. Each
+  component's bodies are repaired one by one and united exactly; only bodies
+  that stay open are rebuilt, and the notes say how many. `.edrw` drawings are
+  2D and are explained rather than imported.
 - **A triangle budget on import.** Above 250,000 triangles a mesh is
   simplified automatically, with a notice naming both counts and saying
   plainly that simplification loses fine detail. It runs after repair, since
@@ -532,6 +544,12 @@ interfaces so it can be swapped without touching the pipeline.
   not exist here. Export from your tool as 3MF, OBJ or STL.
 - **ZIP64 archives are refused.** A 3MF that large is past every other limit
   in the importer anyway; the message says to save it smaller.
+- **eDrawings support is verified against one file.** Other SOLIDWORKS
+  versions and other publishers may use encodings not seen yet (Edgebreaker,
+  compressed points); those stop with a message naming the encoding, never a
+  guess. The STL-export permission flag is not identified, and the import is
+  limited by the display tessellation the file was saved with — for exact
+  geometry, export STEP or a fine STL from the CAD system.
 
 ### Remaining caveats
 

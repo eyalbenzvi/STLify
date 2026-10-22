@@ -172,7 +172,7 @@ export function EditorHeader({
       <div className="ms-auto flex flex-wrap items-center gap-1.5">
         <FilePickerButton
           labelHe="ייבוא מודל"
-          accept=".stl,.3mf,.obj"
+          accept=".stl,.3mf,.obj,.easm,.eprt,.edrw"
           ariaLabel="קובץ מודל"
           onFile={onMeshFile}
         />

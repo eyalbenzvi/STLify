@@ -40,6 +40,8 @@ import { usePrintAids } from "@/hooks/usePrintAids";
 import { useRegionTools } from "@/hooks/useRegionTools";
 import { useImportHandlers } from "@/hooks/useImportHandlers";
 import { useCloudModelImport } from "@/hooks/useCloudModelImport";
+import { isEDrawingsFileName, useEDrawingsImport } from "@/hooks/useEDrawingsImport";
+import { EDrawingsImportScreen } from "@/components/edrawings/EDrawingsImportScreen";
 import { useAnalysisRunner } from "@/hooks/useAnalysisRunner";
 import { useSessionPersistence } from "@/hooks/useSessionPersistence";
 import { usePaintReanchor } from "@/hooks/usePaintReanchor";
@@ -666,6 +668,17 @@ function EditorInner() {
     requestAutoAnalysis,
   });
 
+  // eDrawings assemblies get their own full-screen step (component choice,
+  // unit, scale) before anything reaches the document.
+  const edrawingsImport = useEDrawingsImport({
+    doc,
+    dispatch,
+    applyDocument,
+    setMessage,
+    showError,
+    requestAutoAnalysis,
+  });
+
   // ---- imports --------------------------------------------------------------
 
   // Extracted to hooks/useImportHandlers.ts: STL, SVG, image and design-file
@@ -856,7 +869,11 @@ function EditorInner() {
         onRedo={() => dispatch({ type: "history/redo" })}
         onApplyTemplate={(template) => applyDocument(template, "טעינת תבנית")}
         onRequestBaseMode={setModeSwitchTarget}
-        onMeshFile={(file) => void handleMeshFile(file)}
+        onMeshFile={(file) =>
+          void (isEDrawingsFileName(file.name)
+            ? edrawingsImport.start(file)
+            : handleMeshFile(file))
+        }
         onSvgFile={(file) =>
           void file.text().then((text) => setSvgPending({ text, fileName: file.name }))
         }
@@ -1147,6 +1164,7 @@ function EditorInner() {
           {/* The cloud generation reuses the same overlay: stages, fraction
               where known, and a cancel that actually aborts the flow. */}
           <JobProgressOverlay progress={cloudImport.progress} onCancel={cloudImport.cancel} />
+          <JobProgressOverlay progress={edrawingsImport.progress} onCancel={edrawingsImport.cancel} />
           <ErrorBoundary
             areaHe="תצוגה התלת־ממדית"
             action={{ labelHe: "הורד קובץ עיצוב", onClick: handleDownloadDesign }}
@@ -1273,6 +1291,11 @@ function EditorInner() {
         currentTriangles={selectedParts[0]?.stats.triangleCount ?? 0}
         onConfirm={handleSimplifyConfirm}
         onClose={dialogs.close}
+      />
+      <EDrawingsImportScreen
+        pending={edrawingsImport.pending}
+        onConfirm={(choice) => void edrawingsImport.confirm(choice)}
+        onClose={edrawingsImport.close}
       />
       <StlImportDialog
         preview={stlPreview}

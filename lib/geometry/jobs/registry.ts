@@ -37,6 +37,8 @@ import { diagnoseMesh, repairMesh, type RepairOptions } from "../repair/diagnose
 import { voxelRemesh } from "../repair/voxelRemesh";
 import { isotropicRemesh, type RemeshSettings } from "../operations/remesh";
 import { parseObj } from "@/lib/import/obj";
+import { parseEDrawingsFile, type EDrawingsModel } from "@/lib/import/edrawings/model";
+import { assembleBodies, type AssembleResult } from "@/lib/import/edrawings/assemble";
 import { findSelfIntersections } from "../repair/selfIntersection";
 import { latticeFill, type LatticeSettings } from "../operations/lattice";
 import { roundEdges, shellSolid, type FilletSettings, type ShellSettings } from "../operations/fillet";
@@ -195,6 +197,25 @@ export interface GeometryJobMap {
   parseObjText: {
     payload: { text: string };
     result: ReturnType<typeof parseObj>;
+  };
+  /**
+   * eDrawings (.easm/.eprt) parse: unzip, inflate, decode the HSF stream and
+   * lay out every component instance. A floor-plan assembly is several
+   * megabytes of stream and hundreds of thousands of triangles.
+   */
+  parseEDrawings: {
+    payload: { buffer: ArrayBuffer };
+    result: EDrawingsModel;
+  };
+  /** One eDrawings component's bodies → one solid (see assemble.ts). */
+  assembleEDrawingsComponent: {
+    payload: { bodies: MeshData[] };
+    result: AssembleResult;
+  };
+  /** Boolean union of several meshes into one solid (the "one body" import). */
+  unionMeshes: {
+    payload: { meshes: MeshData[] };
+    result: { mesh: MeshData };
   };
   latticeFill: {
     payload: { mesh: MeshData; settings: LatticeSettings };
@@ -400,6 +421,49 @@ export const JOB_HANDLERS: Handlers = {
     const parsed = parseObj(text);
     ctx.onProgress(1, "הושלם");
     return parsed;
+  },
+
+  parseEDrawings: async ({ buffer }, ctx) => {
+    ctx.onProgress(0.1, "מפענח את קובץ ה-eDrawings");
+    ctx.throwIfCancelled();
+    const model = await parseEDrawingsFile(buffer);
+    ctx.onProgress(1, "הושלם");
+    return model;
+  },
+
+  assembleEDrawingsComponent: async ({ bodies }, ctx) => {
+    ctx.onProgress(0.02, "מתקן ומאחד גופים");
+    return assembleBodies(
+      bodies,
+      (fraction) => ctx.onProgress(fraction, "מתקן ומאחד גופים"),
+      ctx.throwIfCancelled
+    );
+  },
+
+  unionMeshes: async ({ meshes }, ctx) => {
+    ctx.onProgress(0.1, "מאחד את הרכיבים");
+    const kernel = await getGeometryKernel();
+    const solids = [];
+    try {
+      for (const mesh of meshes) {
+        ctx.throwIfCancelled();
+        const { solid, status } = kernel.fromMeshData(mesh);
+        if (status !== "NoError" || solid.isEmpty()) {
+          solid.dispose();
+          throw new Error(`אחד הרכיבים אינו גוף סגור (${status}) — לא ניתן לאחד`);
+        }
+        solids.push(solid);
+      }
+      ctx.onProgress(0.5, "מאחד את הרכיבים");
+      // unionAll consumes its operands.
+      const united = kernel.unionAll(solids.splice(0));
+      const mesh = united.toMeshData();
+      united.dispose();
+      ctx.onProgress(1, "הושלם");
+      return { mesh };
+    } finally {
+      for (const solid of solids) solid.dispose();
+    }
   },
 
   latticeFill: async ({ mesh, settings }, ctx) => {
